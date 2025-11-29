@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/netip"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -20,15 +21,38 @@ import (
 	"github.com/sagernet/sing/common/json/badoption"
 )
 
+type Result struct {
+	Options        option.Options
+	BaseTags       []string
+	TagToNodeIndex map[string]int
+	MemberMetadata map[string]poolout.MemberMeta
+}
+
+var outboundIndexPattern = regexp.MustCompile(`outbound\[(\d+)\]`)
+
+// ExtractOutboundIndex tries to parse a sing-box initialization error and return the outbound index.
+func ExtractOutboundIndex(err error) (int, bool) {
+	matches := outboundIndexPattern.FindStringSubmatch(err.Error())
+	if len(matches) != 2 {
+		return 0, false
+	}
+	idx, parseErr := strconv.Atoi(matches[1])
+	if parseErr != nil {
+		return 0, false
+	}
+	return idx, true
+}
+
 // Build converts high level config into sing-box Options tree.
-func Build(cfg *config.Config) (option.Options, error) {
+func Build(cfg *config.Config) (Result, error) {
 	baseOutbounds := make([]option.Outbound, 0, len(cfg.Nodes))
 	memberTags := make([]string, 0, len(cfg.Nodes))
 	metadata := make(map[string]poolout.MemberMeta)
+	tagToNodeIndex := make(map[string]int)
 	var failedNodes []string
 	usedTags := make(map[string]int) // Track tag usage for uniqueness
 
-	for _, node := range cfg.Nodes {
+	for idx, node := range cfg.Nodes {
 		baseTag := sanitizeTag(node.Name)
 		if baseTag == "" {
 			baseTag = fmt.Sprintf("node-%d", len(memberTags)+1)
@@ -51,6 +75,7 @@ func Build(cfg *config.Config) (option.Options, error) {
 		}
 		memberTags = append(memberTags, tag)
 		baseOutbounds = append(baseOutbounds, outbound)
+		tagToNodeIndex[tag] = idx
 		meta := poolout.MemberMeta{
 			Name: node.Name,
 			URI:  node.URI,
@@ -68,7 +93,7 @@ func Build(cfg *config.Config) (option.Options, error) {
 
 	// Check if we have at least one valid node
 	if len(baseOutbounds) == 0 {
-		return option.Options{}, fmt.Errorf("no valid nodes available (all %d nodes failed to build)", len(cfg.Nodes))
+		return Result{}, fmt.Errorf("no valid nodes available (all %d nodes failed to build)", len(cfg.Nodes))
 	}
 
 	// Log summary
@@ -91,7 +116,7 @@ func Build(cfg *config.Config) (option.Options, error) {
 	case "pool":
 		inbound, err := buildPoolInbound(cfg)
 		if err != nil {
-			return option.Options{}, err
+			return Result{}, err
 		}
 		inbounds = []option.Inbound{inbound}
 		poolOptions := poolout.Options{
@@ -110,7 +135,7 @@ func Build(cfg *config.Config) (option.Options, error) {
 	case "multi-port":
 		addr, err := parseAddr(cfg.MultiPort.Address)
 		if err != nil {
-			return option.Options{}, fmt.Errorf("parse multi-port address: %w", err)
+			return Result{}, fmt.Errorf("parse multi-port address: %w", err)
 		}
 		for _, tag := range memberTags {
 			meta := metadata[tag]
@@ -162,7 +187,7 @@ func Build(cfg *config.Config) (option.Options, error) {
 			})
 		}
 	default:
-		return option.Options{}, fmt.Errorf("unsupported mode %s", cfg.Mode)
+		return Result{}, fmt.Errorf("unsupported mode %s", cfg.Mode)
 	}
 
 	opts := option.Options{
@@ -171,7 +196,7 @@ func Build(cfg *config.Config) (option.Options, error) {
 		Outbounds: outbounds,
 		Route:     &route,
 	}
-	return opts, nil
+	return Result{Options: opts, BaseTags: memberTags, TagToNodeIndex: tagToNodeIndex, MemberMetadata: metadata}, nil
 }
 
 func buildPoolInbound(cfg *config.Config) (option.Inbound, error) {
@@ -342,6 +367,16 @@ func buildTLSOptions(query url.Values) (*option.OutboundTLSOptions, error) {
 		tlsOptions.UTLS = &option.OutboundUTLSOptions{Enabled: true, Fingerprint: fp}
 	}
 	if security == "reality" {
+		// Reality requires uTLS support; default to Chrome fingerprint when not provided
+		if tlsOptions.UTLS == nil {
+			log.Println("⚠️  uTLS fingerprint not provided for reality, defaulting to Chrome")
+			tlsOptions.UTLS = &option.OutboundUTLSOptions{Enabled: true, Fingerprint: "chrome"}
+		} else {
+			tlsOptions.UTLS.Enabled = true
+			if tlsOptions.UTLS.Fingerprint == "" {
+				tlsOptions.UTLS.Fingerprint = "chrome"
+			}
+		}
 		tlsOptions.Reality = &option.OutboundRealityOptions{Enabled: true, PublicKey: query.Get("pbk"), ShortID: query.Get("sid")}
 	}
 	return tlsOptions, nil
