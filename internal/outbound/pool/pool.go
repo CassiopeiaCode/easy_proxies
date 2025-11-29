@@ -162,7 +162,8 @@ func (p *poolOutbound) Start(stage adapter.StartStage) error {
 	err := p.initializeMembersLocked()
 	p.mu.Unlock()
 	if err != nil {
-		return err
+		p.logger.Warn("proxy pool initialization skipped: ", err)
+		return nil
 	}
 	// 在初始化完成后，立即在后台触发健康检查
 	if p.monitor != nil {

@@ -29,6 +29,24 @@ func (l *stdLogger) Warn(args ...any) {
 	log.Println(append([]any{"[health-check] ⚠️ "}, args...)...)
 }
 
+func blacklistFailedNode(err error, cfg *config.Config, result builder.Result) bool {
+	idx, ok := builder.ExtractOutboundIndex(err)
+	if !ok || idx >= len(result.BaseTags) {
+		return false
+	}
+
+	tag := result.BaseTags[idx]
+	nodeIdx, ok := result.TagToNodeIndex[tag]
+	if !ok || nodeIdx >= len(cfg.Nodes) {
+		return false
+	}
+
+	node := cfg.Nodes[nodeIdx]
+	log.Printf("⚠️  removing unstable node '%s' (%s) after initialization failure: %v", node.Name, tag, err)
+	cfg.Nodes = append(cfg.Nodes[:nodeIdx], cfg.Nodes[nodeIdx+1:]...)
+	return true
+}
+
 // Run builds the runtime components from config and blocks until shutdown.
 func Run(ctx context.Context, cfg *config.Config) error {
 	// 根据模式选择代理用户名密码
@@ -53,27 +71,46 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		return fmt.Errorf("init monitor: %w", err)
 	}
 
-	buildResult, err := builder.Build(cfg)
-	if err != nil {
-		return err
-	}
+	workingCfg := *cfg
+	workingCfg.Nodes = append([]config.NodeConfig(nil), cfg.Nodes...)
 
-	inboundRegistry := include.InboundRegistry()
-	outboundRegistry := include.OutboundRegistry()
-	pool.Register(outboundRegistry)
-	endpointRegistry := include.EndpointRegistry()
-	dnsRegistry := include.DNSTransportRegistry()
-	serviceRegistry := include.ServiceRegistry()
+	var (
+		instance    *box.Box
+		buildResult builder.Result
+	)
 
-	ctx = box.Context(ctx, inboundRegistry, outboundRegistry, endpointRegistry, dnsRegistry, serviceRegistry)
-	ctx = monitor.ContextWith(ctx, monitorMgr)
+	baseCtx := ctx
+	for {
+		buildResult, err = builder.Build(&workingCfg)
+		if err != nil {
+			return err
+		}
 
-	instance, err := box.New(box.Options{Context: ctx, Options: buildResult})
-	if err != nil {
-		return fmt.Errorf("create sing-box instance: %w", err)
-	}
-	if err := instance.Start(); err != nil {
-		return fmt.Errorf("start sing-box: %w", err)
+		inboundRegistry := include.InboundRegistry()
+		outboundRegistry := include.OutboundRegistry()
+		pool.Register(outboundRegistry)
+		endpointRegistry := include.EndpointRegistry()
+		dnsRegistry := include.DNSTransportRegistry()
+		serviceRegistry := include.ServiceRegistry()
+
+		ctx = box.Context(baseCtx, inboundRegistry, outboundRegistry, endpointRegistry, dnsRegistry, serviceRegistry)
+		ctx = monitor.ContextWith(ctx, monitorMgr)
+
+		instance, err = box.New(box.Options{Context: ctx, Options: buildResult.Options})
+		if err != nil {
+			if blacklistFailedNode(err, &workingCfg, buildResult) {
+				continue
+			}
+			return fmt.Errorf("create sing-box instance: %w", err)
+		}
+		if err := instance.Start(); err != nil {
+			_ = instance.Close()
+			if blacklistFailedNode(err, &workingCfg, buildResult) {
+				continue
+			}
+			return fmt.Errorf("start sing-box: %w", err)
+		}
+		break
 	}
 
 	var monitorServer *monitor.Server
