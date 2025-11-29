@@ -1,6 +1,8 @@
 module easy_proxies
 
-go 1.22
+go 1.24.1
+
+toolchain go1.24.10
 
 require (
 	github.com/sagernet/sing v0.7.13
