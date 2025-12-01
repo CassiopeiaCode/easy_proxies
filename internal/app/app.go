@@ -120,8 +120,8 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		defer monitorServer.Shutdown(context.Background())
 
 		monitorMgr.SetLogger(&stdLogger{})
-		// 启动定期健康检查（每5分钟检查一次，每个节点超时10秒）
-		monitorMgr.StartPeriodicHealthCheck(5*time.Minute, 10*time.Second)
+		// 启动定期健康检查（每5分钟检查一次，每个节点超时5秒）
+		monitorMgr.StartPeriodicHealthCheck(5*time.Minute, 5*time.Second)
 		defer monitorMgr.Stop()
 	}
 

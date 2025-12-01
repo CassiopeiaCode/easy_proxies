@@ -3,7 +3,7 @@ log_level: info
 management:
   enabled: true
   listen: 0.0.0.0:9090
-  probe_target: www.apple.com:80
+  probe_target: https://api.ipify.org  # 健康检查 URL，要求5秒内成功返回HTTP响应
   password: ""  # WebUI 访问密码，为空则不需要密码（可选）
 listener:
   address: 0.0.0.0

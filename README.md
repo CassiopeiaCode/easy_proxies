@@ -277,13 +277,14 @@ hysteria2://password@server:port?sni=example.com&insecure=0&obfs=salamander&obfs
 - **初始检查**: 启动后立即检测所有节点的连通性
 - **定期检查**: 每 5 分钟检查一次所有节点状态
 - **智能过滤**: 不可用节点自动从 WebUI 和导出列表中隐藏
-- **探测目标**: 通过 `management.probe_target` 配置（默认 `www.apple.com:80`）
+- **探测方式**: 通过代理请求 HTTP URL，要求5秒内成功返回响应
+- **探测目标**: 通过 `management.probe_target` 配置（默认 `https://api.ipify.org`）
 
 ```yaml
 management:
   enabled: true
   listen: 0.0.0.0:9090
-  probe_target: www.apple.com:80  # 健康检查探测目标
+  probe_target: https://api.ipify.org  # 健康检查探测目标（HTTP URL）
 ```
 
 ### 密码保护

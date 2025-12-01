@@ -2,8 +2,11 @@ package pool
 
 import (
 	"context"
+	"fmt"
+	"io"
 	"math/rand"
 	"net"
+	"net/http"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -218,7 +221,7 @@ func (p *poolOutbound) initializeMembersLocked() error {
 
 // probeAllMembersOnStartup performs initial health checks on all members
 func (p *poolOutbound) probeAllMembersOnStartup() {
-	destination, ok := p.monitor.DestinationForProbe()
+	probeURL, ok := p.monitor.ProbeURL()
 	if !ok {
 		p.logger.Warn("probe target not configured, skipping initial health check")
 		// 没有配置探测目标时，标记所有节点为可用
@@ -243,11 +246,11 @@ func (p *poolOutbound) probeAllMembersOnStartup() {
 	failedCount := 0
 
 	for _, member := range members {
-		// Create a timeout context for each probe
-		ctx, cancel := context.WithTimeout(p.ctx, 10*time.Second)
+		// Create a timeout context for each probe (5 seconds)
+		ctx, cancel := context.WithTimeout(p.ctx, 5*time.Second)
 
 		start := time.Now()
-		conn, err := member.outbound.DialContext(ctx, N.NetworkTCP, destination)
+		err := p.probeHTTP(ctx, member, probeURL)
 		latency := time.Since(start)
 
 		if err != nil {
@@ -258,7 +261,6 @@ func (p *poolOutbound) probeAllMembersOnStartup() {
 				member.entry.MarkInitialCheckDone(false) // 标记为不可用
 			}
 		} else {
-			_ = conn.Close()
 			p.logger.Info("initial probe success for ", member.tag, ", latency: ", latency.Milliseconds(), "ms")
 			availableCount++
 			if member.entry != nil {
@@ -440,9 +442,16 @@ func (p *poolOutbound) recordSuccess(member *memberState) {
 }
 
 func (p *poolOutbound) wrapConn(conn net.Conn, member *memberState) net.Conn {
-	return &trackedConn{Conn: conn, release: func() {
-		p.decActive(member)
-	}}
+	return &trackedConn{
+		Conn:         conn,
+		member:       member,
+		pool:         p,
+		bytesRead:    0,
+		checkPending: true,
+		release: func() {
+			p.decActive(member)
+		},
+	}
 }
 
 func (p *poolOutbound) wrapPacketConn(conn net.PacketConn, member *memberState) net.PacketConn {
@@ -464,24 +473,68 @@ func (p *poolOutbound) makeReleaseFunc(member *memberState) func() {
 	}
 }
 
+// probeHTTP performs HTTP GET request through the proxy to verify connectivity
+func (p *poolOutbound) probeHTTP(ctx context.Context, member *memberState, url string) error {
+	// Create HTTP client that uses the proxy outbound for dialing
+	client := &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				// Parse the address to get host and port
+				host, port, err := net.SplitHostPort(addr)
+				if err != nil {
+					return nil, err
+				}
+				portNum := uint16(80)
+				if port == "443" {
+					portNum = 443
+				}
+				destination := M.ParseSocksaddrHostPort(host, portNum)
+				return member.outbound.DialContext(ctx, network, destination)
+			},
+		},
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse // Don't follow redirects
+		},
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return fmt.Errorf("create request: %w", err)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("http request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+	}
+
+	// Read and discard response body to ensure full response
+	_, _ = io.Copy(io.Discard, resp.Body)
+
+	return nil
+}
+
 func (p *poolOutbound) makeProbeFunc(member *memberState) func(ctx context.Context) (time.Duration, error) {
 	if p.monitor == nil {
 		return nil
 	}
-	destination, ok := p.monitor.DestinationForProbe()
+	probeURL, ok := p.monitor.ProbeURL()
 	if !ok {
 		return nil
 	}
 	return func(ctx context.Context) (time.Duration, error) {
 		start := time.Now()
-		conn, err := member.outbound.DialContext(ctx, N.NetworkTCP, destination)
+		err := p.probeHTTP(ctx, member, probeURL)
 		if err != nil {
 			if member.entry != nil {
 				member.entry.RecordFailure(err)
 			}
 			return 0, err
 		}
-		_ = conn.Close()
 		duration := time.Since(start)
 		if member.entry != nil {
 			member.entry.RecordSuccess()
@@ -495,7 +548,7 @@ func (p *poolOutbound) makeProbeByTagFunc(tag string) func(ctx context.Context) 
 	if p.monitor == nil {
 		return nil
 	}
-	destination, ok := p.monitor.DestinationForProbe()
+	probeURL, ok := p.monitor.ProbeURL()
 	if !ok {
 		return nil
 	}
@@ -524,14 +577,13 @@ func (p *poolOutbound) makeProbeByTagFunc(tag string) func(ctx context.Context) 
 		}
 
 		start := time.Now()
-		conn, err := member.outbound.DialContext(ctx, N.NetworkTCP, destination)
+		err := p.probeHTTP(ctx, member, probeURL)
 		if err != nil {
 			if member.entry != nil {
 				member.entry.RecordFailure(err)
 			}
 			return 0, err
 		}
-		_ = conn.Close()
 		duration := time.Since(start)
 		if member.entry != nil {
 			member.entry.RecordSuccess()
@@ -576,11 +628,47 @@ func (p *poolOutbound) makeReleaseByTagFunc(tag string) func() {
 
 type trackedConn struct {
 	net.Conn
-	once    sync.Once
-	release func()
+	member       *memberState
+	pool         *poolOutbound
+	bytesRead    int64
+	checkPending bool
+	once         sync.Once
+	mu           sync.Mutex
+	release      func()
+}
+
+func (c *trackedConn) Read(b []byte) (n int, err error) {
+	n, err = c.Conn.Read(b)
+	
+	c.mu.Lock()
+	c.bytesRead += int64(n)
+	checkNeeded := c.checkPending && c.bytesRead < 10
+	c.mu.Unlock()
+	
+	// If connection is closing and we haven't received 10 bytes, record failure
+	if err != nil && checkNeeded {
+		c.pool.recordFailure(c.member, fmt.Errorf("connection closed after %d bytes (expected at least 10): %w", c.bytesRead, err))
+	} else if c.bytesRead >= 10 {
+		// Once we've read 10 bytes, mark the check as done
+		c.mu.Lock()
+		c.checkPending = false
+		c.mu.Unlock()
+	}
+	
+	return n, err
 }
 
 func (c *trackedConn) Close() error {
+	c.mu.Lock()
+	checkNeeded := c.checkPending && c.bytesRead < 10
+	bytesRead := c.bytesRead
+	c.mu.Unlock()
+	
+	// If closing with less than 10 bytes read, record as failure
+	if checkNeeded {
+		c.pool.recordFailure(c.member, fmt.Errorf("connection closed with only %d bytes received (expected at least 10)", bytesRead))
+	}
+	
 	err := c.Conn.Close()
 	c.once.Do(c.release)
 	return err

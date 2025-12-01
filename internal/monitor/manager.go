@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net"
 	"sort"
 	"strconv"
 	"sync"
@@ -18,7 +17,7 @@ import (
 type Config struct {
 	Enabled       bool
 	Listen        string
-	ProbeTarget   string
+	ProbeTarget   string // HTTP URL to probe (e.g., https://api.ipify.org)
 	Password      string
 	ProxyUsername string // 代理池的用户名（用于导出）
 	ProxyPassword string // 代理池的密码（用于导出）
@@ -78,7 +77,8 @@ type entry struct {
 // Manager aggregates all node states for the UI/API.
 type Manager struct {
 	cfg        Config
-	probeDst   M.Socksaddr
+	probeDst   M.Socksaddr // Deprecated: kept for backward compatibility
+	probeURL   string      // HTTP URL for probing
 	probeReady bool
 	mu         sync.RWMutex
 	nodes      map[string]*entry
@@ -103,13 +103,8 @@ func NewManager(cfg Config) (*Manager, error) {
 		cancel: cancel,
 	}
 	if cfg.ProbeTarget != "" {
-		host, port, err := net.SplitHostPort(cfg.ProbeTarget)
-		if err != nil {
-			cancel()
-			return nil, err
-		}
-		parsed := M.ParseSocksaddrHostPort(host, parsePort(port))
-		m.probeDst = parsed
+		// ProbeTarget is now expected to be a full HTTP URL
+		m.probeURL = cfg.ProbeTarget
 		m.probeReady = true
 	}
 	return m, nil
@@ -242,11 +237,20 @@ func (m *Manager) Register(info NodeInfo) *EntryHandle {
 }
 
 // DestinationForProbe exposes the configured destination for health checks.
+// Deprecated: Use ProbeURL instead
 func (m *Manager) DestinationForProbe() (M.Socksaddr, bool) {
 	if !m.probeReady {
 		return M.Socksaddr{}, false
 	}
 	return m.probeDst, true
+}
+
+// ProbeURL returns the HTTP URL for health checks.
+func (m *Manager) ProbeURL() (string, bool) {
+	if !m.probeReady {
+		return "", false
+	}
+	return m.probeURL, true
 }
 
 // Snapshot returns a sorted copy of current node states.
