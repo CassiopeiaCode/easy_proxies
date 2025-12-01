@@ -1,6 +1,7 @@
 package builder
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -13,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"easy_proxies/internal/config"
 	poolout "easy_proxies/internal/outbound/pool"
@@ -28,6 +30,7 @@ type Result struct {
 	BaseTags       []string
 	TagToNodeIndex map[string]int
 	MemberMetadata map[string]poolout.MemberMeta
+	FailedIndices  []int // 构建失败的节点索引列表
 }
 
 var outboundIndexPattern = regexp.MustCompile(`outbound\[(\d+)\]`)
@@ -46,9 +49,10 @@ func ExtractOutboundIndex(err error) (int, bool) {
 }
 
 type buildJob struct {
-	idx  int
-	node config.NodeConfig
-	tag  string
+	idx     int
+	node    config.NodeConfig
+	tag     string
+	timeout time.Duration
 }
 
 type buildResult struct {
@@ -98,13 +102,19 @@ func Build(cfg *config.Config) (Result, error) {
 		go func() {
 			defer wg.Done()
 			for job := range jobChan {
-				outbound, err := buildNodeOutbound(job.tag, job.node.URI)
+				// Create context with timeout for fast-fail
+				ctx, cancel := context.WithTimeout(context.Background(), job.timeout)
+				outbound, err := buildNodeOutboundWithContext(ctx, job.tag, job.node.URI)
+				cancel()
 				resultsChan <- buildResult{idx: job.idx, outbound: outbound, err: err}
 			}
 		}()
 	}
 
+	// Set timeout for each job (3 seconds for fast-fail)
+	buildTimeout := 3 * time.Second
 	for _, job := range jobs {
+		job.timeout = buildTimeout
 		jobChan <- job
 	}
 	close(jobChan)
@@ -123,14 +133,42 @@ func Build(cfg *config.Config) (Result, error) {
 	metadata := make(map[string]poolout.MemberMeta)
 	tagToNodeIndex := make(map[string]int)
 	var failedNodes []string
+	var failedIndices []int
+	
+	// Track error types for summary logging
+	errorCounts := make(map[string]int)
 
 	for _, res := range orderedResults {
 		originalNode := cfg.Nodes[res.idx]
 		originalTag := jobs[res.idx].tag
 
 		if res.err != nil {
-			log.Printf("❌ Failed to build node '%s': %v (skipping)", originalNode.Name, res.err)
+			// Extract error type for grouping
+			errMsg := res.err.Error()
+			var errorType string
+			switch {
+			case strings.Contains(errMsg, "shadowsocks userinfo format"):
+				errorType = "shadowsocks_format_error"
+			case strings.Contains(errMsg, "invalid userinfo"):
+				errorType = "invalid_url_format"
+			case strings.Contains(errMsg, "unsupported scheme"):
+				errorType = "unsupported_protocol"
+			case strings.Contains(errMsg, "unsupported transport type"):
+				errorType = "unsupported_transport"
+			case strings.Contains(errMsg, "context deadline exceeded"):
+				errorType = "timeout"
+			default:
+				errorType = "other_error"
+			}
+			errorCounts[errorType]++
+			
+			// Only log first 5 failures of each type
+			if errorCounts[errorType] <= 5 {
+				log.Printf("❌ Failed to build node '%s': %v", originalNode.Name, res.err)
+			}
+			
 			failedNodes = append(failedNodes, originalNode.Name)
+			failedIndices = append(failedIndices, res.idx)
 			continue
 		}
 
@@ -157,11 +195,31 @@ func Build(cfg *config.Config) (Result, error) {
 		return Result{}, fmt.Errorf("no valid nodes available (all %d nodes failed to build)", len(cfg.Nodes))
 	}
 
-	// Log summary
+	// Log summary with error breakdown
 	if len(failedNodes) > 0 {
-		log.Printf("⚠️  %d/%d nodes failed and were skipped: %v", len(failedNodes), len(cfg.Nodes), failedNodes)
+		log.Printf("⚠️  Build Summary: %d/%d nodes failed, %d succeeded", len(failedNodes), len(cfg.Nodes), len(baseOutbounds))
+		log.Printf("   Failure breakdown:")
+		for errType, count := range errorCounts {
+			var description string
+			switch errType {
+			case "shadowsocks_format_error":
+				description = "Shadowsocks format errors"
+			case "invalid_url_format":
+				description = "Invalid URL format (often contains invalid characters)"
+			case "unsupported_protocol":
+				description = "Unsupported protocols"
+			case "unsupported_transport":
+				description = "Unsupported transport types (KCP, XHTTP, etc.)"
+			case "timeout":
+				description = "Build timeouts"
+			default:
+				description = "Other errors"
+			}
+			log.Printf("   • %s: %d nodes", description, count)
+		}
+	} else {
+		log.Printf("✅ Successfully built all %d nodes", len(baseOutbounds))
 	}
-	log.Printf("✅ Successfully built %d/%d nodes", len(baseOutbounds), len(cfg.Nodes))
 
 	// Print proxy links for each node
 	printProxyLinks(cfg, metadata)
@@ -257,7 +315,13 @@ func Build(cfg *config.Config) (Result, error) {
 		Outbounds: outbounds,
 		Route:     &route,
 	}
-	return Result{Options: opts, BaseTags: memberTags, TagToNodeIndex: tagToNodeIndex, MemberMetadata: metadata}, nil
+	return Result{
+		Options:        opts,
+		BaseTags:       memberTags,
+		TagToNodeIndex: tagToNodeIndex,
+		MemberMetadata: metadata,
+		FailedIndices:  failedIndices,
+	}, nil
 }
 
 func buildPoolInbound(cfg *config.Config) (option.Inbound, error) {
@@ -286,11 +350,35 @@ func buildPoolInbound(cfg *config.Config) (option.Inbound, error) {
 }
 
 func buildNodeOutbound(tag, rawURI string) (option.Outbound, error) {
+	return buildNodeOutboundWithContext(context.Background(), tag, rawURI)
+}
+
+func buildNodeOutboundWithContext(ctx context.Context, tag, rawURI string) (option.Outbound, error) {
+	// Quick validation for fast-fail
+	if err := quickValidateURI(rawURI); err != nil {
+		return option.Outbound{}, fmt.Errorf("invalid uri: %w", err)
+	}
+
+	// Check context timeout
+	select {
+	case <-ctx.Done():
+		return option.Outbound{}, ctx.Err()
+	default:
+	}
+
 	parsed, err := url.Parse(rawURI)
 	if err != nil {
 		return option.Outbound{}, fmt.Errorf("parse uri: %w", err)
 	}
-	switch strings.ToLower(parsed.Scheme) {
+
+	scheme := strings.ToLower(parsed.Scheme)
+	
+	// Fast-fail: check if scheme is supported
+	if !isSupportedScheme(scheme) {
+		return option.Outbound{}, fmt.Errorf("unsupported scheme %q", scheme)
+	}
+
+	switch scheme {
 	case "vless":
 		opts, err := buildVLESSOptions(parsed)
 		if err != nil {
@@ -322,8 +410,33 @@ func buildNodeOutbound(tag, rawURI string) (option.Outbound, error) {
 		}
 		return option.Outbound{Type: C.TypeVMess, Tag: tag, Options: &opts}, nil
 	default:
-		return option.Outbound{}, fmt.Errorf("unsupported scheme %q", parsed.Scheme)
+		return option.Outbound{}, fmt.Errorf("unsupported scheme %q", scheme)
 	}
+}
+
+// quickValidateURI performs fast validation without complex parsing
+func quickValidateURI(rawURI string) error {
+	if rawURI == "" {
+		return errors.New("empty uri")
+	}
+	if len(rawURI) < 10 {
+		return errors.New("uri too short")
+	}
+	if !strings.Contains(rawURI, "://") {
+		return errors.New("missing scheme separator")
+	}
+	return nil
+}
+
+// isSupportedScheme checks if the protocol scheme is supported
+func isSupportedScheme(scheme string) bool {
+	supported := []string{"vless", "hysteria2", "ss", "shadowsocks", "trojan", "vmess"}
+	for _, s := range supported {
+		if s == scheme {
+			return true
+		}
+	}
+	return false
 }
 
 func buildVLESSOptions(u *url.URL) (option.VLESSOutboundOptions, error) {

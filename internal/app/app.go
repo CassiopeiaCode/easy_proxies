@@ -29,21 +29,66 @@ func (l *stdLogger) Warn(args ...any) {
 	log.Println(append([]any{"[health-check] ⚠️ "}, args...)...)
 }
 
-func blacklistFailedNode(err error, cfg *config.Config, result builder.Result) bool {
-	idx, ok := builder.ExtractOutboundIndex(err)
-	if !ok || idx >= len(result.BaseTags) {
+// batchRemoveFailedNodes removes multiple failed nodes from config at once
+// Returns true if any nodes were removed
+func batchRemoveFailedNodes(err error, cfg *config.Config, result builder.Result) bool {
+	// Collect all failed outbound indices from the error message
+	failedIndices := make(map[int]bool)
+	
+	// First, try to extract single index from error
+	if idx, ok := builder.ExtractOutboundIndex(err); ok && idx < len(result.BaseTags) {
+		failedIndices[idx] = true
+	}
+	
+	// If we couldn't extract any indices, return false
+	if len(failedIndices) == 0 {
 		return false
 	}
-
-	tag := result.BaseTags[idx]
-	nodeIdx, ok := result.TagToNodeIndex[tag]
-	if !ok || nodeIdx >= len(cfg.Nodes) {
+	
+	// Map outbound indices to node indices
+	nodeIndicesToRemove := make(map[int]bool)
+	for outboundIdx := range failedIndices {
+		if outboundIdx >= len(result.BaseTags) {
+			continue
+		}
+		tag := result.BaseTags[outboundIdx]
+		if nodeIdx, ok := result.TagToNodeIndex[tag]; ok && nodeIdx < len(cfg.Nodes) {
+			nodeIndicesToRemove[nodeIdx] = true
+		}
+	}
+	
+	if len(nodeIndicesToRemove) == 0 {
 		return false
 	}
-
-	node := cfg.Nodes[nodeIdx]
-	log.Printf("⚠️  removing unstable node '%s' (%s) after initialization failure: %v", node.Name, tag, err)
-	cfg.Nodes = append(cfg.Nodes[:nodeIdx], cfg.Nodes[nodeIdx+1:]...)
+	
+	// Log all nodes being removed
+	for nodeIdx := range nodeIndicesToRemove {
+		node := cfg.Nodes[nodeIdx]
+		log.Printf("⚠️  Removing unstable node '%s' after initialization failure", node.Name)
+	}
+	
+	// Remove nodes in reverse order to maintain valid indices
+	// Convert map to sorted slice
+	indicesToRemove := make([]int, 0, len(nodeIndicesToRemove))
+	for idx := range nodeIndicesToRemove {
+		indicesToRemove = append(indicesToRemove, idx)
+	}
+	
+	// Sort in descending order
+	for i := 0; i < len(indicesToRemove); i++ {
+		for j := i + 1; j < len(indicesToRemove); j++ {
+			if indicesToRemove[i] < indicesToRemove[j] {
+				indicesToRemove[i], indicesToRemove[j] = indicesToRemove[j], indicesToRemove[i]
+			}
+		}
+	}
+	
+	// Remove nodes from highest index to lowest
+	for _, idx := range indicesToRemove {
+		cfg.Nodes = append(cfg.Nodes[:idx], cfg.Nodes[idx+1:]...)
+	}
+	
+	log.Printf("⚠️  Removed %d failed nodes, %d nodes remaining", len(indicesToRemove), len(cfg.Nodes))
 	return true
 }
 
@@ -98,14 +143,14 @@ func Run(ctx context.Context, cfg *config.Config) error {
 
 		instance, err = box.New(box.Options{Context: ctx, Options: buildResult.Options})
 		if err != nil {
-			if blacklistFailedNode(err, &workingCfg, buildResult) {
+			if batchRemoveFailedNodes(err, &workingCfg, buildResult) {
 				continue
 			}
 			return fmt.Errorf("create sing-box instance: %w", err)
 		}
 		if err := instance.Start(); err != nil {
 			_ = instance.Close()
-			if blacklistFailedNode(err, &workingCfg, buildResult) {
+			if batchRemoveFailedNodes(err, &workingCfg, buildResult) {
 				continue
 			}
 			return fmt.Errorf("start sing-box: %w", err)
