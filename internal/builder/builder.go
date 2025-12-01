@@ -37,15 +37,34 @@ var outboundIndexPattern = regexp.MustCompile(`outbound\[(\d+)\]`)
 
 // ExtractOutboundIndex tries to parse a sing-box initialization error and return the outbound index.
 func ExtractOutboundIndex(err error) (int, bool) {
-	matches := outboundIndexPattern.FindStringSubmatch(err.Error())
-	if len(matches) != 2 {
+	indices := ExtractOutboundIndices(err)
+	if len(indices) == 0 {
 		return 0, false
 	}
-	idx, parseErr := strconv.Atoi(matches[1])
-	if parseErr != nil {
-		return 0, false
+	return indices[0], true
+}
+
+// ExtractOutboundIndices returns every outbound index mentioned in the error.
+func ExtractOutboundIndices(err error) []int {
+	if err == nil {
+		return nil
 	}
-	return idx, true
+	matches := outboundIndexPattern.FindAllStringSubmatch(err.Error(), -1)
+	if len(matches) == 0 {
+		return nil
+	}
+	indices := make([]int, 0, len(matches))
+	for _, match := range matches {
+		if len(match) != 2 {
+			continue
+		}
+		idx, parseErr := strconv.Atoi(match[1])
+		if parseErr != nil {
+			continue
+		}
+		indices = append(indices, idx)
+	}
+	return indices
 }
 
 type buildJob struct {
@@ -134,7 +153,7 @@ func Build(cfg *config.Config) (Result, error) {
 	tagToNodeIndex := make(map[string]int)
 	var failedNodes []string
 	var failedIndices []int
-	
+
 	// Track error types for summary logging
 	errorCounts := make(map[string]int)
 
@@ -161,12 +180,12 @@ func Build(cfg *config.Config) (Result, error) {
 				errorType = "other_error"
 			}
 			errorCounts[errorType]++
-			
+
 			// Only log first 5 failures of each type
 			if errorCounts[errorType] <= 5 {
 				log.Printf("❌ Failed to build node '%s': %v", originalNode.Name, res.err)
 			}
-			
+
 			failedNodes = append(failedNodes, originalNode.Name)
 			failedIndices = append(failedIndices, res.idx)
 			continue
@@ -206,7 +225,7 @@ func Build(cfg *config.Config) (Result, error) {
 			}
 		}
 	}
-	
+
 	// Log summary with error breakdown
 	if len(failedNodes) > 0 {
 		log.Printf("⚠️  Build Summary: %d/%d nodes failed, %d succeeded", len(failedNodes), len(cfg.Nodes), len(baseOutbounds))
@@ -232,7 +251,7 @@ func Build(cfg *config.Config) (Result, error) {
 	} else {
 		log.Printf("✅ Successfully built all %d nodes", len(baseOutbounds))
 	}
-	
+
 	// Log XHTTP fallback summary if any
 	if xhttpCount > 0 {
 		log.Printf("ℹ️  Note: %d nodes using XHTTP transport (automatically converted to HTTPUpgrade)", xhttpCount)
@@ -389,7 +408,7 @@ func buildNodeOutboundWithContext(ctx context.Context, tag, rawURI string) (opti
 	}
 
 	scheme := strings.ToLower(parsed.Scheme)
-	
+
 	// Fast-fail: check if scheme is supported
 	if !isSupportedScheme(scheme) {
 		return option.Outbound{}, fmt.Errorf("unsupported scheme %q", scheme)

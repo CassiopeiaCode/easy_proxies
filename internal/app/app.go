@@ -6,6 +6,8 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"sort"
+	"strings"
 	"syscall"
 	"time"
 
@@ -29,66 +31,109 @@ func (l *stdLogger) Warn(args ...any) {
 	log.Println(append([]any{"[health-check] ⚠️ "}, args...)...)
 }
 
-// batchRemoveFailedNodes removes multiple failed nodes from config at once
-// Returns true if any nodes were removed
-func batchRemoveFailedNodes(err error, cfg *config.Config, result builder.Result) bool {
-	// Collect all failed outbound indices from the error message
-	failedIndices := make(map[int]bool)
-	
-	// First, try to extract single index from error
-	if idx, ok := builder.ExtractOutboundIndex(err); ok && idx < len(result.BaseTags) {
-		failedIndices[idx] = true
+const maxLoggedNodeNames = 5
+
+// summarizeNodeNames returns a short list of node names for logging purposes.
+func summarizeNodeNames(nodes []config.NodeConfig, indices []int) string {
+	names := make([]string, 0, len(indices))
+	for _, idx := range indices {
+		if idx < 0 || idx >= len(nodes) {
+			continue
+		}
+		name := nodes[idx].Name
+		if name == "" {
+			name = fmt.Sprintf("node-%d", idx)
+		}
+		names = append(names, name)
 	}
-	
-	// If we couldn't extract any indices, return false
-	if len(failedIndices) == 0 {
-		return false
+	if len(names) == 0 {
+		return ""
 	}
-	
-	// Map outbound indices to node indices
-	nodeIndicesToRemove := make(map[int]bool)
-	for outboundIdx := range failedIndices {
-		if outboundIdx >= len(result.BaseTags) {
+	if len(names) > maxLoggedNodeNames {
+		remaining := len(names) - maxLoggedNodeNames
+		names = append(names[:maxLoggedNodeNames], fmt.Sprintf("... and %d more", remaining))
+	}
+	return strings.Join(names, ", ")
+}
+
+// removeNodesByIndices removes nodes at the provided indices (sorted desc) and returns the updated slice.
+func removeNodesByIndices(nodes []config.NodeConfig, sortedDescending []int) []config.NodeConfig {
+	for _, idx := range sortedDescending {
+		if idx < 0 || idx >= len(nodes) {
+			continue
+		}
+		nodes = append(nodes[:idx], nodes[idx+1:]...)
+	}
+	return nodes
+}
+
+// uniqueSortedDescending returns unique indices sorted from high to low.
+func uniqueSortedDescending(indices []int) []int {
+	if len(indices) == 0 {
+		return nil
+	}
+	seen := make(map[int]struct{}, len(indices))
+	result := make([]int, 0, len(indices))
+	for _, idx := range indices {
+		if idx < 0 {
+			continue
+		}
+		if _, exists := seen[idx]; exists {
+			continue
+		}
+		seen[idx] = struct{}{}
+		result = append(result, idx)
+	}
+	sort.Slice(result, func(i, j int) bool {
+		return result[i] > result[j]
+	})
+	return result
+}
+
+// mapOutboundIndicesToNodeIndices converts outbound indices to node indices using builder metadata.
+func mapOutboundIndicesToNodeIndices(result builder.Result, outboundIndices []int) []int {
+	if len(outboundIndices) == 0 {
+		return nil
+	}
+	nodeIndexSet := make(map[int]struct{})
+	for _, outboundIdx := range outboundIndices {
+		if outboundIdx < 0 || outboundIdx >= len(result.BaseTags) {
 			continue
 		}
 		tag := result.BaseTags[outboundIdx]
-		if nodeIdx, ok := result.TagToNodeIndex[tag]; ok && nodeIdx < len(cfg.Nodes) {
-			nodeIndicesToRemove[nodeIdx] = true
+		if nodeIdx, ok := result.TagToNodeIndex[tag]; ok {
+			nodeIndexSet[nodeIdx] = struct{}{}
 		}
 	}
-	
-	if len(nodeIndicesToRemove) == 0 {
+	if len(nodeIndexSet) == 0 {
+		return nil
+	}
+	nodeIndices := make([]int, 0, len(nodeIndexSet))
+	for idx := range nodeIndexSet {
+		nodeIndices = append(nodeIndices, idx)
+	}
+	sort.Slice(nodeIndices, func(i, j int) bool {
+		return nodeIndices[i] > nodeIndices[j]
+	})
+	return nodeIndices
+}
+
+// batchRemoveFailedNodes removes multiple failed nodes from config at once
+// Returns true if any nodes were removed
+func batchRemoveFailedNodes(err error, cfg *config.Config, result builder.Result) bool {
+	outboundIndices := builder.ExtractOutboundIndices(err)
+	if len(outboundIndices) == 0 {
 		return false
 	}
-	
-	// Log all nodes being removed
-	for nodeIdx := range nodeIndicesToRemove {
-		node := cfg.Nodes[nodeIdx]
-		log.Printf("⚠️  Removing unstable node '%s' after initialization failure", node.Name)
+	nodeIndices := mapOutboundIndicesToNodeIndices(result, outboundIndices)
+	if len(nodeIndices) == 0 {
+		return false
 	}
-	
-	// Remove nodes in reverse order to maintain valid indices
-	// Convert map to sorted slice
-	indicesToRemove := make([]int, 0, len(nodeIndicesToRemove))
-	for idx := range nodeIndicesToRemove {
-		indicesToRemove = append(indicesToRemove, idx)
+	if summary := summarizeNodeNames(cfg.Nodes, nodeIndices); summary != "" {
+		log.Printf("⚠️  Removing unstable nodes after initialization failure: %s", summary)
 	}
-	
-	// Sort in descending order
-	for i := 0; i < len(indicesToRemove); i++ {
-		for j := i + 1; j < len(indicesToRemove); j++ {
-			if indicesToRemove[i] < indicesToRemove[j] {
-				indicesToRemove[i], indicesToRemove[j] = indicesToRemove[j], indicesToRemove[i]
-			}
-		}
-	}
-	
-	// Remove nodes from highest index to lowest
-	for _, idx := range indicesToRemove {
-		cfg.Nodes = append(cfg.Nodes[:idx], cfg.Nodes[idx+1:]...)
-	}
-	
-	log.Printf("⚠️  Removed %d failed nodes, %d nodes remaining", len(indicesToRemove), len(cfg.Nodes))
+	cfg.Nodes = removeNodesByIndices(cfg.Nodes, nodeIndices)
+	log.Printf("⚠️  Removed %d failed nodes, %d nodes remaining", len(nodeIndices), len(cfg.Nodes))
 	return true
 }
 
@@ -134,27 +179,14 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		// Pre-remove all nodes that failed during build phase
 		// This prevents them from entering sing-box initialization, avoiding expensive rebuild loops
 		if len(buildResult.FailedIndices) > 0 {
-			log.Printf("⚠️  Removing %d nodes that failed during build phase", len(buildResult.FailedIndices))
-			
-			// Sort indices in descending order for safe removal
-			indices := make([]int, len(buildResult.FailedIndices))
-			copy(indices, buildResult.FailedIndices)
-			for i := 0; i < len(indices); i++ {
-				for j := i + 1; j < len(indices); j++ {
-					if indices[i] < indices[j] {
-						indices[i], indices[j] = indices[j], indices[i]
-					}
-				}
+			indices := uniqueSortedDescending(buildResult.FailedIndices)
+			log.Printf("⚠️  Removing %d nodes that failed during build phase", len(indices))
+			if summary := summarizeNodeNames(workingCfg.Nodes, indices); summary != "" {
+				log.Printf("    Affected nodes: %s", summary)
 			}
-			
-			// Remove from highest to lowest index
-			for _, idx := range indices {
-				if idx < len(workingCfg.Nodes) {
-					workingCfg.Nodes = append(workingCfg.Nodes[:idx], workingCfg.Nodes[idx+1:]...)
-				}
-			}
+			workingCfg.Nodes = removeNodesByIndices(workingCfg.Nodes, indices)
 			log.Printf("⚠️  %d nodes remaining after removing build failures", len(workingCfg.Nodes))
-			
+
 			// Rebuild with cleaned node list
 			continue
 		}
