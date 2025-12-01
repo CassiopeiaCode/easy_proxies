@@ -142,6 +142,12 @@
       transform: translateY(0);
     }
 
+    .btn:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
+      pointer-events: none;
+    }
+
     .btn-sm {
       padding: 6px 14px;
       font-size: 13px;
@@ -584,6 +590,21 @@
 
     .login-error.show { display: block; }
 
+    /* Pagination */
+    .pagination-controls {
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      gap: 16px;
+      margin-top: 32px;
+    }
+
+    .pagination-controls span {
+      font-size: 15px;
+      color: var(--text-secondary);
+      font-weight: 500;
+    }
+
     /* Responsive */
     @media (max-width: 768px) {
       .app { padding: 24px 16px; }
@@ -647,6 +668,12 @@
 
     <div id="nodesContainer" class="nodes-grid"></div>
 
+    <div class="pagination-controls" id="paginationControls" style="display: none;">
+      <button class="btn btn-secondary" id="prevPageBtn" onclick="prevPage()">‹ 上一页</button>
+      <span id="pageInfo"></span>
+      <button class="btn btn-secondary" id="nextPageBtn" onclick="nextPage()">下一页 ›</button>
+    </div>
+
     <div id="emptyState" class="empty" style="display: none;">
       <svg width="64" height="64" viewBox="0 0 64 64" fill="none" opacity="0.2">
         <circle cx="32" cy="32" r="30" stroke="currentColor" stroke-width="4"/>
@@ -692,6 +719,10 @@
     let autoRefreshInterval = null;
     let isAutoRefresh = true;
     let isAuthenticated = false;
+
+    let allNodes = [];
+    let currentPage = 1;
+    const nodesPerPage = 100;
 
     // 检查是否需要登录
     async function checkAuth() {
@@ -842,17 +873,30 @@
     }
 
     function render(nodes) {
+      allNodes = nodes;
+      currentPage = 1;
+      renderPage();
+    }
+
+    function renderPage() {
       const container = document.getElementById('nodesContainer');
       const emptyState = document.getElementById('emptyState');
+      const paginationControls = document.getElementById('paginationControls');
 
-      if (nodes.length === 0) {
+      if (allNodes.length === 0) {
         container.innerHTML = '';
         emptyState.style.display = 'block';
+        paginationControls.style.display = 'none';
         return;
       }
 
       emptyState.style.display = 'none';
-      container.innerHTML = nodes.map(node => {
+
+      const start = (currentPage - 1) * nodesPerPage;
+      const end = start + nodesPerPage;
+      const paginatedNodes = allNodes.slice(start, end);
+
+      container.innerHTML = paginatedNodes.map(node => {
         const status = getNodeStatus(node);
         const latency = node.last_latency_ms || -1;
         const quality = getLatencyQuality(latency);
@@ -920,6 +964,42 @@
           </div>
         `;
       }).join('');
+
+      updatePaginationControls();
+    }
+
+    function updatePaginationControls() {
+      const pageInfo = document.getElementById('pageInfo');
+      const prevPageBtn = document.getElementById('prevPageBtn');
+      const nextPageBtn = document.getElementById('nextPageBtn');
+      const paginationControls = document.getElementById('paginationControls');
+      const totalPages = Math.ceil(allNodes.length / nodesPerPage);
+
+      if (totalPages <= 1) {
+        paginationControls.style.display = 'none';
+        return;
+      }
+      paginationControls.style.display = 'flex';
+
+      pageInfo.textContent = `第 ${currentPage} / ${totalPages} 页`;
+
+      prevPageBtn.disabled = currentPage === 1;
+      nextPageBtn.disabled = currentPage === totalPages;
+    }
+
+    function prevPage() {
+      if (currentPage > 1) {
+        currentPage--;
+        renderPage();
+      }
+    }
+
+    function nextPage() {
+      const totalPages = Math.ceil(allNodes.length / nodesPerPage);
+      if (currentPage < totalPages) {
+        currentPage++;
+        renderPage();
+      }
     }
 
     async function probe(tag) {
