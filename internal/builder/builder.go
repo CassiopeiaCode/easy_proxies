@@ -9,8 +9,10 @@ import (
 	"net/netip"
 	"net/url"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 
 	"easy_proxies/internal/config"
 	poolout "easy_proxies/internal/outbound/pool"
@@ -43,19 +45,27 @@ func ExtractOutboundIndex(err error) (int, bool) {
 	return idx, true
 }
 
+type buildJob struct {
+	idx  int
+	node config.NodeConfig
+	tag  string
+}
+
+type buildResult struct {
+	idx      int
+	outbound option.Outbound
+	err      error
+}
+
 // Build converts high level config into sing-box Options tree.
 func Build(cfg *config.Config) (Result, error) {
-	baseOutbounds := make([]option.Outbound, 0, len(cfg.Nodes))
-	memberTags := make([]string, 0, len(cfg.Nodes))
-	metadata := make(map[string]poolout.MemberMeta)
-	tagToNodeIndex := make(map[string]int)
-	var failedNodes []string
+	// 1. Pre-computation loop (serial) to generate unique tags
+	jobs := make([]buildJob, 0, len(cfg.Nodes))
 	usedTags := make(map[string]int) // Track tag usage for uniqueness
-
 	for idx, node := range cfg.Nodes {
 		baseTag := sanitizeTag(node.Name)
 		if baseTag == "" {
-			baseTag = fmt.Sprintf("node-%d", len(memberTags)+1)
+			baseTag = fmt.Sprintf("node-%d", len(jobs)+1)
 		}
 
 		// Ensure tag uniqueness by appending a counter if needed
@@ -66,29 +76,80 @@ func Build(cfg *config.Config) (Result, error) {
 		} else {
 			usedTags[baseTag] = 1
 		}
+		jobs = append(jobs, buildJob{idx: idx, node: node, tag: tag})
+	}
 
-		outbound, err := buildNodeOutbound(tag, node.URI)
-		if err != nil {
-			log.Printf("❌ Failed to build node '%s': %v (skipping)", node.Name, err)
-			failedNodes = append(failedNodes, node.Name)
+	// 2. Parallel build phase using a worker pool
+	numJobs := len(jobs)
+	jobChan := make(chan buildJob, numJobs)
+	resultsChan := make(chan buildResult, numJobs)
+	var wg sync.WaitGroup
+
+	numWorkers := runtime.NumCPU() * 2
+	if numJobs < numWorkers {
+		numWorkers = numJobs
+	}
+	if numWorkers == 0 && numJobs > 0 {
+		numWorkers = 1
+	}
+
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for job := range jobChan {
+				outbound, err := buildNodeOutbound(job.tag, job.node.URI)
+				resultsChan <- buildResult{idx: job.idx, outbound: outbound, err: err}
+			}
+		}()
+	}
+
+	for _, job := range jobs {
+		jobChan <- job
+	}
+	close(jobChan)
+
+	wg.Wait()
+	close(resultsChan)
+
+	// 3. Post-processing loop (serial) to assemble results in order
+	orderedResults := make([]buildResult, numJobs)
+	for res := range resultsChan {
+		orderedResults[res.idx] = res
+	}
+
+	baseOutbounds := make([]option.Outbound, 0, numJobs)
+	memberTags := make([]string, 0, numJobs)
+	metadata := make(map[string]poolout.MemberMeta)
+	tagToNodeIndex := make(map[string]int)
+	var failedNodes []string
+
+	for _, res := range orderedResults {
+		originalNode := cfg.Nodes[res.idx]
+		originalTag := jobs[res.idx].tag
+
+		if res.err != nil {
+			log.Printf("❌ Failed to build node '%s': %v (skipping)", originalNode.Name, res.err)
+			failedNodes = append(failedNodes, originalNode.Name)
 			continue
 		}
-		memberTags = append(memberTags, tag)
-		baseOutbounds = append(baseOutbounds, outbound)
-		tagToNodeIndex[tag] = idx
+
+		memberTags = append(memberTags, originalTag)
+		baseOutbounds = append(baseOutbounds, res.outbound)
+		tagToNodeIndex[originalTag] = res.idx
 		meta := poolout.MemberMeta{
-			Name: node.Name,
-			URI:  node.URI,
+			Name: originalNode.Name,
+			URI:  originalNode.URI,
 			Mode: cfg.Mode,
 		}
 		if cfg.Mode == "multi-port" {
 			meta.ListenAddress = cfg.MultiPort.Address
-			meta.Port = node.Port
+			meta.Port = originalNode.Port
 		} else {
 			meta.ListenAddress = cfg.Listener.Address
 			meta.Port = cfg.Listener.Port
 		}
-		metadata[tag] = meta
+		metadata[originalTag] = meta
 	}
 
 	// Check if we have at least one valid node
@@ -799,9 +860,11 @@ func printProxyLinks(cfg *config.Config, metadata map[string]poolout.MemberMeta)
 	log.Println("📡 Proxy Links:")
 	log.Println("═══════════════════════════════════════════════════════════════")
 
+	const maxLinksToShow = 20 // 超过此数量则只显示摘要
+	totalNodes := len(cfg.Nodes)
+
 	switch cfg.Mode {
 	case "pool":
-		// Pool mode: single entry point for all nodes
 		var auth string
 		if cfg.Listener.Username != "" {
 			auth = fmt.Sprintf("%s:%s@", cfg.Listener.Username, cfg.Listener.Password)
@@ -811,15 +874,32 @@ func printProxyLinks(cfg *config.Config, metadata map[string]poolout.MemberMeta)
 		log.Printf("   %s", proxyURL)
 		log.Println("")
 		log.Printf("   Nodes in pool (%d):", len(metadata))
-		for _, meta := range metadata {
-			log.Printf("   • %s", meta.Name)
+		if totalNodes > maxLinksToShow {
+			log.Printf("   (Showing first %d nodes)", maxLinksToShow)
+			count := 0
+			for _, meta := range metadata {
+				if count >= maxLinksToShow {
+					break
+				}
+				log.Printf("   • %s", meta.Name)
+				count++
+			}
+		} else {
+			for _, meta := range metadata {
+				log.Printf("   • %s", meta.Name)
+			}
 		}
 
 	case "multi-port":
-		// Multi-port mode: each node has its own port
-		log.Printf("🔌 Multi-Port Mode (%d nodes):", len(cfg.Nodes))
+		log.Printf("🔌 Multi-Port Mode (%d nodes):", totalNodes)
 		log.Println("")
-		for _, node := range cfg.Nodes {
+		if totalNodes > maxLinksToShow {
+			log.Printf("   (Showing first %d nodes)", maxLinksToShow)
+		}
+		for i, node := range cfg.Nodes {
+			if i >= maxLinksToShow {
+				break
+			}
 			var auth string
 			username := node.Username
 			password := node.Password
