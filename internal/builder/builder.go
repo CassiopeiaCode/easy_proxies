@@ -195,6 +195,18 @@ func Build(cfg *config.Config) (Result, error) {
 		return Result{}, fmt.Errorf("no valid nodes available (all %d nodes failed to build)", len(cfg.Nodes))
 	}
 
+	// Count XHTTP fallbacks in successful nodes
+	xhttpCount := 0
+	for _, res := range orderedResults {
+		if res.err == nil {
+			// Check if this node uses XHTTP transport
+			originalNode := cfg.Nodes[res.idx]
+			if strings.Contains(strings.ToLower(originalNode.URI), "type=xhttp") {
+				xhttpCount++
+			}
+		}
+	}
+	
 	// Log summary with error breakdown
 	if len(failedNodes) > 0 {
 		log.Printf("⚠️  Build Summary: %d/%d nodes failed, %d succeeded", len(failedNodes), len(cfg.Nodes), len(baseOutbounds))
@@ -209,7 +221,7 @@ func Build(cfg *config.Config) (Result, error) {
 			case "unsupported_protocol":
 				description = "Unsupported protocols"
 			case "unsupported_transport":
-				description = "Unsupported transport types (KCP, XHTTP, etc.)"
+				description = "Unsupported transport types (KCP, etc.)"
 			case "timeout":
 				description = "Build timeouts"
 			default:
@@ -219,6 +231,11 @@ func Build(cfg *config.Config) (Result, error) {
 		}
 	} else {
 		log.Printf("✅ Successfully built all %d nodes", len(baseOutbounds))
+	}
+	
+	// Log XHTTP fallback summary if any
+	if xhttpCount > 0 {
+		log.Printf("ℹ️  Note: %d nodes using XHTTP transport (automatically converted to HTTPUpgrade)", xhttpCount)
 	}
 
 	// Print proxy links for each node
@@ -594,7 +611,7 @@ func buildV2RayTransport(query url.Values) (*option.V2RayTransportOptions, error
 		options.HTTPUpgradeOptions.Path = query.Get("path")
 	case "xhttp":
 		// XHTTP is not supported by sing-box, fallback to HTTPUpgrade
-		log.Printf("⚠️  XHTTP transport not supported by sing-box, falling back to HTTPUpgrade")
+		// Note: This fallback is logged in summary, not per-node
 		options.Type = C.V2RayTransportTypeHTTPUpgrade
 		options.HTTPUpgradeOptions.Path = query.Get("path")
 		if host := query.Get("host"); host != "" {
