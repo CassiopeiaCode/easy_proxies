@@ -7,6 +7,8 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -33,6 +35,13 @@ const (
 	modeSequential = "sequential"
 	modeRandom     = "random"
 	modeBalance    = "balance"
+)
+
+const (
+	startupHealthCheckConcurrency = 200
+	tcpProbeTimeout               = 2 * time.Second
+	httpProbeTimeout              = 5 * time.Second
+	httpProbePoolSize             = startupHealthCheckConcurrency
 )
 
 // Options controls pool outbound behaviour.
@@ -242,37 +251,121 @@ func (p *poolOutbound) probeAllMembersOnStartup() {
 	copy(members, p.members)
 	p.mu.Unlock()
 
-	availableCount := 0
-	failedCount := 0
-
-	for _, member := range members {
-		// Create a timeout context for each probe (5 seconds)
-		ctx, cancel := context.WithTimeout(p.ctx, 5*time.Second)
-
-		start := time.Now()
-		err := p.probeHTTP(ctx, member, probeURL)
-		latency := time.Since(start)
-
-		if err != nil {
-			p.logger.Warn("initial probe failed for ", member.tag, ": ", err)
-			failedCount++
+	host, port, err := parseProbeTarget(probeURL)
+	if err != nil {
+		p.logger.Warn("invalid probe target, skipping initial health check: ", err)
+		p.mu.Lock()
+		for _, member := range p.members {
 			if member.entry != nil {
-				member.entry.RecordFailure(err)
-				member.entry.MarkInitialCheckDone(false) // 标记为不可用
-			}
-		} else {
-			p.logger.Info("initial probe success for ", member.tag, ", latency: ", latency.Milliseconds(), "ms")
-			availableCount++
-			if member.entry != nil {
-				member.entry.RecordSuccessWithLatency(latency) // 记录成功和延迟
-				member.entry.MarkInitialCheckDone(true)        // 标记为可用
+				member.entry.MarkInitialCheckDone(true)
 			}
 		}
-
-		cancel()
+		p.mu.Unlock()
+		return
 	}
 
-	p.logger.Info("initial health check completed: ", availableCount, " available, ", failedCount, " failed")
+	workerCount := startupHealthCheckConcurrency
+	if len(members) < workerCount {
+		workerCount = len(members)
+	}
+	if workerCount == 0 {
+		return
+	}
+
+	jobs := make(chan *memberState, len(members))
+	var wg sync.WaitGroup
+	var availableCount atomic.Int32
+	var failedCount atomic.Int32
+
+	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for member := range jobs {
+				start := time.Now()
+
+				tcpCtx, tcpCancel := context.WithTimeout(p.ctx, tcpProbeTimeout)
+				tcpErr := p.probeTCP(tcpCtx, member, host, port)
+				tcpCancel()
+				if tcpErr != nil {
+					p.recordInitialProbeFailure(member, fmt.Errorf("tcp dial: %w", tcpErr))
+					failedCount.Add(1)
+					continue
+				}
+
+				httpCtx, httpCancel := context.WithTimeout(p.ctx, httpProbeTimeout)
+				httpErr := p.probeHTTP(httpCtx, member, probeURL, httpProbePoolSize)
+				httpCancel()
+				if httpErr != nil {
+					p.recordInitialProbeFailure(member, httpErr)
+					failedCount.Add(1)
+					continue
+				}
+
+				latency := time.Since(start)
+				p.recordInitialProbeSuccess(member, latency)
+				availableCount.Add(1)
+			}
+		}()
+	}
+
+	for _, member := range members {
+		jobs <- member
+	}
+	close(jobs)
+	wg.Wait()
+
+	p.logger.Info("initial health check completed: ", availableCount.Load(), " available, ", failedCount.Load(), " failed")
+}
+
+func parseProbeTarget(rawURL string) (string, uint16, error) {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return "", 0, err
+	}
+	host := parsed.Hostname()
+	if host == "" {
+		return "", 0, fmt.Errorf("probe url missing host: %s", rawURL)
+	}
+	port := 80
+	switch strings.ToLower(parsed.Scheme) {
+	case "https":
+		port = 443
+	case "http":
+		port = 80
+	}
+	if p := parsed.Port(); p != "" {
+		if n, err := strconv.Atoi(p); err == nil && n > 0 && n <= 65535 {
+			port = n
+		}
+	}
+	return host, uint16(port), nil
+}
+
+func (p *poolOutbound) probeTCP(ctx context.Context, member *memberState, host string, port uint16) error {
+	destination := M.ParseSocksaddrHostPort(host, port)
+	conn, err := member.outbound.DialContext(ctx, N.NetworkTCP, destination)
+	if err != nil {
+		return err
+	}
+	_ = conn.Close()
+	return nil
+}
+
+func (p *poolOutbound) recordInitialProbeFailure(member *memberState, err error) {
+	p.logger.Warn("initial probe failed for ", member.tag, ": ", err)
+	if member.entry != nil {
+		member.entry.RecordFailure(err)
+		member.entry.MarkInitialCheckDone(false)
+	}
+}
+
+func (p *poolOutbound) recordInitialProbeSuccess(member *memberState, latency time.Duration) {
+	p.logger.Info("initial probe success for ", member.tag, ", latency: ", latency.Milliseconds(), "ms")
+	if member.entry != nil {
+		member.entry.RecordSuccessWithLatency(latency)
+		member.entry.MarkInitialCheckDone(true)
+	}
 }
 
 func (p *poolOutbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
@@ -485,28 +578,36 @@ func (p *poolOutbound) makeReleaseFunc(member *memberState) func() {
 }
 
 // probeHTTP performs HTTP GET request through the proxy to verify connectivity
-func (p *poolOutbound) probeHTTP(ctx context.Context, member *memberState, url string) error {
+func (p *poolOutbound) probeHTTP(ctx context.Context, member *memberState, url string, poolSize int) error {
 	// Create HTTP client that uses the proxy outbound for dialing
-	client := &http.Client{
-		Transport: &http.Transport{
-			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-				// Parse the address to get host and port
-				host, port, err := net.SplitHostPort(addr)
-				if err != nil {
-					return nil, err
-				}
-				portNum := uint16(80)
-				if port == "443" {
-					portNum = 443
-				}
-				destination := M.ParseSocksaddrHostPort(host, portNum)
-				return member.outbound.DialContext(ctx, network, destination)
-			},
+	if poolSize <= 0 {
+		poolSize = 1
+	}
+	transport := &http.Transport{
+		MaxConnsPerHost:     poolSize,
+		MaxIdleConns:        poolSize,
+		MaxIdleConnsPerHost: poolSize,
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			// Parse the address to get host and port
+			host, port, err := net.SplitHostPort(addr)
+			if err != nil {
+				return nil, err
+			}
+			portNum := uint16(80)
+			if port == "443" {
+				portNum = 443
+			}
+			destination := M.ParseSocksaddrHostPort(host, portNum)
+			return member.outbound.DialContext(ctx, network, destination)
 		},
+	}
+	client := &http.Client{
+		Transport: transport,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse // Don't follow redirects
 		},
 	}
+	defer transport.CloseIdleConnections()
 
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
@@ -539,7 +640,7 @@ func (p *poolOutbound) makeProbeFunc(member *memberState) func(ctx context.Conte
 	}
 	return func(ctx context.Context) (time.Duration, error) {
 		start := time.Now()
-		err := p.probeHTTP(ctx, member, probeURL)
+		err := p.probeHTTP(ctx, member, probeURL, httpProbePoolSize)
 		if err != nil {
 			if member.entry != nil {
 				member.entry.RecordFailure(err)
@@ -588,7 +689,7 @@ func (p *poolOutbound) makeProbeByTagFunc(tag string) func(ctx context.Context) 
 		}
 
 		start := time.Now()
-		err := p.probeHTTP(ctx, member, probeURL)
+		err := p.probeHTTP(ctx, member, probeURL, httpProbePoolSize)
 		if err != nil {
 			if member.entry != nil {
 				member.entry.RecordFailure(err)
@@ -650,12 +751,12 @@ type trackedConn struct {
 
 func (c *trackedConn) Read(b []byte) (n int, err error) {
 	n, err = c.Conn.Read(b)
-	
+
 	c.mu.Lock()
 	c.bytesRead += int64(n)
 	checkNeeded := c.checkPending && c.bytesRead < 10
 	c.mu.Unlock()
-	
+
 	// If connection is closing and we haven't received 10 bytes, record failure
 	if err != nil && checkNeeded {
 		c.pool.recordFailure(c.member, fmt.Errorf("connection closed after %d bytes (expected at least 10): %w", c.bytesRead, err))
@@ -665,7 +766,7 @@ func (c *trackedConn) Read(b []byte) (n int, err error) {
 		c.checkPending = false
 		c.mu.Unlock()
 	}
-	
+
 	return n, err
 }
 
@@ -674,12 +775,12 @@ func (c *trackedConn) Close() error {
 	checkNeeded := c.checkPending && c.bytesRead < 10
 	bytesRead := c.bytesRead
 	c.mu.Unlock()
-	
+
 	// If closing with less than 10 bytes read, record as failure
 	if checkNeeded {
 		c.pool.recordFailure(c.member, fmt.Errorf("connection closed with only %d bytes received (expected at least 10)", bytesRead))
 	}
-	
+
 	err := c.Conn.Close()
 	c.once.Do(c.release)
 	return err

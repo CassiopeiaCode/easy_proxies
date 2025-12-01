@@ -24,9 +24,9 @@ type Config struct {
 	Pool          PoolConfig       `yaml:"pool"`
 	Management    ManagementConfig `yaml:"management"`
 	Nodes         []NodeConfig     `yaml:"nodes"`
-	NodesFile     string           `yaml:"nodes_file"`     // 节点文件路径，每行一个 URI
-	Subscriptions []string         `yaml:"subscriptions"`  // 订阅链接列表
-	ExternalIP    string           `yaml:"external_ip"`    // 外部 IP 地址，用于导出时替换 0.0.0.0
+	NodesFile     string           `yaml:"nodes_file"`    // 节点文件路径，每行一个 URI
+	Subscriptions []string         `yaml:"subscriptions"` // 订阅链接列表
+	ExternalIP    string           `yaml:"external_ip"`   // 外部 IP 地址，用于导出时替换 0.0.0.0
 	LogLevel      string           `yaml:"log_level"`
 }
 
@@ -162,6 +162,17 @@ func (c *Config) normalize() error {
 	if len(c.Nodes) == 0 {
 		return errors.New("config.nodes cannot be empty (configure nodes in config or use nodes_file)")
 	}
+
+	// Deduplicate nodes by host/IP to avoid repeated checks / builds
+	uniqueNodes, removed := deduplicateNodesByHost(c.Nodes)
+	if removed > 0 {
+		log.Printf("⚠️ 去重：发现 %d 个主机/IP 重复的节点，已自动跳过", removed)
+	}
+	if len(uniqueNodes) == 0 {
+		return errors.New("all nodes were removed after deduplication; please provide distinct hosts/IPs")
+	}
+	c.Nodes = uniqueNodes
+
 	portCursor := c.MultiPort.BasePort
 	for idx := range c.Nodes {
 		c.Nodes[idx].Name = strings.TrimSpace(c.Nodes[idx].Name)
@@ -205,6 +216,52 @@ func (c *Config) normalize() error {
 		c.LogLevel = "info"
 	}
 	return nil
+}
+
+const maxDedupLogEntries = 5
+
+// deduplicateNodesByHost removes nodes that share the same host/IP, keeping the first occurrence.
+func deduplicateNodesByHost(nodes []NodeConfig) ([]NodeConfig, int) {
+	if len(nodes) == 0 {
+		return nodes, 0
+	}
+	seen := make(map[string]NodeConfig)
+	deduped := make([]NodeConfig, 0, len(nodes))
+	duplicateLogs := 0
+	for _, node := range nodes {
+		host := extractHostFromURI(node.URI)
+		key := strings.ToLower(host)
+
+		if key == "" {
+			deduped = append(deduped, node)
+			continue
+		}
+
+		if existing, exists := seen[key]; exists {
+			if duplicateLogs < maxDedupLogEntries {
+				log.Printf("⚠️ 去重：节点 %q (host=%s) 与 %q 重复，已跳过", node.Name, host, existing.Name)
+				duplicateLogs++
+			}
+			continue
+		}
+
+		seen[key] = node
+		deduped = append(deduped, node)
+	}
+	return deduped, len(nodes) - len(deduped)
+}
+
+// extractHostFromURI returns the hostname or IP from the node URI.
+func extractHostFromURI(rawURI string) string {
+	rawURI = strings.TrimSpace(rawURI)
+	if rawURI == "" {
+		return ""
+	}
+	parsed, err := url.Parse(rawURI)
+	if err != nil {
+		return ""
+	}
+	return parsed.Hostname()
 }
 
 // ManagementEnabled reports whether the monitoring endpoint should run.
@@ -356,27 +413,27 @@ type clashConfig struct {
 }
 
 type clashProxy struct {
-	Name           string                 `yaml:"name"`
-	Type           string                 `yaml:"type"`
-	Server         string                 `yaml:"server"`
-	Port           int                    `yaml:"port"`
-	UUID           string                 `yaml:"uuid"`
-	Password       string                 `yaml:"password"`
-	Cipher         string                 `yaml:"cipher"`
-	AlterId        int                    `yaml:"alterId"`
-	Network        string                 `yaml:"network"`
-	TLS            bool                   `yaml:"tls"`
-	SkipCertVerify bool                   `yaml:"skip-cert-verify"`
-	ServerName     string                 `yaml:"servername"`
-	SNI            string                 `yaml:"sni"`
-	Flow           string                 `yaml:"flow"`
-	UDP            bool                   `yaml:"udp"`
-	WSOpts         *clashWSOptions        `yaml:"ws-opts"`
-	GrpcOpts       *clashGrpcOptions      `yaml:"grpc-opts"`
-	RealityOpts    *clashRealityOptions   `yaml:"reality-opts"`
-	ClientFingerprint string              `yaml:"client-fingerprint"`
-	Plugin         string                 `yaml:"plugin"`
-	PluginOpts     map[string]interface{} `yaml:"plugin-opts"`
+	Name              string                 `yaml:"name"`
+	Type              string                 `yaml:"type"`
+	Server            string                 `yaml:"server"`
+	Port              int                    `yaml:"port"`
+	UUID              string                 `yaml:"uuid"`
+	Password          string                 `yaml:"password"`
+	Cipher            string                 `yaml:"cipher"`
+	AlterId           int                    `yaml:"alterId"`
+	Network           string                 `yaml:"network"`
+	TLS               bool                   `yaml:"tls"`
+	SkipCertVerify    bool                   `yaml:"skip-cert-verify"`
+	ServerName        string                 `yaml:"servername"`
+	SNI               string                 `yaml:"sni"`
+	Flow              string                 `yaml:"flow"`
+	UDP               bool                   `yaml:"udp"`
+	WSOpts            *clashWSOptions        `yaml:"ws-opts"`
+	GrpcOpts          *clashGrpcOptions      `yaml:"grpc-opts"`
+	RealityOpts       *clashRealityOptions   `yaml:"reality-opts"`
+	ClientFingerprint string                 `yaml:"client-fingerprint"`
+	Plugin            string                 `yaml:"plugin"`
+	PluginOpts        map[string]interface{} `yaml:"plugin-opts"`
 }
 
 type clashWSOptions struct {
