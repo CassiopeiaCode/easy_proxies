@@ -131,6 +131,34 @@ func Run(ctx context.Context, cfg *config.Config) error {
 			return err
 		}
 
+		// Pre-remove all nodes that failed during build phase
+		// This prevents them from entering sing-box initialization, avoiding expensive rebuild loops
+		if len(buildResult.FailedIndices) > 0 {
+			log.Printf("⚠️  Removing %d nodes that failed during build phase", len(buildResult.FailedIndices))
+			
+			// Sort indices in descending order for safe removal
+			indices := make([]int, len(buildResult.FailedIndices))
+			copy(indices, buildResult.FailedIndices)
+			for i := 0; i < len(indices); i++ {
+				for j := i + 1; j < len(indices); j++ {
+					if indices[i] < indices[j] {
+						indices[i], indices[j] = indices[j], indices[i]
+					}
+				}
+			}
+			
+			// Remove from highest to lowest index
+			for _, idx := range indices {
+				if idx < len(workingCfg.Nodes) {
+					workingCfg.Nodes = append(workingCfg.Nodes[:idx], workingCfg.Nodes[idx+1:]...)
+				}
+			}
+			log.Printf("⚠️  %d nodes remaining after removing build failures", len(workingCfg.Nodes))
+			
+			// Rebuild with cleaned node list
+			continue
+		}
+
 		inboundRegistry := include.InboundRegistry()
 		outboundRegistry := include.OutboundRegistry()
 		pool.Register(outboundRegistry)

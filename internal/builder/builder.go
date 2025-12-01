@@ -30,7 +30,7 @@ type Result struct {
 	BaseTags       []string
 	TagToNodeIndex map[string]int
 	MemberMetadata map[string]poolout.MemberMeta
-	FailedIndices  []int // 构建失败的节点索引列表
+	FailedIndices  []int // 构建失败的节点索引列表 - 用于批量移除避免重复构建
 }
 
 var outboundIndexPattern = regexp.MustCompile(`outbound\[(\d+)\]`)
