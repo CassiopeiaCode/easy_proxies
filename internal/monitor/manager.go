@@ -421,6 +421,12 @@ func (e *entry) recordProbeLatency(d time.Duration) {
 	e.mu.Unlock()
 }
 
+func (e *entry) isAvailable() (bool, bool) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.initialCheckDone, e.available
+}
+
 // RecordFailure updates failure counters.
 func (h *EntryHandle) RecordFailure(err error) {
 	if h == nil || h.ref == nil {
@@ -492,6 +498,14 @@ func (h *EntryHandle) SetRelease(fn func()) {
 		return
 	}
 	h.ref.setRelease(fn)
+}
+
+// IsAvailable returns whether the initial check is done and the node is available.
+func (h *EntryHandle) IsAvailable() (checked bool, available bool) {
+	if h == nil || h.ref == nil {
+		return false, false
+	}
+	return h.ref.isAvailable()
 }
 
 // MarkInitialCheckDone marks the initial health check as completed.

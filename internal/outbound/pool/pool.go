@@ -346,6 +346,17 @@ func (p *poolOutbound) availableMembersLocked(now time.Time, network string) []*
 		if network != "" && !common.Contains(member.outbound.Network(), network) {
 			continue
 		}
+
+		// Only include members that have been checked and are available.
+		// This applies to all modes. If the monitor is not enabled, entry will be nil,
+		// and this check is skipped, effectively treating all nodes as available.
+		if member.entry != nil {
+			checked, available := member.entry.IsAvailable()
+			if !checked || !available {
+				continue // Skip untested or unavailable nodes
+			}
+		}
+
 		result = append(result, member)
 	}
 	return result
