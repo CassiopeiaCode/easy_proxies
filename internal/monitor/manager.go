@@ -256,13 +256,20 @@ func (m *Manager) Register(info NodeInfo) *EntryHandle {
 					e.blacklist = false
 					e.until = time.Time{}
 				}
-				// Seed availability state from persisted record so that
-				// nodes that were previously checked and healthy can be
-				// used immediately after restart, without waiting for a
-				// new round of health checks.
+				// Seed availability and probe state from persisted record so that
+				// nodes that were previously checked and healthy can be used
+				// immediately after restart, without waiting for a new round of
+				// health checks.
 				if !rec.LastSuccessAt.IsZero() || rec.FailureCount > 0 {
 					e.initialCheckDone = true
 					e.available = rec.Enabled
+					// Restore last success / failure timestamps for UI
+					if !rec.LastSuccessAt.IsZero() {
+						e.lastOK = rec.LastSuccessAt
+					}
+					if !rec.LastFailureAt.IsZero() {
+						e.lastFail = rec.LastFailureAt
+					}
 					if rec.LatencyMs > 0 {
 						e.lastProbe = time.Duration(rec.LatencyMs) * time.Millisecond
 					}
