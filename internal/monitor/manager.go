@@ -256,6 +256,17 @@ func (m *Manager) Register(info NodeInfo) *EntryHandle {
 					e.blacklist = false
 					e.until = time.Time{}
 				}
+				// Seed availability state from persisted record so that
+				// nodes that were previously checked and healthy can be
+				// used immediately after restart, without waiting for a
+				// new round of health checks.
+				if !rec.LastSuccessAt.IsZero() || rec.FailureCount > 0 {
+					e.initialCheckDone = true
+					e.available = rec.Enabled
+					if rec.LatencyMs > 0 {
+						e.lastProbe = time.Duration(rec.LatencyMs) * time.Millisecond
+					}
+				}
 			}
 		}
 	}
