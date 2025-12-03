@@ -60,6 +60,10 @@ type MemberMeta struct {
 	Mode          string
 	ListenAddress string
 	Port          uint16
+	EndpointID    string
+	EndpointHost  string
+	EndpointPort  uint16
+	Scheme        string
 }
 
 // Register wires the pool outbound into the registry.
@@ -125,6 +129,10 @@ func newPool(ctx context.Context, _ adapter.Router, logger log.ContextLogger, ta
 				Mode:          meta.Mode,
 				ListenAddress: meta.ListenAddress,
 				Port:          meta.Port,
+				EndpointID:    meta.EndpointID,
+				EndpointHost:  meta.EndpointHost,
+				EndpointPort:  meta.EndpointPort,
+				Scheme:        meta.Scheme,
 			}
 			entry := monitorMgr.Register(info)
 			if entry != nil {
@@ -210,6 +218,10 @@ func (p *poolOutbound) initializeMembersLocked() error {
 				Mode:          meta.Mode,
 				ListenAddress: meta.ListenAddress,
 				Port:          meta.Port,
+				EndpointID:    meta.EndpointID,
+				EndpointHost:  meta.EndpointHost,
+				EndpointPort:  meta.EndpointPort,
+				Scheme:        meta.Scheme,
 			}
 			entry := p.monitor.Register(info)
 			if entry != nil {
@@ -219,6 +231,12 @@ func (p *poolOutbound) initializeMembersLocked() error {
 				}
 			}
 			member.entry = entry
+			if entry != nil {
+				if blacklisted, until := entry.BlacklistState(); blacklisted {
+					member.blacklisted = true
+					member.blacklistedUntil = until
+				}
+			}
 		}
 		members = append(members, member)
 	}

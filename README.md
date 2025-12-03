@@ -14,6 +14,9 @@
 - **自动健康检查**: 启动时自动检测所有节点可用性，定期（5分钟）检查节点状态
 - **智能节点过滤**: 自动过滤不可用节点，WebUI 和导出按延迟排序
 - **灵活配置**: 支持配置文件、节点文件、订阅链接多种方式
+- **节点状态持久化**: 拉黑/失败次数跨重启保存，重启后自动恢复
+- **订阅自动刷新**: 默认 24 小时自动更新订阅节点，可自定义周期
+- **Host+Port 去重**: 以 `host:port` 作为全局 ID，跨订阅统一识别同一出口
 
 ## 快速开始
 
@@ -56,6 +59,9 @@ go build -tags "with_utls with_quic with_grpc" -o easy-proxies ./cmd/easy_proxie
 ```yaml
 mode: pool                    # 运行模式: pool (节点池) 或 multi-port (多端口)
 log_level: info               # 日志级别: debug, info, warn, error
+state_file: state/nodes_state.json   # 节点状态持久化文件（可选）
+state_flush_interval: 30s           # 状态刷盘周期
+subscription_refresh_interval: 24h  # 订阅自动刷新周期（需配置 subscriptions）
 external_ip: ""               # 外部 IP 地址，用于导出时替换 0.0.0.0（Docker 部署时建议配置）
 
 # 订阅链接（可选，支持多个）
@@ -198,6 +204,13 @@ vmess://base64...#VMess节点
 ```
 
 **方式 3: 直接在配置文件中**
+
+### 节点状态持久化 & 禁用策略
+
+- 每个节点在解析阶段都会生成 `endpoint_id = host:port`，即使订阅名称或 URI 发生变化，只要出口一致就会被视为同一个节点。
+- `state_file` 保存统一的 JSON 表，记录 ID、Host、Port、协议、最新 URI、启用状态、失败次数、拉黑到期时间、最近成功/失败时间以及延迟。
+- 构建/初始化失败或运行期被拉黑的节点会立即写入 `state_file` 并标记为 `enabled=false`，下次启动或订阅刷新时会被自动跳过，避免浪费资源；在 WebUI 中“解除拉黑”会同步更新该记录。
+- 订阅刷新、新节点加入或 Docker 重启都只需要挂载同一个 `state/` 目录即可继承历史状态；如果某个节点真正下线，只需清空或删除对应记录（或等待订阅提供新的 host:port）。
 
 ```yaml
 nodes:

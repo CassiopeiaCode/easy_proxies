@@ -10,6 +10,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"easy_proxies/internal/state"
+
 	M "github.com/sagernet/sing/common/metadata"
 )
 
@@ -32,6 +34,10 @@ type NodeInfo struct {
 	Mode          string `json:"mode"`
 	ListenAddress string `json:"listen_address,omitempty"`
 	Port          uint16 `json:"port,omitempty"`
+	EndpointID    string `json:"endpoint_id,omitempty"`
+	EndpointHost  string `json:"endpoint_host,omitempty"`
+	EndpointPort  uint16 `json:"endpoint_port,omitempty"`
+	Scheme        string `json:"scheme,omitempty"`
 }
 
 // Snapshot is a runtime view of a proxy node.
@@ -72,6 +78,7 @@ type entry struct {
 	initialCheckDone bool // 初始健康检查是否完成
 	available        bool // 节点是否可用（初始检查通过）
 	mu               sync.RWMutex
+	state            *state.Store
 }
 
 // Manager aggregates all node states for the UI/API.
@@ -85,6 +92,7 @@ type Manager struct {
 	ctx        context.Context
 	cancel     context.CancelFunc
 	logger     Logger
+	state      *state.Store
 }
 
 // Logger interface for logging
@@ -94,13 +102,14 @@ type Logger interface {
 }
 
 // NewManager constructs a manager and pre-validates the probe target.
-func NewManager(cfg Config) (*Manager, error) {
+func NewManager(cfg Config, store *state.Store) (*Manager, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	m := &Manager{
 		cfg:    cfg,
 		nodes:  make(map[string]*entry),
 		ctx:    ctx,
 		cancel: cancel,
+		state:  store,
 	}
 	if cfg.ProbeTarget != "" {
 		// ProbeTarget is now expected to be a full HTTP URL
@@ -228,10 +237,27 @@ func (m *Manager) Register(info NodeInfo) *EntryHandle {
 	defer m.mu.Unlock()
 	e, ok := m.nodes[info.Tag]
 	if !ok {
-		e = &entry{info: info}
+		e = &entry{info: info, state: m.state}
 		m.nodes[info.Tag] = e
 	} else {
 		e.info = info
+		e.state = m.state
+	}
+	if m.state != nil {
+		meta := metaFromInfo(info)
+		if meta.ID != "" {
+			m.state.UpdateMeta(meta)
+			if rec, ok := m.state.Get(meta.ID); ok {
+				e.failure = rec.FailureCount
+				if !rec.Enabled {
+					e.blacklist = true
+					e.until = rec.BlacklistUntil
+				} else {
+					e.blacklist = false
+					e.until = time.Time{}
+				}
+			}
+		}
 	}
 	return &EntryHandle{ref: e}
 }
@@ -329,6 +355,12 @@ func (m *Manager) Release(tag string) error {
 		return errors.New("release not available for this node")
 	}
 	e.release()
+	if m.state != nil {
+		meta := metaFromInfo(e.info)
+		if meta.ID != "" {
+			m.state.Enable(meta)
+		}
+	}
 	return nil
 }
 
@@ -369,30 +401,51 @@ func (e *entry) snapshot() Snapshot {
 
 func (e *entry) recordFailure(err error) {
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	e.failure++
 	e.lastError = err.Error()
 	e.lastFail = time.Now()
+	until := e.until
+	store := e.state
+	meta := metaFromInfo(e.info)
+	e.mu.Unlock()
+	if store != nil && meta.ID != "" {
+		store.RecordFailure(meta, until)
+	}
 }
 
 func (e *entry) recordSuccess() {
 	e.mu.Lock()
+	store := e.state
+	meta := metaFromInfo(e.info)
 	e.lastOK = time.Now()
 	e.mu.Unlock()
+	if store != nil && meta.ID != "" {
+		store.RecordSuccess(meta, 0)
+	}
 }
 
 func (e *entry) blacklistUntil(until time.Time) {
 	e.mu.Lock()
 	e.blacklist = true
 	e.until = until
+	store := e.state
+	meta := metaFromInfo(e.info)
 	e.mu.Unlock()
+	if store != nil && meta.ID != "" {
+		store.Disable(meta, until)
+	}
 }
 
 func (e *entry) clearBlacklist() {
 	e.mu.Lock()
 	e.blacklist = false
 	e.until = time.Time{}
+	store := e.state
+	meta := metaFromInfo(e.info)
 	e.mu.Unlock()
+	if store != nil && meta.ID != "" {
+		store.Enable(meta)
+	}
 }
 
 func (e *entry) incActive() {
@@ -417,8 +470,13 @@ func (e *entry) setRelease(fn releaseFunc) {
 
 func (e *entry) recordProbeLatency(d time.Duration) {
 	e.mu.Lock()
+	store := e.state
+	meta := metaFromInfo(e.info)
 	e.lastProbe = d
 	e.mu.Unlock()
+	if store != nil && meta.ID != "" && d > 0 {
+		store.RecordSuccess(meta, d)
+	}
 }
 
 func (e *entry) isAvailable() (bool, bool) {
@@ -466,6 +524,16 @@ func (h *EntryHandle) ClearBlacklist() {
 		return
 	}
 	h.ref.clearBlacklist()
+}
+
+// BlacklistState reports current blacklist flag and expiration.
+func (h *EntryHandle) BlacklistState() (bool, time.Time) {
+	if h == nil || h.ref == nil {
+		return false, time.Time{}
+	}
+	h.ref.mu.RLock()
+	defer h.ref.mu.RUnlock()
+	return h.ref.blacklist, h.ref.until
 }
 
 // IncActive increments the active connection counter.
@@ -517,6 +585,35 @@ func (h *EntryHandle) MarkInitialCheckDone(available bool) {
 	h.ref.initialCheckDone = true
 	h.ref.available = available
 	h.ref.mu.Unlock()
+}
+
+// PruneByTags removes nodes that are no longer present.
+func (m *Manager) PruneByTags(tags []string) {
+	if len(tags) == 0 {
+		return
+	}
+	set := make(map[string]struct{}, len(tags))
+	for _, tag := range tags {
+		set[tag] = struct{}{}
+	}
+	m.mu.Lock()
+	for tag := range m.nodes {
+		if _, ok := set[tag]; !ok {
+			delete(m.nodes, tag)
+		}
+	}
+	m.mu.Unlock()
+}
+
+func metaFromInfo(info NodeInfo) state.Meta {
+	return state.Meta{
+		ID:     info.EndpointID,
+		Host:   info.EndpointHost,
+		Port:   info.EndpointPort,
+		Scheme: info.Scheme,
+		Name:   info.Name,
+		URI:    info.URI,
+	}
 }
 
 // MarkAvailable updates the availability status.

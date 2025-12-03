@@ -195,9 +195,13 @@ func Build(cfg *config.Config) (Result, error) {
 		baseOutbounds = append(baseOutbounds, res.outbound)
 		tagToNodeIndex[originalTag] = res.idx
 		meta := poolout.MemberMeta{
-			Name: originalNode.Name,
-			URI:  originalNode.URI,
-			Mode: cfg.Mode,
+			Name:         originalNode.Name,
+			URI:          originalNode.URI,
+			Mode:         cfg.Mode,
+			EndpointID:   originalNode.EndpointID,
+			EndpointHost: originalNode.EndpointHost,
+			EndpointPort: originalNode.EndpointPort,
+			Scheme:       originalNode.EndpointScheme,
 		}
 		if cfg.Mode == "multi-port" {
 			meta.ListenAddress = cfg.MultiPort.Address

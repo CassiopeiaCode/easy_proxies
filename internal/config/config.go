@@ -2,14 +2,17 @@ package config
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -18,16 +21,20 @@ import (
 
 // Config describes the high level settings for the proxy pool server.
 type Config struct {
-	Mode          string           `yaml:"mode"`
-	Listener      ListenerConfig   `yaml:"listener"`
-	MultiPort     MultiPortConfig  `yaml:"multi_port"`
-	Pool          PoolConfig       `yaml:"pool"`
-	Management    ManagementConfig `yaml:"management"`
-	Nodes         []NodeConfig     `yaml:"nodes"`
-	NodesFile     string           `yaml:"nodes_file"`    // 节点文件路径，每行一个 URI
-	Subscriptions []string         `yaml:"subscriptions"` // 订阅链接列表
-	ExternalIP    string           `yaml:"external_ip"`   // 外部 IP 地址，用于导出时替换 0.0.0.0
-	LogLevel      string           `yaml:"log_level"`
+	Mode                        string           `yaml:"mode"`
+	Listener                    ListenerConfig   `yaml:"listener"`
+	MultiPort                   MultiPortConfig  `yaml:"multi_port"`
+	Pool                        PoolConfig       `yaml:"pool"`
+	Management                  ManagementConfig `yaml:"management"`
+	Nodes                       []NodeConfig     `yaml:"nodes"`
+	NodesFile                   string           `yaml:"nodes_file"`    // 节点文件路径，每行一个 URI
+	Subscriptions               []string         `yaml:"subscriptions"` // 订阅链接列表
+	ExternalIP                  string           `yaml:"external_ip"`   // 外部 IP 地址，用于导出时替换 0.0.0.0
+	LogLevel                    string           `yaml:"log_level"`
+	StateFile                   string           `yaml:"state_file"`                    // 节点状态持久化文件
+	StateFlushInterval          time.Duration    `yaml:"state_flush_interval"`          // 状态刷盘周期
+	SubscriptionRefreshInterval time.Duration    `yaml:"subscription_refresh_interval"` // 订阅自动刷新周期
+	ConfigPath                  string           `yaml:"-"`
 }
 
 // ListenerConfig defines how the HTTP proxy should listen for clients.
@@ -63,11 +70,32 @@ type ManagementConfig struct {
 
 // NodeConfig describes a single upstream proxy endpoint expressed as URI.
 type NodeConfig struct {
-	Name     string `yaml:"name"`
-	URI      string `yaml:"uri"`
-	Port     uint16 `yaml:"port,omitempty"`
-	Username string `yaml:"username,omitempty"`
-	Password string `yaml:"password,omitempty"`
+	Name           string `yaml:"name"`
+	URI            string `yaml:"uri"`
+	Port           uint16 `yaml:"port,omitempty"`
+	Username       string `yaml:"username,omitempty"`
+	Password       string `yaml:"password,omitempty"`
+	EndpointID     string `yaml:"-"`
+	EndpointHost   string `yaml:"-"`
+	EndpointPort   uint16 `yaml:"-"`
+	EndpointScheme string `yaml:"-"`
+}
+
+type endpointMeta struct {
+	host   string
+	port   uint16
+	scheme string
+}
+
+var defaultEndpointPorts = map[string]uint16{
+	"vmess":     443,
+	"vless":     443,
+	"trojan":    443,
+	"ss":        8388,
+	"ssr":       8388,
+	"hysteria":  443,
+	"hysteria2": 443,
+	"hy2":       443,
 }
 
 // Load reads YAML config from disk and applies defaults/validation.
@@ -80,11 +108,15 @@ func Load(path string) (*Config, error) {
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("decode config: %w", err)
 	}
+	cfg.ConfigPath = path
+	configDir := filepath.Dir(path)
 
 	// Resolve nodes_file path relative to config file directory
 	if cfg.NodesFile != "" && !filepath.IsAbs(cfg.NodesFile) {
-		configDir := filepath.Dir(path)
 		cfg.NodesFile = filepath.Join(configDir, cfg.NodesFile)
+	}
+	if cfg.StateFile != "" && !filepath.IsAbs(cfg.StateFile) {
+		cfg.StateFile = filepath.Join(configDir, cfg.StateFile)
 	}
 
 	if err := cfg.normalize(); err != nil {
@@ -137,6 +169,16 @@ func (c *Config) normalize() error {
 		defaultEnabled := true
 		c.Management.Enabled = &defaultEnabled
 	}
+	if c.StateFlushInterval <= 0 {
+		c.StateFlushInterval = 30 * time.Second
+	}
+	if c.StateFile == "" {
+		baseDir := filepath.Dir(c.ConfigPath)
+		c.StateFile = filepath.Join(baseDir, "state", "nodes_state.json")
+	}
+	if c.SubscriptionRefreshInterval <= 0 && len(c.Subscriptions) > 0 {
+		c.SubscriptionRefreshInterval = 24 * time.Hour
+	}
 
 	// Load nodes from file if specified
 	if c.NodesFile != "" {
@@ -163,8 +205,8 @@ func (c *Config) normalize() error {
 		return errors.New("config.nodes cannot be empty (configure nodes in config or use nodes_file)")
 	}
 
-	// Deduplicate nodes by host/IP to avoid repeated checks / builds
-	uniqueNodes, removed := deduplicateNodesByHost(c.Nodes)
+	// Deduplicate nodes by endpoint to避免重复
+	uniqueNodes, removed := deduplicateNodesByEndpoint(c.Nodes)
 	if removed > 0 {
 		log.Printf("⚠️ 去重：发现 %d 个主机/IP 重复的节点，已自动跳过", removed)
 	}
@@ -199,6 +241,15 @@ func (c *Config) normalize() error {
 			c.Nodes[idx].Name = fmt.Sprintf("node-%d", idx)
 		}
 
+		if meta, err := parseEndpointMeta(c.Nodes[idx].URI); err == nil {
+			c.Nodes[idx].EndpointHost = meta.host
+			c.Nodes[idx].EndpointPort = meta.port
+			c.Nodes[idx].EndpointScheme = meta.scheme
+			c.Nodes[idx].EndpointID = endpointID(meta.host, meta.port)
+		} else if c.Nodes[idx].EndpointID == "" && err != nil {
+			log.Printf("⚠️ 无法解析节点 %q 的主机信息（URI=%s）：%v", c.Nodes[idx].Name, c.Nodes[idx].URI, err)
+		}
+
 		// Auto-assign port in multi-port mode
 		if c.Nodes[idx].Port == 0 {
 			c.Nodes[idx].Port = portCursor
@@ -220,8 +271,8 @@ func (c *Config) normalize() error {
 
 const maxDedupLogEntries = 5
 
-// deduplicateNodesByHost removes nodes that share the same host/IP, keeping the first occurrence.
-func deduplicateNodesByHost(nodes []NodeConfig) ([]NodeConfig, int) {
+// deduplicateNodesByEndpoint removes nodes that share the same host+port.
+func deduplicateNodesByEndpoint(nodes []NodeConfig) ([]NodeConfig, int) {
 	if len(nodes) == 0 {
 		return nodes, 0
 	}
@@ -229,9 +280,7 @@ func deduplicateNodesByHost(nodes []NodeConfig) ([]NodeConfig, int) {
 	deduped := make([]NodeConfig, 0, len(nodes))
 	duplicateLogs := 0
 	for _, node := range nodes {
-		host := extractHostFromURI(node.URI)
-		key := strings.ToLower(host)
-
+		key := strings.ToLower(node.EndpointID)
 		if key == "" {
 			deduped = append(deduped, node)
 			continue
@@ -239,7 +288,7 @@ func deduplicateNodesByHost(nodes []NodeConfig) ([]NodeConfig, int) {
 
 		if existing, exists := seen[key]; exists {
 			if duplicateLogs < maxDedupLogEntries {
-				log.Printf("⚠️ 去重：节点 %q (host=%s) 与 %q 重复，已跳过", node.Name, host, existing.Name)
+				log.Printf("⚠️ 去重：节点 %q (endpoint=%s:%d) 与 %q 重复，已跳过", node.Name, node.EndpointHost, node.EndpointPort, existing.Name)
 				duplicateLogs++
 			}
 			continue
@@ -251,17 +300,166 @@ func deduplicateNodesByHost(nodes []NodeConfig) ([]NodeConfig, int) {
 	return deduped, len(nodes) - len(deduped)
 }
 
-// extractHostFromURI returns the hostname or IP from the node URI.
-func extractHostFromURI(rawURI string) string {
+func parseEndpointMeta(rawURI string) (endpointMeta, error) {
 	rawURI = strings.TrimSpace(rawURI)
 	if rawURI == "" {
-		return ""
+		return endpointMeta{}, errors.New("empty uri")
 	}
+	lower := strings.ToLower(rawURI)
+	parts := strings.SplitN(lower, "://", 2)
+	if len(parts) != 2 {
+		return endpointMeta{}, fmt.Errorf("invalid uri: %s", rawURI)
+	}
+	scheme := parts[0]
+	payload := ""
+	if idx := strings.Index(rawURI, "://"); idx >= 0 && idx+3 < len(rawURI) {
+		payload = rawURI[idx+3:]
+	}
+
+	var meta endpointMeta
+	meta.scheme = scheme
+
+	switch scheme {
+	case "vmess":
+		if host, port := parseVMessEndpoint(payload); host != "" {
+			meta.host = host
+			meta.port = port
+			return meta, nil
+		}
+	case "ss":
+		if host, port := parseSSEndpoint(payload); host != "" {
+			meta.host = host
+			meta.port = port
+			return meta, nil
+		}
+	}
+
 	parsed, err := url.Parse(rawURI)
 	if err != nil {
+		return endpointMeta{}, err
+	}
+	host := strings.ToLower(parsed.Hostname())
+	if host == "" {
+		return endpointMeta{}, fmt.Errorf("missing host: %s", rawURI)
+	}
+	port := uint16(0)
+	if parsed.Port() != "" {
+		if value, err := strconv.Atoi(parsed.Port()); err == nil && value > 0 && value <= 65535 {
+			port = uint16(value)
+		}
+	}
+	if port == 0 {
+		port = defaultPortForScheme(scheme)
+	}
+	meta.host = host
+	meta.port = port
+	return meta, nil
+}
+
+func endpointID(host string, port uint16) string {
+	host = strings.TrimSpace(strings.ToLower(host))
+	if host == "" || port == 0 {
 		return ""
 	}
-	return parsed.Hostname()
+	return fmt.Sprintf("%s:%d", host, port)
+}
+
+func defaultPortForScheme(scheme string) uint16 {
+	if port, ok := defaultEndpointPorts[strings.ToLower(scheme)]; ok {
+		return port
+	}
+	return 0
+}
+
+func parseVMessEndpoint(payload string) (string, uint16) {
+	data, err := decodeMaybeBase64(payload)
+	if err != nil {
+		return "", 0
+	}
+	var meta struct {
+		Host string `json:"host"`
+		Add  string `json:"add"`
+		Port any    `json:"port"`
+	}
+	if err := json.Unmarshal(data, &meta); err != nil {
+		return "", 0
+	}
+	host := strings.TrimSpace(meta.Host)
+	if host == "" {
+		host = strings.TrimSpace(meta.Add)
+	}
+	if host == "" {
+		return "", 0
+	}
+	host = strings.ToLower(host)
+	port := parsePort(meta.Port)
+	if port == 0 {
+		port = defaultPortForScheme("vmess")
+	}
+	return host, port
+}
+
+func parseSSEndpoint(payload string) (string, uint16) {
+	base := payload
+	if idx := strings.IndexAny(base, "#?"); idx >= 0 {
+		base = base[:idx]
+	}
+	decoded, err := decodeMaybeBase64(base)
+	if err != nil {
+		return parsePlainSSEndpoint(base)
+	}
+	return parsePlainSSEndpoint(string(decoded))
+}
+
+func parsePlainSSEndpoint(decoded string) (string, uint16) {
+	parts := strings.Split(decoded, "@")
+	if len(parts) < 2 {
+		return "", 0
+	}
+	hostPort := parts[len(parts)-1]
+	host, portStr, err := net.SplitHostPort(strings.TrimSpace(hostPort))
+	if err != nil {
+		return "", 0
+	}
+	portVal, err := strconv.Atoi(portStr)
+	if err != nil {
+		return "", 0
+	}
+	return strings.ToLower(host), uint16(portVal)
+}
+
+func decodeMaybeBase64(s string) ([]byte, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil, errors.New("empty base64")
+	}
+	if decoded, err := base64.StdEncoding.DecodeString(s); err == nil {
+		return decoded, nil
+	}
+	if decoded, err := base64.URLEncoding.DecodeString(s); err == nil {
+		return decoded, nil
+	}
+	return base64.RawStdEncoding.DecodeString(s)
+}
+
+func parsePort(value any) uint16 {
+	switch v := value.(type) {
+	case float64:
+		if v <= 0 || v > 65535 {
+			return 0
+		}
+		return uint16(v)
+	case int:
+		if v <= 0 || v > 65535 {
+			return 0
+		}
+		return uint16(v)
+	case string:
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 65535 {
+			return uint16(n)
+		}
+	}
+	return 0
 }
 
 // ManagementEnabled reports whether the monitoring endpoint should run.

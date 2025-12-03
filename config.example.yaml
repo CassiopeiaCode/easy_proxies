@@ -1,5 +1,8 @@
 mode: pool  # pool 或 multi-port（也支持 multi_port）
 log_level: info
+state_file: state/nodes_state.json         # 节点状态持久化路径
+state_flush_interval: 30s                  # 状态刷盘周期
+subscription_refresh_interval: 24h        # 订阅刷新周期（需配置 subscriptions）
 management:
   enabled: true
   listen: 0.0.0.0:9090
@@ -43,4 +46,3 @@ nodes:
 # nodes_file: nodes.txt
 # nodes:
 #   - uri: "vless://xxx@server:443#额外节点"
-

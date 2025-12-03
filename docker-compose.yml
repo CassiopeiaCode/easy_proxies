@@ -16,3 +16,4 @@ services:
     volumes:
       - ./config.yaml:/etc/easy-proxies/config.yaml:ro
       - ./nodes.txt:/etc/easy-proxies/nodes.txt:ro
+      - ./state:/etc/easy-proxies/state
