@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log"
 	"os"
 	"path/filepath"
 	"sync"
@@ -275,6 +276,7 @@ func (s *Store) Flush() error {
 	s.mu.Lock()
 	if !s.dirty {
 		s.mu.Unlock()
+		log.Printf("[state] flush skipped: no pending changes")
 		return nil
 	}
 	records := make([]Record, 0, len(s.data))
@@ -284,23 +286,30 @@ func (s *Store) Flush() error {
 	s.dirty = false
 	s.mu.Unlock()
 
+	log.Printf("[state] flushing %d records to %s", len(records), s.path)
+
 	if err := os.MkdirAll(filepath.Dir(s.path), 0o755); err != nil {
+		log.Printf("[state] flush failed: create dir %s: %v", filepath.Dir(s.path), err)
 		return err
 	}
 	data, err := json.MarshalIndent(records, "", "  ")
 	if err != nil {
+		log.Printf("[state] flush failed: marshal json: %v", err)
 		s.markDirty()
 		return err
 	}
 	tmp := s.path + ".tmp"
 	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		log.Printf("[state] flush failed: write temp file %s: %v", tmp, err)
 		s.markDirty()
 		return err
 	}
 	if err := os.Rename(tmp, s.path); err != nil {
+		log.Printf("[state] flush failed: rename temp file %s -> %s: %v", tmp, s.path, err)
 		s.markDirty()
 		return err
 	}
+	log.Printf("[state] flush complete: %d records persisted", len(records))
 	return nil
 }
 
