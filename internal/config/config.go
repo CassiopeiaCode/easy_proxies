@@ -205,8 +205,53 @@ func (c *Config) normalize() error {
 		return errors.New("config.nodes cannot be empty (configure nodes in config or use nodes_file)")
 	}
 
+	processedNodes := make([]NodeConfig, 0, len(c.Nodes))
+
+	for idx := range c.Nodes {
+		node := c.Nodes[idx]
+		node.Name = strings.TrimSpace(node.Name)
+		node.URI = strings.TrimSpace(node.URI)
+
+		if node.URI == "" {
+			return fmt.Errorf("node %d is missing uri", idx)
+		}
+
+		// Auto-extract name from URI fragment (#name) if not provided
+		if node.Name == "" {
+			if parsed, err := url.Parse(node.URI); err == nil && parsed.Fragment != "" {
+				// URL decode the fragment to handle encoded characters
+				if decoded, err := url.QueryUnescape(parsed.Fragment); err == nil {
+					node.Name = decoded
+				} else {
+					node.Name = parsed.Fragment
+				}
+			}
+		}
+
+		// Fallback to default name if still empty
+		if node.Name == "" {
+			node.Name = fmt.Sprintf("node-%d", idx)
+		}
+
+		if meta, err := parseEndpointMeta(node.URI); err == nil {
+			node.EndpointHost = meta.host
+			node.EndpointPort = meta.port
+			node.EndpointScheme = meta.scheme
+			node.EndpointID = endpointID(meta.host, meta.port)
+		} else {
+			log.Printf("⚠️ 无法解析节点 %q 的主机信息（URI=%s）：%v，已跳过", node.Name, node.URI, err)
+			continue
+		}
+
+		processedNodes = append(processedNodes, node)
+	}
+
+	if len(processedNodes) == 0 {
+		return errors.New("no valid nodes after filtering; please check your configuration or subscriptions")
+	}
+
 	// Deduplicate nodes by endpoint to避免重复
-	uniqueNodes, removed := deduplicateNodesByEndpoint(c.Nodes)
+	uniqueNodes, removed := deduplicateNodesByEndpoint(processedNodes)
 	if removed > 0 {
 		log.Printf("⚠️ 去重：发现 %d 个主机/IP 重复的节点，已自动跳过", removed)
 	}
@@ -217,39 +262,6 @@ func (c *Config) normalize() error {
 
 	portCursor := c.MultiPort.BasePort
 	for idx := range c.Nodes {
-		c.Nodes[idx].Name = strings.TrimSpace(c.Nodes[idx].Name)
-		c.Nodes[idx].URI = strings.TrimSpace(c.Nodes[idx].URI)
-
-		if c.Nodes[idx].URI == "" {
-			return fmt.Errorf("node %d is missing uri", idx)
-		}
-
-		// Auto-extract name from URI fragment (#name) if not provided
-		if c.Nodes[idx].Name == "" {
-			if parsed, err := url.Parse(c.Nodes[idx].URI); err == nil && parsed.Fragment != "" {
-				// URL decode the fragment to handle encoded characters
-				if decoded, err := url.QueryUnescape(parsed.Fragment); err == nil {
-					c.Nodes[idx].Name = decoded
-				} else {
-					c.Nodes[idx].Name = parsed.Fragment
-				}
-			}
-		}
-
-		// Fallback to default name if still empty
-		if c.Nodes[idx].Name == "" {
-			c.Nodes[idx].Name = fmt.Sprintf("node-%d", idx)
-		}
-
-		if meta, err := parseEndpointMeta(c.Nodes[idx].URI); err == nil {
-			c.Nodes[idx].EndpointHost = meta.host
-			c.Nodes[idx].EndpointPort = meta.port
-			c.Nodes[idx].EndpointScheme = meta.scheme
-			c.Nodes[idx].EndpointID = endpointID(meta.host, meta.port)
-		} else if c.Nodes[idx].EndpointID == "" && err != nil {
-			log.Printf("⚠️ 无法解析节点 %q 的主机信息（URI=%s）：%v", c.Nodes[idx].Name, c.Nodes[idx].URI, err)
-		}
-
 		// Auto-assign port in multi-port mode
 		if c.Nodes[idx].Port == 0 {
 			c.Nodes[idx].Port = portCursor
@@ -263,6 +275,7 @@ func (c *Config) normalize() error {
 			}
 		}
 	}
+
 	if c.LogLevel == "" {
 		c.LogLevel = "info"
 	}
