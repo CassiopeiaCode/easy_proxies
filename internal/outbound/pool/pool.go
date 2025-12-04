@@ -84,15 +84,35 @@ type memberState struct {
 
 type poolOutbound struct {
 	outbound.Adapter
-	ctx     context.Context
-	logger  log.ContextLogger
+	ctx    context.Context
+	logger log.ContextLogger
+
 	manager adapter.OutboundManager
 	options Options
 	mode    string
+
+	// All nodes in the pool (static after initialization).
 	members []*memberState
-	mu      sync.Mutex
-	rrIndex int
-	rng     *rand.Rand
+
+	// mu protects mutable fields on memberState and the members slice itself.
+	mu sync.Mutex
+
+	// Precomputed views of "currently usable" members, maintained off the hot path.
+	// These are read in O(1) on the request path to avoid scanning the full pool.
+	availableAny []*memberState
+	availableTCP []*memberState
+	availableUDP []*memberState
+
+	// availableMu protects the precomputed available slices.
+	availableMu sync.RWMutex
+
+	// rrCounter is used for round-robin selection without taking the main mutex.
+	rrCounter atomic.Uint64
+
+	// rng is used only for random mode, guarded by rngMu.
+	rng   *rand.Rand
+	rngMu sync.Mutex
+
 	monitor *monitor.Manager
 }
 
@@ -180,6 +200,12 @@ func (p *poolOutbound) Start(stage adapter.StartStage) error {
 	}
 	p.mu.Lock()
 	err := p.initializeMembersLocked()
+	if err == nil {
+		// Build initial availability view. At this point most nodes haven't been
+		// health-checked yet, so the result may be empty; it will be refreshed
+		// after startup probes and on state changes.
+		p.refreshAvailabilityLocked(time.Now(), false)
+	}
 	p.mu.Unlock()
 	if err != nil {
 		p.logger.Warn("proxy pool initialization skipped: ", err)
@@ -258,6 +284,8 @@ func (p *poolOutbound) probeAllMembersOnStartup() {
 				member.entry.MarkInitialCheckDone(true)
 			}
 		}
+		// Rebuild availability view based on updated monitor state.
+		p.refreshAvailabilityLocked(time.Now(), false)
 		p.mu.Unlock()
 		return
 	}
@@ -278,6 +306,8 @@ func (p *poolOutbound) probeAllMembersOnStartup() {
 				member.entry.MarkInitialCheckDone(true)
 			}
 		}
+		// Mark all as usable from the pool's perspective as well.
+		p.refreshAvailabilityLocked(time.Now(), false)
 		p.mu.Unlock()
 		return
 	}
@@ -334,6 +364,10 @@ func (p *poolOutbound) probeAllMembersOnStartup() {
 	wg.Wait()
 
 	p.logger.Info("initial health check completed: ", availableCount.Load(), " available, ", failedCount.Load(), " failed")
+	// Refresh availability after initial probes have finished.
+	p.mu.Lock()
+	p.refreshAvailabilityLocked(time.Now(), false)
+	p.mu.Unlock()
 }
 
 func parseProbeTarget(rawURL string) (string, uint16, error) {
@@ -419,58 +453,44 @@ func (p *poolOutbound) ListenPacket(ctx context.Context, destination M.Socksaddr
 }
 
 func (p *poolOutbound) pickMember(network string) (*memberState, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	// Lazy initialization: initialize members on first use if not already done
-	if len(p.members) == 0 {
-		if err := p.initializeMembersLocked(); err != nil {
-			return nil, err
+	// Fast path: choose from precomputed available slices without scanning the
+	// full pool or taking the main mutex.
+	candidates := p.availableForNetwork(network)
+	if len(candidates) == 0 {
+		// Slow path: (re)build availability from the full pool and retry once.
+		now := time.Now()
+		p.mu.Lock()
+		// Lazy initialization: initialize members on first use if not already done.
+		if len(p.members) == 0 {
+			if err := p.initializeMembersLocked(); err != nil {
+				p.mu.Unlock()
+				return nil, err
+			}
+		}
+		// Recompute availability; if everything is blacklisted, try releasing them.
+		p.refreshAvailabilityLocked(now, true)
+		p.mu.Unlock()
+		candidates = p.availableForNetwork(network)
+		if len(candidates) == 0 {
+			return nil, E.New("no healthy proxy available")
 		}
 	}
-	now := time.Now()
-	available := p.availableMembersLocked(now, network)
-	if len(available) == 0 {
-		if p.releaseIfAllBlacklistedLocked(now) {
-			available = p.availableMembersLocked(now, network)
-		}
-	}
-	if len(available) == 0 {
-		return nil, E.New("no healthy proxy available")
-	}
-	return p.selectMemberLocked(available), nil
+	return p.selectMember(candidates), nil
 }
 
-func (p *poolOutbound) availableMembersLocked(now time.Time, network string) []*memberState {
-	result := make([]*memberState, 0, len(p.members))
-	for _, member := range p.members {
-		if member.blacklisted && now.After(member.blacklistedUntil) {
-			member.blacklisted = false
-			member.blacklistedUntil = time.Time{}
-			member.failures = 0
-			if member.entry != nil {
-				member.entry.ClearBlacklist()
-			}
-		}
-		if member.blacklisted {
-			continue
-		}
-		if network != "" && !common.Contains(member.outbound.Network(), network) {
-			continue
-		}
-
-		// Only include members that have been checked and are available.
-		// This applies to all modes. If the monitor is not enabled, entry will be nil,
-		// and this check is skipped, effectively treating all nodes as available.
-		if member.entry != nil {
-			checked, available := member.entry.IsAvailable()
-			if !checked || !available {
-				continue // Skip untested or unavailable nodes
-			}
-		}
-
-		result = append(result, member)
+// availableForNetwork returns the precomputed available slice for the given
+// network. It only uses a read lock and never scans the full pool.
+func (p *poolOutbound) availableForNetwork(network string) []*memberState {
+	p.availableMu.RLock()
+	defer p.availableMu.RUnlock()
+	switch network {
+	case N.NetworkTCP:
+		return p.availableTCP
+	case N.NetworkUDP:
+		return p.availableUDP
+	default:
+		return p.availableAny
 	}
-	return result
 }
 
 func (p *poolOutbound) releaseIfAllBlacklistedLocked(now time.Time) bool {
@@ -504,10 +524,86 @@ func (p *poolOutbound) releaseIfAllBlacklistedLocked(now time.Time) bool {
 	return true
 }
 
-func (p *poolOutbound) selectMemberLocked(candidates []*memberState) *memberState {
+// refreshAvailabilityLocked rebuilds the precomputed availability slices from
+// the full member list. It must be called with p.mu held.
+//
+// This function is intentionally not called on the hot request path; instead it
+// is triggered by state changes (startup probes, blacklist updates, etc.).
+func (p *poolOutbound) refreshAvailabilityLocked(now time.Time, allowRelease bool) {
+	// First scan to build candidate lists.
+	all := make([]*memberState, 0, len(p.members))
+	tcp := make([]*memberState, 0, len(p.members))
+	udp := make([]*memberState, 0, len(p.members))
+
+	for _, member := range p.members {
+		// Expire blacklist if needed.
+		if member.blacklisted && now.After(member.blacklistedUntil) {
+			member.blacklisted = false
+			member.blacklistedUntil = time.Time{}
+			member.failures = 0
+			if member.entry != nil {
+				member.entry.ClearBlacklist()
+			}
+		}
+		if member.blacklisted {
+			continue
+		}
+
+		// Only include members that have been checked and are available.
+		// If the monitor is not enabled, entry will be nil,
+		// and this check is skipped, effectively treating all nodes as available.
+		if member.entry != nil {
+			checked, available := member.entry.IsAvailable()
+			if !checked || !available {
+				continue
+			}
+		}
+
+		all = append(all, member)
+		networks := member.outbound.Network()
+		if len(networks) == 0 || common.Contains(networks, N.NetworkTCP) {
+			tcp = append(tcp, member)
+		}
+		if len(networks) == 0 || common.Contains(networks, N.NetworkUDP) {
+			udp = append(udp, member)
+		}
+	}
+
+	// If nothing is available but everything is blacklisted, optionally release
+	// them for retry and rebuild once.
+	if allowRelease && len(all) == 0 {
+		if p.releaseIfAllBlacklistedLocked(now) {
+			all = all[:0]
+			tcp = tcp[:0]
+			udp = udp[:0]
+			for _, member := range p.members {
+				// After release, treat them as available regardless of monitor state.
+				networks := member.outbound.Network()
+				all = append(all, member)
+				if len(networks) == 0 || common.Contains(networks, N.NetworkTCP) {
+					tcp = append(tcp, member)
+				}
+				if len(networks) == 0 || common.Contains(networks, N.NetworkUDP) {
+					udp = append(udp, member)
+				}
+			}
+		}
+	}
+
+	p.availableMu.Lock()
+	p.availableAny = all
+	p.availableTCP = tcp
+	p.availableUDP = udp
+	p.availableMu.Unlock()
+}
+
+func (p *poolOutbound) selectMember(candidates []*memberState) *memberState {
 	switch p.mode {
 	case modeRandom:
-		return candidates[p.rng.Intn(len(candidates))]
+		p.rngMu.Lock()
+		idx := p.rng.Intn(len(candidates))
+		p.rngMu.Unlock()
+		return candidates[idx]
 	case modeBalance:
 		var selected *memberState
 		var minActive int32
@@ -520,9 +616,10 @@ func (p *poolOutbound) selectMemberLocked(candidates []*memberState) *memberStat
 		}
 		return selected
 	default:
-		member := candidates[p.rrIndex%len(candidates)]
-		p.rrIndex = (p.rrIndex + 1) % len(candidates)
-		return member
+		// Round-robin selection over the precomputed candidate slice.
+		// rrCounter is incremented atomically without taking the main mutex.
+		index := p.rrCounter.Add(1) - 1
+		return candidates[int(index)%len(candidates)]
 	}
 }
 
@@ -531,10 +628,17 @@ func (p *poolOutbound) recordFailure(member *memberState, cause error) {
 	member.failures++
 	failures := member.failures
 	threshold := p.options.FailureThreshold
+	blacklisted := false
 	if failures >= threshold {
 		member.failures = 0
 		member.blacklisted = true
 		member.blacklistedUntil = time.Now().Add(p.options.BlacklistDuration)
+		blacklisted = true
+	}
+	// If this failure caused the member to be blacklisted, refresh availability
+	// so that it is removed from the fast-path candidate lists.
+	if blacklisted {
+		p.refreshAvailabilityLocked(time.Now(), false)
 	}
 	p.mu.Unlock()
 
@@ -588,6 +692,7 @@ func (p *poolOutbound) makeReleaseFunc(member *memberState) func() {
 		member.blacklisted = false
 		member.blacklistedUntil = time.Time{}
 		member.failures = 0
+		p.refreshAvailabilityLocked(time.Now(), false)
 		p.mu.Unlock()
 		if member.entry != nil {
 			member.entry.ClearBlacklist()
@@ -729,6 +834,7 @@ func (p *poolOutbound) makeReleaseByTagFunc(tag string) func() {
 		p.mu.Lock()
 		if len(p.members) == 0 {
 			if err := p.initializeMembersLocked(); err != nil {
+				// Initialization failed; nothing else to do here.
 				p.mu.Unlock()
 				return
 			}
@@ -747,6 +853,7 @@ func (p *poolOutbound) makeReleaseByTagFunc(tag string) func() {
 			member.blacklisted = false
 			member.blacklistedUntil = time.Time{}
 			member.failures = 0
+			p.refreshAvailabilityLocked(time.Now(), false)
 		}
 		p.mu.Unlock()
 
