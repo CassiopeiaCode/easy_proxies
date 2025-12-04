@@ -208,9 +208,9 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		defer monitorServer.Shutdown(context.Background())
 
 		monitorMgr.SetLogger(&stdLogger{})
-		// 启动定期健康检查（每5分钟检查一次，每个节点超时5秒）
-		monitorMgr.StartPeriodicHealthCheck(5*time.Minute, 5*time.Second)
-		defer monitorMgr.Stop()
+		// 注意：不再启动全局周期健康检查，健康检查仅在以下时机运行：
+		// 1) 每次 sing-box 实例启动时的并行初始健康检查
+		// 2) 手动探测（Web 面板上的“探测延迟”按钮）
 	}
 
 	startSubscriptionRefresher(ctx, baseCtx, cfg, monitorMgr, stateStore, &instance, &currentNodes, &instanceMu)

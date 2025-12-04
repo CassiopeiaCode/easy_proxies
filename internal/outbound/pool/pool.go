@@ -406,10 +406,12 @@ func (p *poolOutbound) probeTCP(ctx context.Context, member *memberState, host s
 
 func (p *poolOutbound) recordInitialProbeFailure(member *memberState, err error) {
 	p.logger.Warn("initial probe failed for ", member.tag, ": ", err)
-	if member.entry != nil {
-		member.entry.RecordFailure(err)
-		member.entry.MarkInitialCheckDone(false)
-	}
+	// Treat initial probe failure as a hard failure: immediately blacklist the
+	// node for BlacklistDuration so it is not used until either the blacklist
+	// expires or a manual release happens. When the blacklist expires, the node
+	// will still require a successful health check before it is considered
+	// available again.
+	p.blacklistMemberFromHealthCheck(member, err)
 }
 
 func (p *poolOutbound) recordInitialProbeSuccess(member *memberState, latency time.Duration) {
@@ -700,6 +702,37 @@ func (p *poolOutbound) makeReleaseFunc(member *memberState) func() {
 	}
 }
 
+// blacklistMemberFromHealthCheck marks a member as blacklisted due to a failed
+// health check (initial or periodic) and updates both the in-memory pool state
+// and the monitoring/state subsystems. The node will remain excluded from the
+// scheduling fast path for at least BlacklistDuration. When the blacklist
+// expires, the node is still considered unavailable until a subsequent health
+// check succeeds.
+func (p *poolOutbound) blacklistMemberFromHealthCheck(member *memberState, cause error) {
+	now := time.Now()
+	until := now.Add(p.options.BlacklistDuration)
+
+	// Update pool-local blacklist state and availability views.
+	p.mu.Lock()
+	member.blacklisted = true
+	member.blacklistedUntil = until
+	member.failures = 0
+	p.refreshAvailabilityLocked(now, false)
+	p.mu.Unlock()
+
+	// Update monitoring + persisted state.
+	if member.entry != nil {
+		member.entry.RecordFailure(cause)
+		member.entry.Blacklist(until)
+		// Mark initial check as completed but unavailable; this ensures UI
+		// treats the node as failed, and the pool scheduler will not consider
+		// it available until a later health check succeeds.
+		member.entry.MarkInitialCheckDone(false)
+	}
+
+	p.logger.Warn("health check blacklisted proxy ", member.tag, " for ", p.options.BlacklistDuration, ": ", cause)
+}
+
 // probeHTTP performs HTTP GET request through the proxy to verify connectivity
 func (p *poolOutbound) probeHTTP(ctx context.Context, member *memberState, url string, poolSize int) error {
 	// Create HTTP client that uses the proxy outbound for dialing
@@ -765,9 +798,10 @@ func (p *poolOutbound) makeProbeFunc(member *memberState) func(ctx context.Conte
 		start := time.Now()
 		err := p.probeHTTP(ctx, member, probeURL, httpProbePoolSize)
 		if err != nil {
-			if member.entry != nil {
-				member.entry.RecordFailure(err)
-			}
+			// Any health check failure immediately blacklists the node for
+			// BlacklistDuration so that it is not used until the blacklist
+			// expires or is manually released.
+			p.blacklistMemberFromHealthCheck(member, err)
 			return 0, err
 		}
 		duration := time.Since(start)
@@ -814,9 +848,10 @@ func (p *poolOutbound) makeProbeByTagFunc(tag string) func(ctx context.Context) 
 		start := time.Now()
 		err := p.probeHTTP(ctx, member, probeURL, httpProbePoolSize)
 		if err != nil {
-			if member.entry != nil {
-				member.entry.RecordFailure(err)
-			}
+			// Same semantics as makeProbeFunc: immediately blacklist on health
+			// check failure so that this node is not used until the blacklist
+			// window expires or the user manually releases it.
+			p.blacklistMemberFromHealthCheck(member, err)
 			return 0, err
 		}
 		duration := time.Since(start)
