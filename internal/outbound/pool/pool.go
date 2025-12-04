@@ -42,6 +42,7 @@ const (
 	tcpProbeTimeout               = 2 * time.Second
 	httpProbeTimeout              = 5 * time.Second
 	httpProbePoolSize             = startupHealthCheckConcurrency
+	firstByteTimeout              = 5 * time.Second
 )
 
 // Options controls pool outbound behaviour.
@@ -907,14 +908,36 @@ type trackedConn struct {
 	once         sync.Once
 	mu           sync.Mutex
 	release      func()
+	// firstReadDeadlineSet is used to ensure we only install the first-byte
+	// timeout once, on the first Read call when no data has been received yet.
+	firstReadDeadlineSet bool
 }
 
 func (c *trackedConn) Read(b []byte) (n int, err error) {
+	// If this is the first Read and we haven't seen any data yet, enforce a
+	// first-byte timeout: if the upstream server does not send any data within
+	// firstByteTimeout, the read will fail with a timeout error. This failure is
+	// then counted against the node.
+	c.mu.Lock()
+	needDeadline := !c.firstReadDeadlineSet && c.bytesRead == 0
+	if needDeadline {
+		c.firstReadDeadlineSet = true
+	}
+	c.mu.Unlock()
+	if needDeadline {
+		_ = c.Conn.SetReadDeadline(time.Now().Add(firstByteTimeout))
+	}
+
 	n, err = c.Conn.Read(b)
 
 	c.mu.Lock()
 	c.bytesRead += int64(n)
 	checkNeeded := c.checkPending && c.bytesRead < 10
+	// Once we have received any data, clear the read deadline so that subsequent
+	// traffic is not subject to the first-byte timeout.
+	if c.bytesRead > 0 {
+		_ = c.Conn.SetReadDeadline(time.Time{})
+	}
 	c.mu.Unlock()
 
 	// If connection is closing and we haven't received 10 bytes, record failure
