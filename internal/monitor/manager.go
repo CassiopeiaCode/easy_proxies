@@ -291,6 +291,12 @@ func (m *Manager) Register(info NodeInfo) *EntryHandle {
 	e.initialCheckDone = false
 	e.available = false
 
+	if m.logger != nil {
+		// 这里记录一次初始健康检查状态被重置，便于排查订阅刷新或节点重建时的
+		// 行为是否干扰健康检查线程。
+		m.logger.Info("register node ", info.Tag, ": reset initialCheckDone=false, available=false")
+	}
+
 	if m.state != nil {
 		meta := metaFromInfo(info)
 		if meta.ID != "" {

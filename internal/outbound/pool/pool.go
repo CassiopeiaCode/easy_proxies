@@ -298,12 +298,13 @@ func (p *poolOutbound) probeAllMembersOnStartup() {
 		return
 	}
 
-	p.logger.Info("starting initial health check for all nodes")
-
 	p.mu.Lock()
 	members := make([]*memberState, len(p.members))
 	copy(members, p.members)
+	memberCount := len(members)
 	p.mu.Unlock()
+
+	p.logger.Info("starting initial health check for all nodes, total members: ", memberCount)
 
 	// 为了避免在大规模节点场景下始终以相同顺序进行健康检查，这里随机打乱
 	// 检查顺序，使得每次订阅刷新或重启时的探测顺序更加均匀。
@@ -313,7 +314,7 @@ func (p *poolOutbound) probeAllMembersOnStartup() {
 
 	host, port, err := parseProbeTarget(probeURL)
 	if err != nil {
-		p.logger.Warn("invalid probe target, skipping initial health check: ", err)
+		p.logger.Warn("invalid probe target ", probeURL, ", skipping initial health check: ", err)
 		p.mu.Lock()
 		for _, member := range p.members {
 			if member.entry != nil {
@@ -331,8 +332,11 @@ func (p *poolOutbound) probeAllMembersOnStartup() {
 		workerCount = len(members)
 	}
 	if workerCount == 0 {
+		p.logger.Warn("initial health check skipped: no members to probe")
 		return
 	}
+
+	p.logger.Info("initial health check worker count: ", workerCount)
 
 	jobs := make(chan *memberState, len(members))
 	var wg sync.WaitGroup
