@@ -203,11 +203,14 @@ func normalizeOptions(options Options) Options {
 }
 
 func (p *poolOutbound) Start(stage adapter.StartStage) error {
+	// 这里打点 Start 调用的阶段，方便排查 sing-box 在何时调用 pool 的生命周期方法。
+	p.logger.Info("pool.Start: entered with stage=", stage)
 	if stage != adapter.StartStateStart {
 		return nil
 	}
 	p.mu.Lock()
 	err := p.initializeMembersLocked()
+	memberCount := len(p.members)
 	if err == nil {
 		// Build initial availability view. At this point most nodes haven't been
 		// health-checked yet, so the result may be empty; it will be refreshed
@@ -216,12 +219,16 @@ func (p *poolOutbound) Start(stage adapter.StartStage) error {
 	}
 	p.mu.Unlock()
 	if err != nil {
-		p.logger.Warn("proxy pool initialization skipped: ", err)
+		p.logger.Warn("pool.Start: proxy pool initialization skipped due to error: ", err)
 		return nil
 	}
+	p.logger.Info("pool.Start: members initialized, total members=", memberCount)
 	// 在初始化完成后，立即在后台触发健康检查
 	if p.monitor != nil {
+		p.logger.Info("pool.Start: monitor present, launching initial health check goroutine")
 		go p.probeAllMembersOnStartup()
+	} else {
+		p.logger.Warn("pool.Start: monitor is nil, skipping initial health check")
 	}
 	return nil
 }
@@ -492,6 +499,7 @@ func (p *poolOutbound) pickMember(network string) (*memberState, error) {
 	// full pool or taking the main mutex.
 	candidates := p.availableForNetwork(network)
 	if len(candidates) == 0 {
+		p.logger.Warn("pickMember: no candidates on fast path for network=", network, ", rebuilding availability")
 		// Slow path: (re)build availability from the full pool and retry once.
 		now := time.Now()
 		p.mu.Lock()
@@ -505,8 +513,10 @@ func (p *poolOutbound) pickMember(network string) (*memberState, error) {
 		// Recompute availability; if everything is blacklisted, try releasing them.
 		p.refreshAvailabilityLocked(now, true)
 		p.mu.Unlock()
+
 		candidates = p.availableForNetwork(network)
 		if len(candidates) == 0 {
+			p.logger.Warn("pickMember: still no candidates after availability refresh for network=", network)
 			return nil, E.New("no healthy proxy available")
 		}
 	}
@@ -630,6 +640,10 @@ func (p *poolOutbound) refreshAvailabilityLocked(now time.Time, allowRelease boo
 	p.availableTCP = tcp
 	p.availableUDP = udp
 	p.availableMu.Unlock()
+
+	// 打点当前可调度视图，便于观察在黑名单/健康检查之后的实际可用节点数量。
+	p.logger.Info("pool.refreshAvailabilityLocked: updated availability snapshot, all=", len(all),
+		", tcp=", len(tcp), ", udp=", len(udp), ", allowRelease=", allowRelease)
 }
 
 func (p *poolOutbound) selectMember(candidates []*memberState) *memberState {
