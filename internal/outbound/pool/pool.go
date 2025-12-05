@@ -42,6 +42,10 @@ const (
 	tcpProbeTimeout               = 2 * time.Second
 	httpProbeTimeout              = 5 * time.Second
 	httpProbePoolSize             = startupHealthCheckConcurrency
+	// dialTimeout bounds how long we wait for establishing a connection to an
+	// upstream proxy node for regular client traffic. This only affects pool
+	// outbounds and does not change sing-box global defaults.
+	dialTimeout = 1 * time.Second
 	// firstByteTimeout is the maximum time we wait for the first byte from the
 	// upstream server after a successful connection. If no data is received
 	// within this window, the connection is treated as a failure.
@@ -432,7 +436,15 @@ func (p *poolOutbound) DialContext(ctx context.Context, network string, destinat
 		return nil, err
 	}
 	p.incActive(member)
-	conn, err := member.outbound.DialContext(ctx, network, destination)
+	// Wrap the context with a per-dial timeout unless the caller already
+	// specified a shorter deadline.
+	dialCtx := ctx
+	if deadline, ok := ctx.Deadline(); !ok || time.Until(deadline) > dialTimeout {
+		var cancel context.CancelFunc
+		dialCtx, cancel = context.WithTimeout(ctx, dialTimeout)
+		defer cancel()
+	}
+	conn, err := member.outbound.DialContext(dialCtx, network, destination)
 	if err != nil {
 		p.decActive(member)
 		p.recordFailure(member, err)
@@ -448,7 +460,14 @@ func (p *poolOutbound) ListenPacket(ctx context.Context, destination M.Socksaddr
 		return nil, err
 	}
 	p.incActive(member)
-	conn, err := member.outbound.ListenPacket(ctx, destination)
+	// Apply the same per-dial timeout semantics to UDP listen operations.
+	dialCtx := ctx
+	if deadline, ok := ctx.Deadline(); !ok || time.Until(deadline) > dialTimeout {
+		var cancel context.CancelFunc
+		dialCtx, cancel = context.WithTimeout(ctx, dialTimeout)
+		defer cancel()
+	}
+	conn, err := member.outbound.ListenPacket(dialCtx, destination)
 	if err != nil {
 		p.decActive(member)
 		p.recordFailure(member, err)
