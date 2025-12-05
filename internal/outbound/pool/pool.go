@@ -39,9 +39,15 @@ const (
 
 const (
 	startupHealthCheckConcurrency = 200
-	tcpProbeTimeout               = 2 * time.Second
-	httpProbeTimeout              = 5 * time.Second
-	httpProbePoolSize             = startupHealthCheckConcurrency
+	// tcpProbeTimeout bounds how long we wait for establishing a TCP
+	// connection to a node during health checks. This is intentionally kept
+	// short so that a few slow or stuck nodes do not delay the whole pool.
+	tcpProbeTimeout = 1 * time.Second
+	// httpProbeTimeout bounds the full HTTP probe (including TLS handshake).
+	// It can be slightly longer than tcpProbeTimeout because it covers more
+	// work than a bare TCP connect.
+	httpProbeTimeout  = 3 * time.Second
+	httpProbePoolSize = startupHealthCheckConcurrency
 	// dialTimeout bounds how long we wait for establishing a connection to an
 	// upstream proxy node for regular client traffic. This only affects pool
 	// outbounds and does not change sing-box global defaults.
@@ -364,18 +370,25 @@ func (p *poolOutbound) probeAllMembersOnStartup() {
 			for member := range jobs {
 				start := time.Now()
 
-				tcpCtx, tcpCancel := context.WithTimeout(p.ctx, tcpProbeTimeout)
-				tcpErr := p.probeTCP(tcpCtx, member, host, port)
-				tcpCancel()
+				// 为了避免依赖 sing-box 内部的超时行为，这里在每个 probe 外再包一层
+				// “硬超时”保护：一旦超过 tcpProbeTimeout/httpProbeTimeout，我们就认为
+				// 该节点探测超时并继续处理下一个节点，即使底层 DialContext 仍在阻塞。
+				tcpErr := p.runProbeWithHardTimeout("tcp", tcpProbeTimeout, func() error {
+					tcpCtx, tcpCancel := context.WithTimeout(p.ctx, tcpProbeTimeout)
+					defer tcpCancel()
+					return p.probeTCP(tcpCtx, member, host, port)
+				})
 				if tcpErr != nil {
 					p.recordInitialProbeFailure(member, fmt.Errorf("tcp dial: %w", tcpErr))
 					failedCount.Add(1)
 					continue
 				}
 
-				httpCtx, httpCancel := context.WithTimeout(p.ctx, httpProbeTimeout)
-				httpErr := p.probeHTTP(httpCtx, member, probeURL, httpProbePoolSize)
-				httpCancel()
+				httpErr := p.runProbeWithHardTimeout("http", httpProbeTimeout, func() error {
+					httpCtx, httpCancel := context.WithTimeout(p.ctx, httpProbeTimeout)
+					defer httpCancel()
+					return p.probeHTTP(httpCtx, member, probeURL, httpProbePoolSize)
+				})
 				if httpErr != nil {
 					p.recordInitialProbeFailure(member, httpErr)
 					failedCount.Add(1)
@@ -424,6 +437,39 @@ func parseProbeTarget(rawURL string) (string, uint16, error) {
 		}
 	}
 	return host, uint16(port), nil
+}
+
+// runProbeWithHardTimeout wraps a single probe (TCP or HTTP) with an extra
+// "hard" timeout. This protects the health-check worker from being stuck if
+// the underlying sing-box outbound ignores context deadlines or otherwise
+// blocks for longer than expected. From the worker's point of view, this
+// function never blocks longer than the provided timeout.
+func (p *poolOutbound) runProbeWithHardTimeout(kind string, timeout time.Duration, fn func() error) error {
+	// If timeout is non-positive, fall back to running the probe directly.
+	if timeout <= 0 {
+		return fn()
+	}
+
+	resultCh := make(chan error, 1)
+	go func() {
+		// Ensure the goroutine never blocks the caller: the channel is
+		// buffered, so writing once will not block even if the caller has
+		// already given up due to timeout.
+		resultCh <- fn()
+	}()
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	select {
+	case err := <-resultCh:
+		return err
+	case <-timer.C:
+		// From the health-check scheduler's perspective this probe has timed
+		// out. The underlying goroutine may still be blocked in DialContext or
+		// HTTP I/O, but the worker can move on to the next node.
+		return context.DeadlineExceeded
+	}
 }
 
 func (p *poolOutbound) probeTCP(ctx context.Context, member *memberState, host string, port uint16) error {
