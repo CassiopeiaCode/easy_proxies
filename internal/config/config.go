@@ -177,7 +177,8 @@ func (c *Config) normalize() error {
 		c.StateFile = filepath.Join(baseDir, "state", "nodes_state.json")
 	}
 	if c.SubscriptionRefreshInterval <= 0 && len(c.Subscriptions) > 0 {
-		c.SubscriptionRefreshInterval = 24 * time.Hour
+		// 默认订阅刷新周期：25 小时，避免不同实例在整点同时刷新造成突发流量。
+		c.SubscriptionRefreshInterval = 25 * time.Hour
 	}
 
 	// Load nodes from file if specified
