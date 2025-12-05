@@ -42,7 +42,10 @@ const (
 	tcpProbeTimeout               = 2 * time.Second
 	httpProbeTimeout              = 5 * time.Second
 	httpProbePoolSize             = startupHealthCheckConcurrency
-	firstByteTimeout              = 5 * time.Second
+	// firstByteTimeout is the maximum time we wait for the first byte from the
+	// upstream server after a successful connection. If no data is received
+	// within this window, the connection is treated as a failure.
+	firstByteTimeout = 2 * time.Second
 )
 
 // Options controls pool outbound behaviour.
