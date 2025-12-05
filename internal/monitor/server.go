@@ -94,8 +94,13 @@ func (s *Server) handleNodes(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-	// 只返回初始检查通过的可用节点
-	payload := map[string]any{"nodes": s.mgr.SnapshotFiltered(true)}
+	// 只返回初始检查通过的可用节点，同时附带整体节点统计信息，便于前端展示更多维度的状态。
+	nodes := s.mgr.SnapshotFiltered(true)
+	stats := s.mgr.Stats()
+	payload := map[string]any{
+		"nodes": nodes,
+		"stats": stats,
+	}
 	writeJSON(w, payload)
 }
 

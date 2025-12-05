@@ -305,6 +305,12 @@ func (p *poolOutbound) probeAllMembersOnStartup() {
 	copy(members, p.members)
 	p.mu.Unlock()
 
+	// 为了避免在大规模节点场景下始终以相同顺序进行健康检查，这里随机打乱
+	// 检查顺序，使得每次订阅刷新或重启时的探测顺序更加均匀。
+	rand.Shuffle(len(members), func(i, j int) {
+		members[i], members[j] = members[j], members[i]
+	})
+
 	host, port, err := parseProbeTarget(probeURL)
 	if err != nil {
 		p.logger.Warn("invalid probe target, skipping initial health check: ", err)

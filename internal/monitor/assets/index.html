@@ -649,7 +649,7 @@
 
     <div class="stats">
       <div class="stat-card">
-        <div class="stat-label">总节点</div>
+        <div class="stat-label">总节点（注册）</div>
         <div class="stat-value" id="totalNodes">0</div>
       </div>
       <div class="stat-card">
@@ -663,6 +663,14 @@
       <div class="stat-card">
         <div class="stat-label">拉黑节点</div>
         <div class="stat-value" style="color: var(--error);" id="blacklistedNodes">0</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">未失败节点</div>
+        <div class="stat-value" id="noFailureNodes">0</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">可调度节点</div>
+        <div class="stat-value" id="schedulableNodes">0</div>
       </div>
     </div>
 
@@ -857,19 +865,47 @@
         }
         if (!res.ok) throw new Error('请求失败');
         const data = await res.json();
-        render(data.nodes || []);
-        updateStats(data.nodes || []);
+        const nodes = data.nodes || [];
+        const stats = data.stats || null;
+        render(nodes);
+        updateStats(nodes, stats);
         document.getElementById('lastUpdate').textContent = `更新于 ${new Date().toLocaleTimeString('zh-CN')}`;
       } catch (err) {
         showToast('刷新失败: ' + err.message, 'error');
       }
     }
 
-    function updateStats(nodes) {
-      document.getElementById('totalNodes').textContent = nodes.length;
-      document.getElementById('healthyNodes').textContent = nodes.filter(n => !n.blacklisted && n.failure_count === 0).length;
-      document.getElementById('activeConnections').textContent = nodes.reduce((sum, n) => sum + (n.active_connections || 0), 0);
-      document.getElementById('blacklistedNodes').textContent = nodes.filter(n => n.blacklisted).length;
+    function updateStats(nodes, stats) {
+      // sing-box 内注册的节点总数；
+      // 如果后端提供了 stats，则使用 stats.total，否则退回 nodes.length。
+      const total = stats && typeof stats.total === 'number' ? stats.total : nodes.length;
+      document.getElementById('totalNodes').textContent = total;
+
+      // 健康节点：当前返回列表中未拉黑且未失败的节点
+      document.getElementById('healthyNodes').textContent =
+        nodes.filter(n => !n.blacklisted && n.failure_count === 0).length;
+
+      // 活跃连接：所有节点 active_connections 之和
+      document.getElementById('activeConnections').textContent =
+        nodes.reduce((sum, n) => sum + (n.active_connections || 0), 0);
+
+      // 拉黑节点：使用后端统计值，否则退回本地统计
+      const blacklisted = stats && typeof stats.blacklisted === 'number'
+        ? stats.blacklisted
+        : nodes.filter(n => n.blacklisted).length;
+      document.getElementById('blacklistedNodes').textContent = blacklisted;
+
+      // 未失败节点：使用后端统计值，否则退回本地统计
+      const noFailure = stats && typeof stats.no_failure === 'number'
+        ? stats.no_failure
+        : nodes.filter(n => (n.failure_count || 0) === 0).length;
+      document.getElementById('noFailureNodes').textContent = noFailure;
+
+      // 可调度节点：使用后端统计值，否则简单按“未拉黑且健康检查通过”的节点估算
+      const schedulable = stats && typeof stats.schedulable === 'number'
+        ? stats.schedulable
+        : nodes.filter(n => !n.blacklisted && n.initial_check_done && n.available).length;
+      document.getElementById('schedulableNodes').textContent = schedulable;
     }
 
     function render(nodes) {

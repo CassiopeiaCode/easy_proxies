@@ -223,6 +223,49 @@ func (m *Manager) Stop() {
 	}
 }
 
+// NodeStats summarizes high-level node counts for the monitoring UI.
+// All fields are computed from the in-memory sing-box state, independent of
+// any filtering applied when exposing nodes via HTTP APIs.
+type NodeStats struct {
+	Total       int `json:"total"`       // sing-box 内注册的节点总数
+	Blacklisted int `json:"blacklisted"` // 当前被拉黑的节点数
+	NoFailure   int `json:"no_failure"`  // 从未记录过失败的节点数
+	Schedulable int `json:"schedulable"` // 当前可调度的节点数（未拉黑且健康检查通过）
+}
+
+// Stats returns aggregated counters about all registered nodes. This method is
+// safe for concurrent use and intended for the monitoring HTTP API.
+func (m *Manager) Stats() NodeStats {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	var stats NodeStats
+	for _, e := range m.nodes {
+		stats.Total++
+
+		e.mu.RLock()
+		blacklisted := e.blacklist
+		failureCount := e.failure
+		checked := e.initialCheckDone
+		available := e.available
+		e.mu.RUnlock()
+
+		if blacklisted {
+			stats.Blacklisted++
+		}
+		if failureCount == 0 {
+			stats.NoFailure++
+		}
+		// "Schedulable" matches the pool outbound's notion: nodes that are not
+		// blacklisted and have completed an initial health check with a
+		// positive result.
+		if !blacklisted && checked && available {
+			stats.Schedulable++
+		}
+	}
+	return stats
+}
+
 func parsePort(value string) uint16 {
 	p, err := strconv.Atoi(value)
 	if err != nil || p <= 0 || p > 65535 {
@@ -243,6 +286,11 @@ func (m *Manager) Register(info NodeInfo) *EntryHandle {
 		e.info = info
 		e.state = m.state
 	}
+	// 每次注册（包括订阅刷新）都将初始健康检查状态重置为“未检查”，以确保
+	// 后续的初始健康检查始终真正执行，而不是从持久化状态直接沿用可用性。
+	e.initialCheckDone = false
+	e.available = false
+
 	if m.state != nil {
 		meta := metaFromInfo(info)
 		if meta.ID != "" {
@@ -256,23 +304,16 @@ func (m *Manager) Register(info NodeInfo) *EntryHandle {
 					e.blacklist = false
 					e.until = time.Time{}
 				}
-				// Seed availability and probe state from persisted record so that
-				// nodes that were previously checked and healthy can be used
-				// immediately after restart, without waiting for a new round of
-				// health checks.
-				if !rec.LastSuccessAt.IsZero() || rec.FailureCount > 0 {
-					e.initialCheckDone = true
-					e.available = rec.Enabled
-					// Restore last success / failure timestamps for UI
-					if !rec.LastSuccessAt.IsZero() {
-						e.lastOK = rec.LastSuccessAt
-					}
-					if !rec.LastFailureAt.IsZero() {
-						e.lastFail = rec.LastFailureAt
-					}
-					if rec.LatencyMs > 0 {
-						e.lastProbe = time.Duration(rec.LatencyMs) * time.Millisecond
-					}
+				// 不再从持久化状态同步可用性/健康检查标记，仅保留失败次数、
+				// 黑名单信息和最近一次成功/失败时间以及探测延迟，用于 UI 展示。
+				if rec.LastSuccessAt.IsZero() == false {
+					e.lastOK = rec.LastSuccessAt
+				}
+				if rec.LastFailureAt.IsZero() == false {
+					e.lastFail = rec.LastFailureAt
+				}
+				if rec.LatencyMs > 0 {
+					e.lastProbe = time.Duration(rec.LatencyMs) * time.Millisecond
 				}
 			}
 		}
