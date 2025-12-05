@@ -544,6 +544,13 @@ func (e *entry) recordProbeLatency(d time.Duration) {
 	}
 }
 
+func (e *entry) resetInitialCheck() {
+	e.mu.Lock()
+	e.initialCheckDone = false
+	e.available = false
+	e.mu.Unlock()
+}
+
 func (e *entry) isAvailable() (bool, bool) {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
@@ -650,6 +657,16 @@ func (h *EntryHandle) MarkInitialCheckDone(available bool) {
 	h.ref.initialCheckDone = true
 	h.ref.available = available
 	h.ref.mu.Unlock()
+}
+
+// ResetInitialCheck clears the initial health check state so that subsequent
+// probes can recompute availability from scratch. This is used by the pool
+// outbound's health-check daemon when it needs to rerun a full startup probe.
+func (h *EntryHandle) ResetInitialCheck() {
+	if h == nil || h.ref == nil {
+		return
+	}
+	h.ref.resetInitialCheck()
 }
 
 // PruneByTags removes nodes that are no longer present.

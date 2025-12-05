@@ -122,6 +122,12 @@ type poolOutbound struct {
 	rngMu sync.Mutex
 
 	monitor *monitor.Manager
+
+	// startupProbeRunning indicates whether a full initial health check is
+	// currently running. It is used by the health-check daemon to avoid
+	// starting multiple concurrent startup probes when the pool becomes
+	// temporarily empty.
+	startupProbeRunning atomic.Bool
 }
 
 func newPool(ctx context.Context, _ adapter.Router, logger log.ContextLogger, tag string, options Options) (adapter.Outbound, error) {
@@ -223,10 +229,11 @@ func (p *poolOutbound) Start(stage adapter.StartStage) error {
 		return nil
 	}
 	p.logger.Info("pool.Start: members initialized, total members=", memberCount)
-	// 在初始化完成后，立即在后台触发健康检查
+	// 在初始化完成后，尝试触发一次健康检查守护任务；如果当前已有健康检查在运行，
+	// 守护任务会自动跳过。
 	if p.monitor != nil {
-		p.logger.Info("pool.Start: monitor present, launching initial health check goroutine")
-		go p.probeAllMembersOnStartup()
+		p.logger.Info("pool.Start: monitor present, requesting initial health check daemon")
+		p.triggerStartupHealthCheck("StartStateStart")
 	} else {
 		p.logger.Warn("pool.Start: monitor is nil, skipping initial health check")
 	}
@@ -517,6 +524,11 @@ func (p *poolOutbound) pickMember(network string) (*memberState, error) {
 		candidates = p.availableForNetwork(network)
 		if len(candidates) == 0 {
 			p.logger.Warn("pickMember: still no candidates after availability refresh for network=", network)
+			// 如果在慢路径中仍然找不到任何可调度节点，则触发健康检查守护线程：
+			// 当且仅当当前没有健康检查在运行时，会重置初始健康检查状态并启动一次
+			// 全量并行探测。当前请求依然会返回错误，但后续请求有机会使用新的健康
+			// 检查结果。
+			p.triggerStartupHealthCheck("no_schedulable_nodes")
 			return nil, E.New("no healthy proxy available")
 		}
 	}
@@ -644,6 +656,49 @@ func (p *poolOutbound) refreshAvailabilityLocked(now time.Time, allowRelease boo
 	// 打点当前可调度视图，便于观察在黑名单/健康检查之后的实际可用节点数量。
 	p.logger.Info("pool.refreshAvailabilityLocked: updated availability snapshot, all=", len(all),
 		", tcp=", len(tcp), ", udp=", len(udp), ", allowRelease=", allowRelease)
+}
+
+// triggerStartupHealthCheck launches a background "health-check daemon" which
+// (re)runs the full initial health check when the pool becomes empty. It is
+// safe to call this from multiple code paths; only one health check will run
+// at a time.
+func (p *poolOutbound) triggerStartupHealthCheck(reason string) {
+	if p.monitor == nil {
+		p.logger.Warn("health-check daemon: monitor is nil, skip trigger, reason=", reason)
+		return
+	}
+	if !p.startupProbeRunning.CompareAndSwap(false, true) {
+		p.logger.Info("health-check daemon: probe already running, skip trigger, reason=", reason)
+		return
+	}
+
+	go func() {
+		defer p.startupProbeRunning.Store(false)
+		p.logger.Info("health-check daemon: starting initial health check, reason=", reason)
+
+		// 确保成员已经初始化。
+		p.mu.Lock()
+		if len(p.members) == 0 {
+			if err := p.initializeMembersLocked(); err != nil {
+				p.mu.Unlock()
+				p.logger.Warn("health-check daemon: initialize members failed: ", err)
+				return
+			}
+		}
+
+		// 重置初始健康检查状态，使得接下来的探测可以从干净的视图重新评估可用性。
+		for _, member := range p.members {
+			if member.entry != nil {
+				member.entry.ResetInitialCheck()
+			}
+		}
+		// 立即刷新一次可调度视图，确保在健康检查完成前，调度器不会误用旧的可用性。
+		p.refreshAvailabilityLocked(time.Now(), false)
+		p.mu.Unlock()
+
+		// 复用现有的并行初始健康检查逻辑。
+		p.probeAllMembersOnStartup()
+	}()
 }
 
 func (p *poolOutbound) selectMember(candidates []*memberState) *memberState {
