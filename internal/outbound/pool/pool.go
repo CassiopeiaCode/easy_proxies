@@ -423,7 +423,11 @@ func (p *poolOutbound) probeAllMembersOnStartup() {
 				httpErr := p.runProbeWithHardTimeout("http", httpProbeTimeout, func() error {
 					httpCtx, httpCancel := context.WithTimeout(p.ctx, httpProbeTimeout)
 					defer httpCancel()
-					return p.probeHTTP(httpCtx, member, probeURL, httpProbePoolSize)
+					// During startup probes, reuse the workerCount as the
+					// per-host HTTP connection pool size to avoid creating
+					// more concurrent HTTP requests than there are probe
+					// workers.
+					return p.probeHTTP(httpCtx, member, probeURL, workerCount)
 				})
 				if httpErr != nil {
 					p.recordInitialProbeFailure(member, httpErr)
