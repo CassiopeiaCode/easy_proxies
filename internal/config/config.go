@@ -50,6 +50,16 @@ type PoolConfig struct {
 	Mode              string        `yaml:"mode"`
 	FailureThreshold  int           `yaml:"failure_threshold"`
 	BlacklistDuration time.Duration `yaml:"blacklist_duration"`
+	// MaxConcurrent limits the maximum number of simultaneous active upstream
+	// connections across the whole pool. When the limit is exceeded, the
+	// oldest active connection will be closed to make room for new ones.
+	// A value <= 0 disables this protection. Default: 50.
+	MaxConcurrent int `yaml:"max_concurrent"`
+	// ProbeConcurrency limits how many nodes are probed in parallel during
+	// health checks. Keeping this at a moderate level avoids large bursts of
+	// short-lived connections against the probe target and upstream nodes.
+	// A value <= 0 falls back to MaxConcurrent (if set) or 50.
+	ProbeConcurrency int `yaml:"probe_concurrency"`
 }
 
 // MultiPortConfig defines address/credential defaults for multi-port mode.
@@ -152,6 +162,19 @@ func (c *Config) normalize() error {
 	}
 	if c.Pool.BlacklistDuration <= 0 {
 		c.Pool.BlacklistDuration = 24 * time.Hour
+	}
+	// Default concurrent connection limit to 50 if not specified.
+	if c.Pool.MaxConcurrent <= 0 {
+		c.Pool.MaxConcurrent = 50
+	}
+	// Default probe concurrency: prefer an explicit value, otherwise reuse
+	// MaxConcurrent, and finally fall back to 50.
+	if c.Pool.ProbeConcurrency <= 0 {
+		if c.Pool.MaxConcurrent > 0 {
+			c.Pool.ProbeConcurrency = c.Pool.MaxConcurrent
+		} else {
+			c.Pool.ProbeConcurrency = 50
+		}
 	}
 	if c.MultiPort.Address == "" {
 		c.MultiPort.Address = "0.0.0.0"

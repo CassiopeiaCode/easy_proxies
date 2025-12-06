@@ -38,11 +38,6 @@ const (
 )
 
 const (
-	// startupHealthCheckConcurrency controls how many nodes are probed in
-	// parallel during the initial health check. Extremely high values can
-	// cause large connection bursts against the探测目标 and upstream nodes,
-	// so we keep this at a moderate level.
-	startupHealthCheckConcurrency = 50
 	// tcpProbeTimeout bounds how long we wait for establishing a TCP
 	// connection to a node during health checks. This is intentionally kept
 	// short so that a few slow or stuck nodes do not delay the whole pool.
@@ -50,8 +45,7 @@ const (
 	// httpProbeTimeout bounds the full HTTP probe (including TLS handshake).
 	// It can be slightly longer than tcpProbeTimeout because it covers more
 	// work than a bare TCP connect.
-	httpProbeTimeout  = 3 * time.Second
-	httpProbePoolSize = startupHealthCheckConcurrency
+	httpProbeTimeout = 3 * time.Second
 	// dialTimeout bounds how long we wait for establishing a connection to an
 	// upstream proxy node for regular client traffic. This only affects pool
 	// outbounds and does not change sing-box global defaults.
@@ -69,6 +63,14 @@ type Options struct {
 	FailureThreshold  int
 	BlacklistDuration time.Duration
 	Metadata          map[string]MemberMeta
+	// MaxConcurrent limits the maximum number of active upstream connections
+	// managed by this pool. When the limit is exceeded, the oldest active
+	// connection is closed to make room for new ones. A value <= 0 disables
+	// this behaviour.
+	MaxConcurrent int
+	// ProbeConcurrency controls how many nodes are probed in parallel during
+	// health checks. If <= 0, a safe default is chosen by the caller.
+	ProbeConcurrency int
 }
 
 // MemberMeta carries optional descriptive information for monitoring UI.
@@ -133,6 +135,15 @@ type poolOutbound struct {
 
 	monitor *monitor.Manager
 
+	// globalActive tracks the total number of active connections across all
+	// members managed by this pool. It is used together with maxConcurrent and
+	// activeConns to implement a global concurrency cap with "drop oldest"
+	// semantics when the cap is exceeded.
+	maxConcurrent int32
+	globalActive  atomic.Int32
+	connsMu       sync.Mutex
+	activeConns   []*trackedConn
+
 	// startupProbeRunning indicates whether a full initial health check is
 	// currently running. It is used by the health-check daemon to avoid
 	// starting multiple concurrent startup probes when the pool becomes
@@ -151,14 +162,15 @@ func newPool(ctx context.Context, _ adapter.Router, logger log.ContextLogger, ta
 	monitorMgr := monitor.FromContext(ctx)
 	normalized := normalizeOptions(options)
 	p := &poolOutbound{
-		Adapter: outbound.NewAdapter(Type, tag, []string{N.NetworkTCP, N.NetworkUDP}, normalized.Members),
-		ctx:     ctx,
-		logger:  logger,
-		manager: manager,
-		options: normalized,
-		mode:    normalized.Mode,
-		rng:     rand.New(rand.NewSource(time.Now().UnixNano())),
-		monitor: monitorMgr,
+		Adapter:       outbound.NewAdapter(Type, tag, []string{N.NetworkTCP, N.NetworkUDP}, normalized.Members),
+		ctx:           ctx,
+		logger:        logger,
+		manager:       manager,
+		options:       normalized,
+		mode:          normalized.Mode,
+		rng:           rand.New(rand.NewSource(time.Now().UnixNano())),
+		monitor:       monitorMgr,
+		maxConcurrent: int32(normalized.MaxConcurrent),
 	}
 
 	// Register nodes immediately if monitor is available
@@ -206,6 +218,19 @@ func normalizeOptions(options Options) Options {
 	}
 	if options.Metadata == nil {
 		options.Metadata = make(map[string]MemberMeta)
+	}
+	// Propagate reasonable defaults for concurrency-related settings if the
+	// builder did not fill them explicitly. These defaults mirror the config
+	// layer: a MaxConcurrent/ProbeConcurrency of 0 is treated as 50.
+	if options.MaxConcurrent < 0 {
+		options.MaxConcurrent = 0
+	}
+	if options.ProbeConcurrency <= 0 {
+		if options.MaxConcurrent > 0 {
+			options.ProbeConcurrency = options.MaxConcurrent
+		} else {
+			options.ProbeConcurrency = 50
+		}
 	}
 	switch strings.ToLower(options.Mode) {
 	case modeRandom:
@@ -351,7 +376,13 @@ func (p *poolOutbound) probeAllMembersOnStartup() {
 		return
 	}
 
-	workerCount := startupHealthCheckConcurrency
+	// Decide how many probes may run in parallel. We prefer the per-pool
+	// configuration from options; if it is unset, fall back to a safe
+	// hard-coded default.
+	workerCount := p.options.ProbeConcurrency
+	if workerCount <= 0 {
+		workerCount = 50
+	}
 	if len(members) < workerCount {
 		workerCount = len(members)
 	}
@@ -831,22 +862,94 @@ func (p *poolOutbound) recordSuccess(member *memberState) {
 }
 
 func (p *poolOutbound) wrapConn(conn net.Conn, member *memberState) net.Conn {
-	return &trackedConn{
+	tc := &trackedConn{
 		Conn:         conn,
 		member:       member,
 		pool:         p,
 		bytesRead:    0,
 		checkPending: true,
-		release: func() {
-			p.decActive(member)
-		},
 	}
+	tc.release = func() {
+		p.decActive(member)
+		p.unregisterConn(tc)
+	}
+	p.registerConn(tc)
+	return tc
 }
 
 func (p *poolOutbound) wrapPacketConn(conn net.PacketConn, member *memberState) net.PacketConn {
 	return &trackedPacketConn{PacketConn: conn, release: func() {
 		p.decActive(member)
 	}}
+}
+
+// registerConn records a newly established connection for global concurrency
+// tracking and enforces the MaxConcurrent limit (if configured). When the
+// limit is exceeded, the oldest still-active connection is closed to make
+// room for the new one.
+func (p *poolOutbound) registerConn(c *trackedConn) {
+	if p.maxConcurrent <= 0 {
+		return
+	}
+	c.createdAt = time.Now()
+
+	p.connsMu.Lock()
+	p.activeConns = append(p.activeConns, c)
+	p.connsMu.Unlock()
+
+	newTotal := p.globalActive.Add(1)
+	if newTotal <= p.maxConcurrent {
+		return
+	}
+
+	// Limit exceeded: find the oldest active connection and close it to free
+	// capacity. We perform the potentially blocking Close call outside the
+	// lock to avoid deadlocks.
+	oldest := p.findOldestActiveConn()
+	if oldest == nil || oldest == c {
+		return
+	}
+	go oldest.Close()
+}
+
+// unregisterConn removes a connection from the global tracking structures and
+// decrements the active counter. It is safe to call multiple times for the
+// same connection; only the first call will take effect.
+func (p *poolOutbound) unregisterConn(c *trackedConn) {
+	if p.maxConcurrent <= 0 {
+		return
+	}
+	// Ensure we only decrement once per connection.
+	if !c.closed.CompareAndSwap(false, true) {
+		return
+	}
+	p.globalActive.Add(-1)
+	// We do not eagerly compact activeConns here to keep the hot path cheap.
+	// Stale entries are ignored by findOldestActiveConn.
+}
+
+// findOldestActiveConn returns the oldest connection that is still considered
+// active from the pool's perspective. It ignores connections that have been
+// marked closed.
+func (p *poolOutbound) findOldestActiveConn() *trackedConn {
+	if p.maxConcurrent <= 0 {
+		return nil
+	}
+	p.connsMu.Lock()
+	defer p.connsMu.Unlock()
+	var oldest *trackedConn
+	for _, c := range p.activeConns {
+		if c == nil {
+			continue
+		}
+		if c.closed.Load() {
+			continue
+		}
+		if oldest == nil || c.createdAt.Before(oldest.createdAt) {
+			oldest = c
+		}
+	}
+	return oldest
 }
 
 func (p *poolOutbound) makeReleaseFunc(member *memberState) func() {
@@ -988,7 +1091,7 @@ func (p *poolOutbound) makeProbeFunc(member *memberState) func(ctx context.Conte
 	}
 	return func(ctx context.Context) (time.Duration, error) {
 		start := time.Now()
-		err := p.probeHTTP(ctx, member, probeURL, httpProbePoolSize)
+		err := p.probeHTTP(ctx, member, probeURL, p.options.ProbeConcurrency)
 		if err != nil {
 			// Any health check failure immediately blacklists the node for
 			// BlacklistDuration so that it is not used until the blacklist
@@ -1038,7 +1141,7 @@ func (p *poolOutbound) makeProbeByTagFunc(tag string) func(ctx context.Context) 
 		}
 
 		start := time.Now()
-		err := p.probeHTTP(ctx, member, probeURL, httpProbePoolSize)
+		err := p.probeHTTP(ctx, member, probeURL, p.options.ProbeConcurrency)
 		if err != nil {
 			// Same semantics as makeProbeFunc: immediately blacklist on health
 			// check failure so that this node is not used until the blacklist
@@ -1099,6 +1202,8 @@ type trackedConn struct {
 	once         sync.Once
 	mu           sync.Mutex
 	release      func()
+	createdAt    time.Time
+	closed       atomic.Bool
 	// firstReadDeadlineSet is used to ensure we only install the first-byte
 	// timeout once, on the first Read call when no data has been received yet.
 	firstReadDeadlineSet bool

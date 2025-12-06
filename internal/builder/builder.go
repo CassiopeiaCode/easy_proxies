@@ -284,6 +284,8 @@ func Build(cfg *config.Config) (Result, error) {
 			FailureThreshold:  cfg.Pool.FailureThreshold,
 			BlacklistDuration: cfg.Pool.BlacklistDuration,
 			Metadata:          metadata,
+			MaxConcurrent:     cfg.Pool.MaxConcurrent,
+			ProbeConcurrency:  cfg.Pool.ProbeConcurrency,
 		}
 		outbounds = append(outbounds, option.Outbound{
 			Type:    poolout.Type,
@@ -306,6 +308,8 @@ func Build(cfg *config.Config) (Result, error) {
 				FailureThreshold:  cfg.Pool.FailureThreshold,
 				BlacklistDuration: cfg.Pool.BlacklistDuration,
 				Metadata:          perMeta,
+				MaxConcurrent:     cfg.Pool.MaxConcurrent,
+				ProbeConcurrency:  cfg.Pool.ProbeConcurrency,
 			}
 			perPool := option.Outbound{
 				Type:    poolout.Type,
