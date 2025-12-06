@@ -1203,12 +1203,12 @@ type trackedConn struct {
 	member       *memberState
 	pool         *poolOutbound
 	bytesRead    int64
-	checkPending bool
-	once         sync.Once
-	mu           sync.Mutex
-	release      func()
-	createdAt    time.Time
-	closed       atomic.Bool
+	checkPending bool        // whether we still need to validate minimum bytes
+	once         sync.Once   // guards release so it only runs once
+	mu           sync.Mutex  // protects mutable fields on trackedConn
+	release      func()      // invoked exactly once when the connection is fully closed
+	createdAt    time.Time   // creation time used for "oldest connection" eviction
+	closed       atomic.Bool // marks whether unregister/release has run
 	// firstReadDeadlineSet is used to ensure we only install the first-byte
 	// timeout once, on the first Read call when no data has been received yet.
 	firstReadDeadlineSet bool
@@ -1230,7 +1230,6 @@ func (c *trackedConn) Read(b []byte) (n int, err error) {
 	}
 
 	n, err = c.Conn.Read(b)
-
 	c.mu.Lock()
 	c.bytesRead += int64(n)
 	checkNeeded := c.checkPending && c.bytesRead < 10
@@ -1241,11 +1240,28 @@ func (c *trackedConn) Read(b []byte) (n int, err error) {
 	}
 	c.mu.Unlock()
 
-	// If connection is closing and we haven't received 10 bytes, record failure
-	if err != nil && checkNeeded {
-		c.pool.recordFailure(c.member, fmt.Errorf("connection closed after %d bytes (expected at least 10): %w", c.bytesRead, err))
+	if err != nil {
+		// If the upstream side errors out before we see enough data, treat it as
+		// a failure for health/blacklist purposes.
+		if checkNeeded {
+			c.pool.recordFailure(c.member, fmt.Errorf("connection closed after %d bytes (expected at least 10): %w", c.bytesRead, err))
+			// We have already recorded this failure; avoid counting it again in
+			// Close by marking the check as completed.
+			c.mu.Lock()
+			c.checkPending = false
+			c.mu.Unlock()
+		}
+
+		// 无论错误类型（超时、EOF 或其他 I/O 错误）如何，都立即在这里关闭
+		// 上游连接，而不是依赖 sing-box 在未来某个时刻再调用 Close：
+		// - 可以确保用户侧连接尽快感知到故障，而不是长时间挂起；
+		// - 也避免“读出错但连接仍被认为是活跃”的状态泄漏。
+		//
+		// Close 可能会被调用多次（例如上层在收到错误后再次调用 Close），
+		// 但 trackedConn 内部通过 once/closed 标记保证释放逻辑只执行一次。
+		_ = c.Close()
 	} else if c.bytesRead >= 10 {
-		// Once we've read 10 bytes, mark the check as done
+		// Once we've read 10 bytes, mark the check as done.
 		c.mu.Lock()
 		c.checkPending = false
 		c.mu.Unlock()
