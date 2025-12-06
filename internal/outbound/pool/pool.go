@@ -38,7 +38,11 @@ const (
 )
 
 const (
-	startupHealthCheckConcurrency = 200
+	// startupHealthCheckConcurrency controls how many nodes are probed in
+	// parallel during the initial health check. Extremely high values can
+	// cause large connection bursts against the探测目标 and upstream nodes,
+	// so we keep this at a moderate level.
+	startupHealthCheckConcurrency = 50
 	// tcpProbeTimeout bounds how long we wait for establishing a TCP
 	// connection to a node during health checks. This is intentionally kept
 	// short so that a few slow or stuck nodes do not delay the whole pool.
@@ -798,6 +802,15 @@ func (p *poolOutbound) recordFailure(member *memberState, cause error) {
 			member.entry.Blacklist(member.blacklistedUntil)
 		}
 	}
+
+	// 注意：这里的 FailureThreshold 只作用于“运行时”黑名单逻辑：
+	// - member.failures 是进程内计数器，达到阈值即触发一次黑名单，并在触发后清零；
+	// - 状态持久化里的 FailureCount 是累计值，仅用于 WebUI 展示，不参与阈值判断；
+	// - 启动时 filterBlockedNodes 只依据 Enabled/BlacklistUntil 判定是否跳过节点，
+	//   不会根据历史 FailureCount 自动禁用。
+	//
+	// 因此在面板上看到某些节点的 failure_count 看似“超过阈值但仍未禁用”是预期行为：
+	// 它们可能已经经历过多次黑名单/恢复周期，但当前并未处于禁用状态。
 	if failures >= threshold {
 		p.logger.Warn("proxy ", member.tag, " blacklisted for ", p.options.BlacklistDuration, ": ", cause)
 	} else {
@@ -924,11 +937,42 @@ func (p *poolOutbound) probeHTTP(ctx context.Context, member *memberState, url s
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+	// 对于 HTTP 探测，我们只关心“能否可靠收取到一定量的数据”，而不是返回码本身：
+	// - 状态码非 200 也视为成功（例如 3xx/4xx/5xx），只要连接建立且有足够的响应体；
+	// - 仅在连接失败、请求出错或总接收字节数不足 10 字节时视为失败。
+	//
+	// 这里按最多读取 10 字节来判定“是否有足够数据”，避免对探测目标造成不必要负载。
+	const minProbeBytes = 10
+	var readBytes int
+
+	buf := make([]byte, minProbeBytes)
+	for readBytes < minProbeBytes {
+		n, err := resp.Body.Read(buf[readBytes:])
+		if n > 0 {
+			readBytes += n
+		}
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				// 提前 EOF 且不足 minProbeBytes，认为响应数据太少，判定为失败。
+				if readBytes < minProbeBytes {
+					return fmt.Errorf("probe response too short: got %d bytes, want at least %d", readBytes, minProbeBytes)
+				}
+				// 读到足够数据再 EOF 视为成功。
+				break
+			}
+			// 其他 I/O 错误直接视为失败。
+			return fmt.Errorf("read response body: %w", err)
+		}
+		if readBytes >= minProbeBytes {
+			break
+		}
 	}
 
-	// Read and discard response body to ensure full response
+	if readBytes < minProbeBytes {
+		return fmt.Errorf("probe response too short: got %d bytes, want at least %d", readBytes, minProbeBytes)
+	}
+
+	// 其余响应体（如果有）直接丢弃。
 	_, _ = io.Copy(io.Discard, resp.Body)
 
 	return nil
