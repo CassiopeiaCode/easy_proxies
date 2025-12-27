@@ -445,7 +445,18 @@ func (p *poolOutbound) probeAllMembersOnStartup() {
 
 				latency := time.Since(start)
 				p.recordInitialProbeSuccess(member, latency)
-				availableCount.Add(1)
+				newCount := availableCount.Add(1)
+
+				// 立即刷新可调度列表，让节点尽快可用
+				// 第一个成功的节点立即刷新，之后每 5 个刷新一次
+				if newCount == 1 || newCount%5 == 0 {
+					p.mu.Lock()
+					p.refreshAvailabilityLocked(time.Now(), false)
+					p.mu.Unlock()
+					if newCount == 1 {
+						p.logger.Info("first node available, pool is now schedulable")
+					}
+				}
 			}
 		}()
 	}
@@ -457,7 +468,7 @@ func (p *poolOutbound) probeAllMembersOnStartup() {
 	wg.Wait()
 
 	p.logger.Info("initial health check completed: ", availableCount.Load(), " available, ", failedCount.Load(), " failed")
-	// Refresh availability after initial probes have finished.
+	// Final refresh to ensure all successful nodes are included.
 	p.mu.Lock()
 	p.refreshAvailabilityLocked(time.Now(), false)
 	p.mu.Unlock()
