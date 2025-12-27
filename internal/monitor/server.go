@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/http/pprof"
+	"runtime"
 	"strings"
 	"time"
 )
@@ -46,6 +48,21 @@ func NewServer(cfg Config, mgr *Manager, logger *log.Logger) *Server {
 	mux.HandleFunc("/api/nodes", s.withAuth(s.handleNodes))
 	mux.HandleFunc("/api/nodes/", s.withAuth(s.handleNodeAction))
 	mux.HandleFunc("/api/export", s.withAuth(s.handleExport))
+	mux.HandleFunc("/api/stats", s.withAuth(s.handleRuntimeStats))
+
+	// pprof 端点 - 用于运行时性能分析
+	mux.HandleFunc("/debug/pprof/", s.withAuth(pprof.Index))
+	mux.HandleFunc("/debug/pprof/cmdline", s.withAuth(pprof.Cmdline))
+	mux.HandleFunc("/debug/pprof/profile", s.withAuth(pprof.Profile))
+	mux.HandleFunc("/debug/pprof/symbol", s.withAuth(pprof.Symbol))
+	mux.HandleFunc("/debug/pprof/trace", s.withAuth(pprof.Trace))
+	mux.HandleFunc("/debug/pprof/heap", s.withAuth(pprof.Handler("heap").ServeHTTP))
+	mux.HandleFunc("/debug/pprof/goroutine", s.withAuth(pprof.Handler("goroutine").ServeHTTP))
+	mux.HandleFunc("/debug/pprof/allocs", s.withAuth(pprof.Handler("allocs").ServeHTTP))
+	mux.HandleFunc("/debug/pprof/block", s.withAuth(pprof.Handler("block").ServeHTTP))
+	mux.HandleFunc("/debug/pprof/mutex", s.withAuth(pprof.Handler("mutex").ServeHTTP))
+	mux.HandleFunc("/debug/pprof/threadcreate", s.withAuth(pprof.Handler("threadcreate").ServeHTTP))
+
 	s.srv = &http.Server{Addr: cfg.Listen, Handler: mux}
 	return s
 }
@@ -231,6 +248,43 @@ func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request) {
 		"message": "登录成功",
 		"token":   s.sessionToken,
 	})
+}
+
+// handleRuntimeStats 返回运行时内存和 goroutine 统计信息
+func (s *Server) handleRuntimeStats(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+
+	stats := map[string]any{
+		"goroutines": runtime.NumGoroutine(),
+		"memory": map[string]any{
+			"alloc_mb":        float64(m.Alloc) / 1024 / 1024,
+			"total_alloc_mb":  float64(m.TotalAlloc) / 1024 / 1024,
+			"sys_mb":          float64(m.Sys) / 1024 / 1024,
+			"heap_alloc_mb":   float64(m.HeapAlloc) / 1024 / 1024,
+			"heap_sys_mb":     float64(m.HeapSys) / 1024 / 1024,
+			"heap_idle_mb":    float64(m.HeapIdle) / 1024 / 1024,
+			"heap_inuse_mb":   float64(m.HeapInuse) / 1024 / 1024,
+			"heap_released_mb": float64(m.HeapReleased) / 1024 / 1024,
+			"heap_objects":    m.HeapObjects,
+			"stack_inuse_mb":  float64(m.StackInuse) / 1024 / 1024,
+			"stack_sys_mb":    float64(m.StackSys) / 1024 / 1024,
+			"gc_cycles":       m.NumGC,
+			"gc_pause_total_ms": float64(m.PauseTotalNs) / 1e6,
+		},
+		"gc": map[string]any{
+			"next_gc_mb":     float64(m.NextGC) / 1024 / 1024,
+			"last_gc_time":   time.Unix(0, int64(m.LastGC)).Format(time.RFC3339),
+			"gc_cpu_percent": m.GCCPUFraction * 100,
+		},
+	}
+
+	writeJSON(w, stats)
 }
 
 // handleExport 导出所有可用代理池节点的 HTTP 代理 URI，每行一个
