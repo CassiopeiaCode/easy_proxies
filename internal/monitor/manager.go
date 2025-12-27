@@ -679,12 +679,23 @@ func (m *Manager) PruneByTags(tags []string) {
 		set[tag] = struct{}{}
 	}
 	m.mu.Lock()
-	for tag := range m.nodes {
+	pruned := 0
+	for tag, entry := range m.nodes {
 		if _, ok := set[tag]; !ok {
+			// Clear references to help GC
+			entry.mu.Lock()
+			entry.probe = nil
+			entry.release = nil
+			entry.state = nil
+			entry.mu.Unlock()
 			delete(m.nodes, tag)
+			pruned++
 		}
 	}
 	m.mu.Unlock()
+	if pruned > 0 && m.logger != nil {
+		m.logger.Info("pruned ", pruned, " stale nodes from monitor")
+	}
 }
 
 func metaFromInfo(info NodeInfo) state.Meta {

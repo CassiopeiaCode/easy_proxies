@@ -122,7 +122,10 @@ func (s *Store) Start(ctx context.Context) {
 	s.backgroundOnce.Do(func() {
 		go func() {
 			ticker := time.NewTicker(s.flushInterval)
+			// Prune stale records every 6 hours
+			pruneTicker := time.NewTicker(6 * time.Hour)
 			defer ticker.Stop()
+			defer pruneTicker.Stop()
 			for {
 				select {
 				case <-ctx.Done():
@@ -130,6 +133,9 @@ func (s *Store) Start(ctx context.Context) {
 					return
 				case <-ticker.C:
 					_ = s.Flush()
+				case <-pruneTicker.C:
+					// Remove records not updated in 7 days
+					s.PruneStale(7 * 24 * time.Hour)
 				}
 			}
 		}()
@@ -245,6 +251,30 @@ func (s *Store) Remove(id string) {
 	defer s.mu.Unlock()
 	delete(s.data, id)
 	s.dirty = true
+}
+
+// PruneStale removes records that haven't been updated in the given duration.
+// This helps prevent unbounded memory growth from historical node data.
+func (s *Store) PruneStale(maxAge time.Duration) int {
+	if maxAge <= 0 {
+		return 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	cutoff := time.Now().Add(-maxAge)
+	pruned := 0
+	for id, rec := range s.data {
+		if rec.UpdatedAt.Before(cutoff) {
+			delete(s.data, id)
+			pruned++
+		}
+	}
+	if pruned > 0 {
+		s.dirty = true
+		log.Printf("[state] pruned %d stale records older than %v", pruned, maxAge)
+	}
+	return pruned
 }
 
 // IsBlocked reports whether the ID should be skipped at the given time.

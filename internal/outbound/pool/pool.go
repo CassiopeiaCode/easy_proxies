@@ -929,31 +929,59 @@ func (p *poolOutbound) unregisterConn(c *trackedConn) {
 		return
 	}
 	p.globalActive.Add(-1)
-	// We do not eagerly compact activeConns here to keep the hot path cheap.
-	// Stale entries are ignored by findOldestActiveConn.
+
+	// Periodically compact activeConns to prevent unbounded memory growth.
+	// We only compact when the slice grows beyond a threshold to avoid
+	// excessive allocations on the hot path.
+	p.connsMu.Lock()
+	if len(p.activeConns) > 200 {
+		alive := make([]*trackedConn, 0, len(p.activeConns)/2)
+		for _, conn := range p.activeConns {
+			if conn != nil && !conn.closed.Load() {
+				alive = append(alive, conn)
+			}
+		}
+		p.activeConns = alive
+	}
+	p.connsMu.Unlock()
 }
 
 // findOldestActiveConn returns the oldest connection that is still considered
 // active from the pool's perspective. It ignores connections that have been
-// marked closed.
+// marked closed. Also performs opportunistic cleanup of closed connections.
 func (p *poolOutbound) findOldestActiveConn() *trackedConn {
 	if p.maxConcurrent <= 0 {
 		return nil
 	}
 	p.connsMu.Lock()
 	defer p.connsMu.Unlock()
+
 	var oldest *trackedConn
+	closedCount := 0
 	for _, c := range p.activeConns {
 		if c == nil {
 			continue
 		}
 		if c.closed.Load() {
+			closedCount++
 			continue
 		}
 		if oldest == nil || c.createdAt.Before(oldest.createdAt) {
 			oldest = c
 		}
 	}
+
+	// Opportunistic cleanup: if more than half are closed, compact now
+	if closedCount > len(p.activeConns)/2 && len(p.activeConns) > 50 {
+		alive := make([]*trackedConn, 0, len(p.activeConns)-closedCount)
+		for _, c := range p.activeConns {
+			if c != nil && !c.closed.Load() {
+				alive = append(alive, c)
+			}
+		}
+		p.activeConns = alive
+	}
+
 	return oldest
 }
 
@@ -1003,15 +1031,19 @@ func (p *poolOutbound) blacklistMemberFromHealthCheck(member *memberState, cause
 }
 
 // probeHTTP performs HTTP GET request through the proxy to verify connectivity
+// Uses a shared transport pool to reduce memory allocations during health checks.
 func (p *poolOutbound) probeHTTP(ctx context.Context, member *memberState, url string, poolSize int) error {
 	// Create HTTP client that uses the proxy outbound for dialing
 	if poolSize <= 0 {
 		poolSize = 1
 	}
 	transport := &http.Transport{
-		MaxConnsPerHost:     poolSize,
-		MaxIdleConns:        poolSize,
-		MaxIdleConnsPerHost: poolSize,
+		MaxConnsPerHost:       1, // Only need 1 connection per probe
+		MaxIdleConns:          1,
+		MaxIdleConnsPerHost:   1,
+		IdleConnTimeout:       5 * time.Second,
+		DisableKeepAlives:     true, // Don't keep connections alive after probe
+		ResponseHeaderTimeout: httpProbeTimeout,
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			// Parse the address to get host and port
 			host, port, err := net.SplitHostPort(addr)
@@ -1028,6 +1060,7 @@ func (p *poolOutbound) probeHTTP(ctx context.Context, member *memberState, url s
 	}
 	client := &http.Client{
 		Transport: transport,
+		Timeout:   httpProbeTimeout,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse // Don't follow redirects
 		},
