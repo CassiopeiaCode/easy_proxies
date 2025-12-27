@@ -309,20 +309,8 @@ func (p *poolOutbound) initializeMembersLocked() error {
 		}
 		// Connect to existing monitor entry if available
 		if p.monitor != nil {
-			meta := p.options.Metadata[tag]
-			info := monitor.NodeInfo{
-				Tag:           tag,
-				Name:          meta.Name,
-				URI:           meta.URI,
-				Mode:          meta.Mode,
-				ListenAddress: meta.ListenAddress,
-				Port:          meta.Port,
-				EndpointID:    meta.EndpointID,
-				EndpointHost:  meta.EndpointHost,
-				EndpointPort:  meta.EndpointPort,
-				Scheme:        meta.Scheme,
-			}
-			entry := p.monitor.Register(info)
+			// Use GetEntry to get existing entry without resetting initialCheckDone/available
+			entry := p.monitor.GetEntry(tag)
 			if entry != nil {
 				entry.SetRelease(p.makeReleaseFunc(member))
 				if probe := p.makeProbeFunc(member); probe != nil {

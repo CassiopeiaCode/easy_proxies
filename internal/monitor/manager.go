@@ -327,6 +327,18 @@ func (m *Manager) Register(info NodeInfo) *EntryHandle {
 	return &EntryHandle{ref: e}
 }
 
+// GetEntry returns an existing entry handle without resetting its state.
+// Returns nil if the entry doesn't exist.
+func (m *Manager) GetEntry(tag string) *EntryHandle {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	e, ok := m.nodes[tag]
+	if !ok {
+		return nil
+	}
+	return &EntryHandle{ref: e}
+}
+
 // DestinationForProbe exposes the configured destination for health checks.
 // Deprecated: Use ProbeURL instead
 func (m *Manager) DestinationForProbe() (M.Socksaddr, bool) {
