@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"sort"
 	"strconv"
 	"sync"
@@ -240,6 +241,7 @@ func (m *Manager) Stats() NodeStats {
 	defer m.mu.RUnlock()
 
 	var stats NodeStats
+	var debugCheckedAvailable, debugCheckedUnavailable, debugUnchecked int
 	for _, e := range m.nodes {
 		stats.Total++
 
@@ -261,8 +263,16 @@ func (m *Manager) Stats() NodeStats {
 		// positive result.
 		if !blacklisted && checked && available {
 			stats.Schedulable++
+			debugCheckedAvailable++
+		} else if checked && !available {
+			debugCheckedUnavailable++
+		} else if !checked {
+			debugUnchecked++
 		}
 	}
+	// 调试日志：追踪 Stats 计算结果
+	log.Printf("[monitor] Stats: total=%d, schedulable=%d, blacklisted=%d, checkedAvailable=%d, checkedUnavailable=%d, unchecked=%d",
+		stats.Total, stats.Schedulable, stats.Blacklisted, debugCheckedAvailable, debugCheckedUnavailable, debugUnchecked)
 	return stats
 }
 
@@ -668,7 +678,10 @@ func (h *EntryHandle) MarkInitialCheckDone(available bool) {
 	h.ref.mu.Lock()
 	h.ref.initialCheckDone = true
 	h.ref.available = available
+	tag := h.ref.info.Tag
 	h.ref.mu.Unlock()
+	// 调试日志：追踪 initialCheckDone 状态变更
+	log.Printf("[monitor] MarkInitialCheckDone: tag=%s, available=%v", tag, available)
 }
 
 // ResetInitialCheck clears the initial health check state so that subsequent

@@ -1,0 +1,271 @@
+root@ubuntu:/mydata/EasyProxies-Docker# docker compose logs --tail 1000 2>&1 | grep -E "(pool\.|health check|initial probe|register node|schedulable|Stats|available)" | head -200
+root@ubuntu:/mydata/EasyProxies-Docker# docker compose logs --tail 1000 2>&1 | grep -E "(pool\.|health check|initial probe|register node|schedulable|Stats|available)" | head -200
+root@ubuntu:/mydata/EasyProxies-Docker# docker compose logs --tail 1000 2>&1 | grep -E "(pool\.|health check|initial probe|register node|schedulable|Stats|available)" | head -200
+root@ubuntu:/mydata/EasyProxies-Docker# docker compose logs --tail 1000 2>&1 | grep -E "(pool\.|health check|initial probe|register node|schedulable|Stats|available)" | head -200
+root@ubuntu:/mydata/EasyProxies-Docker# docker compose logs grep -E "(pool\.|health check|initial probe|register node|schedulable|Stats|available)" | head -200
+unknown shorthand flag: 'E' in -E
+root@ubuntu:/mydata/EasyProxies-Docker# docker compose logs | grep -E "(pool\.|health check|initial probe|register node|schedulable|Stats|available)" | head -200
+root@ubuntu:/mydata/EasyProxies-Docker# # 命令 1：追踪完整的节点生命周期
+docker compose logs 2>&1 | grep -E "(register node|reset initialCheckDone|initial probe success|initial probe failed|health check completed|refreshAvailabilityLocked|Stats)" | head -100
+
+# 命令 2：专门看 Stats 和 schedulable 的计算时机
+docker compose logs 2>&1 | grep -E "(schedulable|Stats|availability snapshot)" | head -50
+
+# 命令 3：看健康检查的开始和结束时间，以及 API 调用时机
+docker compose logs 2>&1 | grep -E "(starting initial health check|health check completed|api/nodes|api/stats)" | head -50
+
+# 命令 4：最关键 - 看 Register 和健康检查成功的时序
+docker compose logs 2>&1 | grep -E "(register node.*reset|initial probe success|MarkInitialCheckDone)" | head -100
+easy-proxies  | INFO[0000] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=0, tcp=0, udp=0, allowRelease=false
+easy-proxies  | INFO[0000] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=0, tcp=0, udp=0, allowRelease=false
+easy-proxies  | WARN[0000] outbound/pool[proxy-pool]: initial probe failed for join-telegram-farah-vpn-1067: tcp dial: v2ray-http-upgrade: unexpected status: 403 Forbidden
+easy-proxies  | INFO[0000] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=0, tcp=0, udp=0, allowRelease=false
+easy-proxies  | WARN[0000] outbound/pool[proxy-pool]: initial probe failed for join-telegram-farah-vpn-294: tcp dial: unexpected HTTP response status: 409
+easy-proxies  | INFO[0000] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=0, tcp=0, udp=0, allowRelease=false
+easy-proxies  | WARN[0000] outbound/pool[proxy-pool]: initial probe failed for join-telegram-farah-vpn-4554: tcp dial: v2ray-http-upgrade: unexpected status: 400 Bad Request
+easy-proxies  | INFO[0000] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=0, tcp=0, udp=0, allowRelease=false
+easy-proxies  | WARN[0000] outbound/pool[proxy-pool]: initial probe failed for relay-104-18-25-92-7996: tcp dial: unexpected HTTP response status: 500
+easy-proxies  | INFO[0000] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=0, tcp=0, udp=0, allowRelease=false
+easy-proxies  | WARN[0000] outbound/pool[proxy-pool]: initial probe failed for join-telegram-farah-vpn-3155: tcp dial: lookup sss57281.tas-bazi.com: (exchange4: NXDOMAIN | exchange6: NXDOMAIN)
+easy-proxies  | INFO[0000] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=0, tcp=0, udp=0, allowRelease=false
+easy-proxies  | WARN[0000] outbound/pool[proxy-pool]: initial probe failed for join-telegram-farah-vpn-4212: tcp dial: dial tcp 35.180.171.33:22222: connect: connection refused
+easy-proxies  | INFO[0000] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=0, tcp=0, udp=0, allowRelease=false
+easy-proxies  | WARN[0000] outbound/pool[proxy-pool]: initial probe failed for us-167-88-62-68-4764: tcp dial: dial tcp 167.88.62.68:3306: connect: connection refused
+easy-proxies  | INFO[0000] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=0, tcp=0, udp=0, allowRelease=false
+easy-proxies  | INFO[0000] outbound/pool[proxy-pool]: initial probe success for join-telegram-farah-vpn-1492, latency: 137ms
+easy-proxies  | INFO[0000] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=1, tcp=1, udp=1, allowRelease=false
+easy-proxies  | WARN[0000] outbound/pool[proxy-pool]: initial probe failed for us-142-4-108-140-7747: tcp dial: dial tcp 142.4.108.140:38007: connect: connection refused
+easy-proxies  | INFO[0000] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=1, tcp=1, udp=1, allowRelease=false
+easy-proxies  | WARN[0000] outbound/pool[proxy-pool]: initial probe failed for join-telegram-farah-vpn-4082: tcp dial: dial tcp 65.109.199.175:33801: connect: connection refused
+easy-proxies  | INFO[0000] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=1, tcp=1, udp=1, allowRelease=false
+easy-proxies  | WARN[0001] outbound/pool[proxy-pool]: initial probe failed for cz-143-244-58-102-9016: http request: Get "https://www.cloudflare.com/cdn-cgi/trace": tls: first record does not look like a TLS handshake
+easy-proxies  | INFO[0001] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=1, tcp=1, udp=1, allowRelease=false
+easy-proxies  | WARN[0001] outbound/pool[proxy-pool]: initial probe failed for hk-82-158-227-232-8089: tcp dial: dial tcp 82.158.227.232:443: connect: connection refused
+easy-proxies  | INFO[0001] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=1, tcp=1, udp=1, allowRelease=false
+easy-proxies  | INFO[0001] outbound/pool[proxy-pool]: initial probe success for join-telegram-farah-vpn-1481, latency: 471ms
+easy-proxies  | WARN[0001] outbound/pool[proxy-pool]: initial probe failed for join-telegram-farah-vpn-1496: http request: Get "https://www.cloudflare.com/cdn-cgi/trace": EOF
+easy-proxies  | INFO[0001] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=2, tcp=2, udp=2, allowRelease=false
+easy-proxies  | WARN[0001] outbound/pool[proxy-pool]: initial probe failed for join-telegram-farah-vpn-4077: http request: Get "https://www.cloudflare.com/cdn-cgi/trace": EOF
+easy-proxies  | INFO[0001] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=2, tcp=2, udp=2, allowRelease=false
+easy-proxies  | WARN[0001] outbound/pool[proxy-pool]: initial probe failed for join-telegram-farah-vpn-341: http request: Get "https://www.cloudflare.com/cdn-cgi/trace": EOF
+easy-proxies  | INFO[0001] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=2, tcp=2, udp=2, allowRelease=false
+easy-proxies  | WARN[0001] outbound/pool[proxy-pool]: initial probe failed for us-167-88-61-60-6597: tcp dial: context deadline exceeded
+easy-proxies  | INFO[0001] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=2, tcp=2, udp=2, allowRelease=false
+easy-proxies  | WARN[0001] outbound/pool[proxy-pool]: initial probe failed for us-167-88-63-82-6897: tcp dial: context deadline exceeded
+easy-proxies  | INFO[0001] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=2, tcp=2, udp=2, allowRelease=false
+easy-proxies  | WARN[0001] outbound/pool[proxy-pool]: initial probe failed for join-telegram-farah-vpn-40: tcp dial: context deadline exceeded
+easy-proxies  | INFO[0001] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=2, tcp=2, udp=2, allowRelease=false
+easy-proxies  | WARN[0001] outbound/pool[proxy-pool]: initial probe failed for join-telegram-farah-vpn-2190: tcp dial: context deadline exceeded
+easy-proxies  | INFO[0001] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=2, tcp=2, udp=2, allowRelease=false
+easy-proxies  | WARN[0001] outbound/pool[proxy-pool]: initial probe failed for join-telegram-farah-vpn-2132: tcp dial: context deadline exceeded
+easy-proxies  | INFO[0001] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=2, tcp=2, udp=2, allowRelease=false
+easy-proxies  | WARN[0001] outbound/pool[proxy-pool]: initial probe failed for join-telegram-farah-vpn-1878: tcp dial: context deadline exceeded
+easy-proxies  | INFO[0001] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=2, tcp=2, udp=2, allowRelease=false
+easy-proxies  | WARN[0001] outbound/pool[proxy-pool]: initial probe failed for join-telegram-farah-vpn-2936: tcp dial: context deadline exceeded
+easy-proxies  | INFO[0001] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=2, tcp=2, udp=2, allowRelease=false
+easy-proxies  | WARN[0001] outbound/pool[proxy-pool]: initial probe failed for join-telegram-farah-vpn-3808: tcp dial: context deadline exceeded
+easy-proxies  | INFO[0001] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=2, tcp=2, udp=2, allowRelease=false
+easy-proxies  | WARN[0001] outbound/pool[proxy-pool]: initial probe failed for cn: tcp dial: context deadline exceeded
+easy-proxies  | INFO[0001] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=2, tcp=2, udp=2, allowRelease=false
+easy-proxies  | WARN[0001] outbound/pool[proxy-pool]: initial probe failed for pl-146-59-118-250-7247: tcp dial: tls: failed to verify certificate: x509: certificate is valid for parisgame.org, *.parisgame.org, not lammaland.org
+easy-proxies  | INFO[0001] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=2, tcp=2, udp=2, allowRelease=false
+easy-proxies  | WARN[0001] outbound/pool[proxy-pool]: initial probe failed for us-167-88-63-82-6794: tcp dial: context deadline exceeded
+easy-proxies  | INFO[0001] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=2, tcp=2, udp=2, allowRelease=false
+easy-proxies  | WARN[0001] outbound/pool[proxy-pool]: initial probe failed for join-telegram-farah-vpn-1501: tcp dial: context deadline exceeded
+easy-proxies  | INFO[0001] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=2, tcp=2, udp=2, allowRelease=false
+easy-proxies  | WARN[0001] outbound/pool[proxy-pool]: initial probe failed for relay-104-26-9-112-0852: tcp dial: unexpected HTTP response status: 409
+easy-proxies  | INFO[0001] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=2, tcp=2, udp=2, allowRelease=false
+easy-proxies  | WARN[0001] outbound/pool[proxy-pool]: initial probe failed for ca-85-208-108-20-4243: tcp dial: dial tcp 85.208.108.20:6697: connect: connection refused
+easy-proxies  | INFO[0001] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=2, tcp=2, udp=2, allowRelease=false
+easy-proxies  | WARN[0001] outbound/pool[proxy-pool]: initial probe failed for relay-203-30-191-9-0741: tcp dial: remote error: tls: handshake failure
+easy-proxies  | INFO[0001] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=2, tcp=2, udp=2, allowRelease=false
+easy-proxies  | WARN[0001] outbound/pool[proxy-pool]: initial probe failed for join-telegram-farah-vpn-1576: tcp dial: dial tcp 91.99.177.36:443: connect: connection refused
+easy-proxies  | INFO[0001] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=2, tcp=2, udp=2, allowRelease=false
+easy-proxies  | WARN[0001] outbound/pool[proxy-pool]: initial probe failed for us-38-121-43-71-6055: tcp dial: context deadline exceeded
+easy-proxies  | INFO[0001] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=2, tcp=2, udp=2, allowRelease=false
+easy-proxies  | WARN[0001] outbound/pool[proxy-pool]: initial probe failed for join-telegram-farah-vpn-3929: tcp dial: remote error: tls: handshake failure
+easy-proxies  | INFO[0001] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=2, tcp=2, udp=2, allowRelease=false
+easy-proxies  | WARN[0001] outbound/pool[proxy-pool]: initial probe failed for join-telegram-farah-vpn-2143: tcp dial: dial tcp 45.144.31.234:443: connect: connection refused
+easy-proxies  | INFO[0001] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=2, tcp=2, udp=2, allowRelease=false
+easy-proxies  | WARN[0001] outbound/pool[proxy-pool]: initial probe failed for join-telegram-farah-vpn-2269: tcp dial: lookup free-httpcustom4free-httpcustom-free-httpcustom-free-httpcustom.httpcustom.ir: (exchange6: NXDOMAIN | exchange4: NXDOMAIN)
+easy-proxies  | INFO[0001] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=2, tcp=2, udp=2, allowRelease=false
+easy-proxies  | WARN[0001] outbound/pool[proxy-pool]: initial probe failed for kr-52-78-213-224-1421: tcp dial: context deadline exceeded
+easy-proxies  | INFO[0001] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=2, tcp=2, udp=2, allowRelease=false
+easy-proxies  | WARN[0001] outbound/pool[proxy-pool]: initial probe failed for join-telegram-farah-vpn-147: http request: Get "https://www.cloudflare.com/cdn-cgi/trace": EOF
+easy-proxies  | INFO[0001] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=2, tcp=2, udp=2, allowRelease=false
+easy-proxies  | WARN[0002] outbound/pool[proxy-pool]: initial probe failed for join-telegram-farah-vpn-4359: tcp dial: v2ray-http-upgrade: unexpected status: 403 Forbidden
+easy-proxies  | INFO[0002] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=2, tcp=2, udp=2, allowRelease=false
+easy-proxies  | WARN[0002] outbound/pool[proxy-pool]: initial probe failed for join-telegram-farah-vpn-1665: http request: Get "https://www.cloudflare.com/cdn-cgi/trace": EOF
+easy-proxies  | INFO[0002] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=2, tcp=2, udp=2, allowRelease=false
+easy-proxies  | WARN[0002] outbound/pool[proxy-pool]: initial probe failed for node-552: http request: Get "https://www.cloudflare.com/cdn-cgi/trace": EOF
+easy-proxies  | INFO[0002] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=2, tcp=2, udp=2, allowRelease=false
+easy-proxies  | WARN[0002] outbound/pool[proxy-pool]: initial probe failed for relay-23-227-60-184-8566: tcp dial: context deadline exceeded
+easy-proxies  | INFO[0002] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=2, tcp=2, udp=2, allowRelease=false
+easy-proxies  | WARN[0002] outbound/pool[proxy-pool]: initial probe failed for join-telegram-farah-vpn-1586: tcp dial: context deadline exceeded
+easy-proxies  | INFO[0002] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=2, tcp=2, udp=2, allowRelease=false
+easy-proxies  | WARN[0002] outbound/pool[proxy-pool]: initial probe failed for relay-172-67-115-249-0760: tcp dial: remote error: tls: handshake failure
+easy-proxies  | INFO[0002] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=2, tcp=2, udp=2, allowRelease=false
+easy-proxies  | WARN[0002] outbound/pool[proxy-pool]: initial probe failed for de-57-129-28-214-7241: tcp dial: tls: failed to verify certificate: x509: certificate is valid for janetvill.com, *.janetvill.com, not kampong.org
+easy-proxies  | INFO[0002] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=2, tcp=2, udp=2, allowRelease=false
+easy-proxies  | WARN[0002] outbound/pool[proxy-pool]: initial probe failed for join-telegram-farah-vpn-1524: http request: Get "https://www.cloudflare.com/cdn-cgi/trace": EOF
+easy-proxies  | INFO[0002] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=2, tcp=2, udp=2, allowRelease=false
+easy-proxies  | WARN[0002] outbound/pool[proxy-pool]: initial probe failed for relay-147-185-161-169-9002: tcp dial: remote error: tls: handshake failure
+easy-proxies  | INFO[0002] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=2, tcp=2, udp=2, allowRelease=false
+easy-proxies  | WARN[0002] outbound/pool[proxy-pool]: initial probe failed for join-telegram-farah-vpn-3252: tcp dial: unexpected HTTP response status: 403
+easy-proxies  | INFO[0002] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=2, tcp=2, udp=2, allowRelease=false
+easy-proxies  | INFO[0002] outbound/pool[proxy-pool]: initial probe success for vn-103-186-154-217-5309, latency: 1162ms
+easy-proxies  | WARN[0002] outbound/pool[proxy-pool]: initial probe failed for us-38-107-226-48-6580: tcp dial: context deadline exceeded
+easy-proxies  | INFO[0002] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=3, tcp=3, udp=3, allowRelease=false
+easy-proxies  | INFO[0000] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=0, tcp=0, udp=0, allowRelease=false
+easy-proxies  | INFO[0000] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=0, tcp=0, udp=0, allowRelease=false
+easy-proxies  | INFO[0000] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=0, tcp=0, udp=0, allowRelease=false
+easy-proxies  | INFO[0000] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=0, tcp=0, udp=0, allowRelease=false
+easy-proxies  | INFO[0000] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=0, tcp=0, udp=0, allowRelease=false
+easy-proxies  | INFO[0000] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=0, tcp=0, udp=0, allowRelease=false
+easy-proxies  | INFO[0000] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=0, tcp=0, udp=0, allowRelease=false
+easy-proxies  | INFO[0000] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=0, tcp=0, udp=0, allowRelease=false
+easy-proxies  | INFO[0000] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=0, tcp=0, udp=0, allowRelease=false
+easy-proxies  | INFO[0000] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=1, tcp=1, udp=1, allowRelease=false
+easy-proxies  | INFO[0000] outbound/pool[proxy-pool]: first node available, pool is now schedulable
+easy-proxies  | INFO[0000] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=1, tcp=1, udp=1, allowRelease=false
+easy-proxies  | INFO[0000] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=1, tcp=1, udp=1, allowRelease=false
+easy-proxies  | INFO[0001] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=1, tcp=1, udp=1, allowRelease=false
+easy-proxies  | INFO[0001] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=1, tcp=1, udp=1, allowRelease=false
+easy-proxies  | INFO[0001] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=2, tcp=2, udp=2, allowRelease=false
+easy-proxies  | INFO[0001] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=2, tcp=2, udp=2, allowRelease=false
+easy-proxies  | INFO[0001] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=2, tcp=2, udp=2, allowRelease=false
+easy-proxies  | INFO[0001] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=2, tcp=2, udp=2, allowRelease=false
+easy-proxies  | INFO[0001] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=2, tcp=2, udp=2, allowRelease=false
+easy-proxies  | INFO[0001] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=2, tcp=2, udp=2, allowRelease=false
+easy-proxies  | INFO[0001] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=2, tcp=2, udp=2, allowRelease=false
+easy-proxies  | INFO[0001] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=2, tcp=2, udp=2, allowRelease=false
+easy-proxies  | INFO[0001] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=2, tcp=2, udp=2, allowRelease=false
+easy-proxies  | INFO[0001] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=2, tcp=2, udp=2, allowRelease=false
+easy-proxies  | INFO[0001] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=2, tcp=2, udp=2, allowRelease=false
+easy-proxies  | INFO[0001] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=2, tcp=2, udp=2, allowRelease=false
+easy-proxies  | INFO[0001] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=2, tcp=2, udp=2, allowRelease=false
+easy-proxies  | INFO[0001] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=2, tcp=2, udp=2, allowRelease=false
+easy-proxies  | INFO[0001] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=2, tcp=2, udp=2, allowRelease=false
+easy-proxies  | INFO[0001] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=2, tcp=2, udp=2, allowRelease=false
+easy-proxies  | INFO[0001] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=2, tcp=2, udp=2, allowRelease=false
+easy-proxies  | INFO[0001] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=2, tcp=2, udp=2, allowRelease=false
+easy-proxies  | INFO[0001] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=2, tcp=2, udp=2, allowRelease=false
+easy-proxies  | INFO[0001] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=2, tcp=2, udp=2, allowRelease=false
+easy-proxies  | INFO[0001] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=2, tcp=2, udp=2, allowRelease=false
+easy-proxies  | INFO[0001] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=2, tcp=2, udp=2, allowRelease=false
+easy-proxies  | INFO[0001] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=2, tcp=2, udp=2, allowRelease=false
+easy-proxies  | INFO[0001] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=2, tcp=2, udp=2, allowRelease=false
+easy-proxies  | INFO[0001] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=2, tcp=2, udp=2, allowRelease=false
+easy-proxies  | INFO[0002] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=2, tcp=2, udp=2, allowRelease=false
+easy-proxies  | INFO[0002] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=2, tcp=2, udp=2, allowRelease=false
+easy-proxies  | INFO[0002] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=2, tcp=2, udp=2, allowRelease=false
+easy-proxies  | INFO[0002] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=2, tcp=2, udp=2, allowRelease=false
+easy-proxies  | INFO[0002] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=2, tcp=2, udp=2, allowRelease=false
+easy-proxies  | INFO[0002] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=2, tcp=2, udp=2, allowRelease=false
+easy-proxies  | INFO[0002] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=2, tcp=2, udp=2, allowRelease=false
+easy-proxies  | INFO[0002] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=2, tcp=2, udp=2, allowRelease=false
+easy-proxies  | INFO[0002] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=2, tcp=2, udp=2, allowRelease=false
+easy-proxies  | INFO[0002] outbound/pool[proxy-pool]: pool.refreshAvailabilityLocked: updated availability snapshot, all=2, tcp=2, udp=2, allowRelease=false
+easy-proxies  | INFO[0000] outbound/pool[proxy-pool]: health-check daemon: starting initial health check, reason=StartStateStart
+easy-proxies  | INFO[0000] outbound/pool[proxy-pool]: starting initial health check for all nodes, total members: 10051
+easy-proxies  | INFO[0000] outbound/pool[proxy-pool]: initial probe success for join-telegram-farah-vpn-1492, latency: 137ms
+easy-proxies  | INFO[0001] outbound/pool[proxy-pool]: initial probe success for join-telegram-farah-vpn-1481, latency: 471ms
+easy-proxies  | INFO[0002] outbound/pool[proxy-pool]: initial probe success for vn-103-186-154-217-5309, latency: 1162ms
+easy-proxies  | INFO[0002] outbound/pool[proxy-pool]: initial probe success for vn-103-186-154-140-5417, latency: 1372ms
+easy-proxies  | INFO[0003] outbound/pool[proxy-pool]: initial probe success for vn-103-186-154-149-5184, latency: 1446ms
+easy-proxies  | INFO[0003] outbound/pool[proxy-pool]: initial probe success for iepl-24-3, latency: 1162ms
+easy-proxies  | INFO[0003] outbound/pool[proxy-pool]: initial probe success for join-telegram-farah-vpn-1473, latency: 858ms
+easy-proxies  | INFO[0004] outbound/pool[proxy-pool]: initial probe success for 38-207-136-20-gemini, latency: 1361ms
+easy-proxies  | INFO[0004] outbound/pool[proxy-pool]: initial probe success for join-telegram-farah-vpn-924, latency: 1108ms
+easy-proxies  | INFO[0005] outbound/pool[proxy-pool]: initial probe success for join-telegram-farah-vpn-985, latency: 572ms
+easy-proxies  | INFO[0005] outbound/pool[proxy-pool]: initial probe success for join-telegram-farah-vpn-61, latency: 460ms
+easy-proxies  | INFO[0006] outbound/pool[proxy-pool]: initial probe success for vn-103-186-154-66-5414, latency: 1107ms
+easy-proxies  | INFO[0007] outbound/pool[proxy-pool]: initial probe success for join-telegram-farah-vpn-2635, latency: 612ms
+easy-proxies  | INFO[0007] outbound/pool[proxy-pool]: initial probe success for join-telegram-farah-vpn-3361, latency: 519ms
+easy-proxies  | INFO[0007] outbound/pool[proxy-pool]: initial probe success for join-telegram-farah-vpn-2398, latency: 792ms
+easy-proxies  | INFO[0008] outbound/pool[proxy-pool]: initial probe success for vn-103-186-154-43-5185, latency: 1164ms
+easy-proxies  | INFO[0008] outbound/pool[proxy-pool]: initial probe success for join-telegram-farah-vpn-2073, latency: 1374ms
+easy-proxies  | INFO[0008] outbound/pool[proxy-pool]: initial probe success for join-telegram-farah-vpn-2625, latency: 2601ms
+easy-proxies  | INFO[0010] outbound/pool[proxy-pool]: initial probe success for node-9772, latency: 1008ms
+easy-proxies  | INFO[0010] outbound/pool[proxy-pool]: initial probe success for join-telegram-farah-vpn-1370, latency: 622ms
+easy-proxies  | INFO[0011] outbound/pool[proxy-pool]: initial probe success for vn-103-186-155-214-5302, latency: 1156ms
+easy-proxies  | INFO[0011] outbound/pool[proxy-pool]: initial probe success for vn-103-186-155-45-5257, latency: 1095ms
+easy-proxies  | INFO[0012] outbound/pool[proxy-pool]: initial probe success for vn-103-186-154-17-5318, latency: 1202ms
+easy-proxies  | INFO[0012] outbound/pool[proxy-pool]: initial probe success for vn-103-186-154-175-5300, latency: 1168ms
+easy-proxies  | INFO[0013] outbound/pool[proxy-pool]: initial probe success for join-telegram-farah-vpn-3972, latency: 482ms
+easy-proxies  | INFO[0013] outbound/pool[proxy-pool]: initial probe success for join-telegram-farah-vpn-4445, latency: 1458ms
+easy-proxies  | INFO[0015] outbound/pool[proxy-pool]: initial probe success for join-telegram-farah-vpn-2209, latency: 483ms
+easy-proxies  | INFO[0015] outbound/pool[proxy-pool]: initial probe success for join-telegram-farah-vpn-2766, latency: 2815ms
+easy-proxies  | INFO[0015] outbound/pool[proxy-pool]: initial probe success for join-telegram-farah-vpn-3914, latency: 538ms
+easy-proxies  | INFO[0015] outbound/pool[proxy-pool]: initial probe success for join-telegram-farah-vpn-2611, latency: 2230ms
+easy-proxies  | INFO[0016] outbound/pool[proxy-pool]: initial probe success for join-telegram-farah-vpn-2255, latency: 1270ms
+easy-proxies  | INFO[0017] outbound/pool[proxy-pool]: initial probe success for vn-103-186-154-22-4992, latency: 1162ms
+easy-proxies  | INFO[0017] outbound/pool[proxy-pool]: initial probe success for node-567, latency: 774ms
+easy-proxies  | INFO[0017] outbound/pool[proxy-pool]: initial probe success for join-telegram-farah-vpn-3763, latency: 1831ms
+easy-proxies  | INFO[0017] outbound/pool[proxy-pool]: initial probe success for iepl-17-5, latency: 1083ms
+easy-proxies  | INFO[0019] outbound/pool[proxy-pool]: initial probe success for vn-103-186-154-70-5320, latency: 1109ms
+easy-proxies  | INFO[0020] outbound/pool[proxy-pool]: initial probe success for join-telegram-farah-vpn-2638, latency: 915ms
+easy-proxies  | INFO[0020] outbound/pool[proxy-pool]: initial probe success for node-7716, latency: 811ms
+easy-proxies  | INFO[0020] outbound/pool[proxy-pool]: initial probe success for join-telegram-farah-vpn-271, latency: 601ms
+easy-proxies  | INFO[0021] outbound/pool[proxy-pool]: initial probe success for vn-103-186-154-210-5216, latency: 1091ms
+easy-proxies  | INFO[0022] outbound/pool[proxy-pool]: initial probe success for vn-103-186-155-149-5389, latency: 1119ms
+easy-proxies  | INFO[0022] outbound/pool[proxy-pool]: initial probe success for join-telegram-farah-vpn-1790, latency: 2347ms
+easy-proxies  | INFO[0023] outbound/pool[proxy-pool]: initial probe success for join-telegram-farah-vpn-211, latency: 663ms
+easy-proxies  | INFO[0023] outbound/pool[proxy-pool]: initial probe success for join-telegram-farah-vpn-670, latency: 1058ms
+easy-proxies  | INFO[0023] outbound/pool[proxy-pool]: initial probe success for iepl-18-3, latency: 1071ms
+easy-proxies  | INFO[0024] outbound/pool[proxy-pool]: initial probe success for join-telegram-farah-vpn-3959, latency: 1194ms
+easy-proxies  | INFO[0025] outbound/pool[proxy-pool]: initial probe success for join-telegram-farah-vpn-1297, latency: 458ms
+easy-proxies  | INFO[0025] outbound/pool[proxy-pool]: initial probe success for join-telegram-farah-vpn-2207, latency: 550ms
+easy-proxies  | INFO[0025] outbound/pool[proxy-pool]: initial probe success for join-telegram-farah-vpn-1814, latency: 856ms
+easy-proxies  | INFO[0025] outbound/pool[proxy-pool]: initial probe success for join-telegram-farah-vpn-3030, latency: 828ms
+easy-proxies  | INFO[0026] outbound/pool[proxy-pool]: initial probe success for join-telegram-farah-vpn-1203, latency: 678ms
+easy-proxies  | INFO[0027] outbound/pool[proxy-pool]: initial probe success for join-telegram-farah-vpn-2095, latency: 1976ms
+easy-proxies  | INFO[0028] outbound/pool[proxy-pool]: initial probe success for join-telegram-farah-vpn-4449, latency: 1422ms
+easy-proxies  | INFO[0028] outbound/pool[proxy-pool]: initial probe success for join-telegram-farah-vpn-1180, latency: 753ms
+easy-proxies  | INFO[0029] outbound/pool[proxy-pool]: initial probe success for vn-103-186-155-110-5452, latency: 1207ms
+easy-proxies  | INFO[0029] outbound/pool[proxy-pool]: initial probe success for join-telegram-farah-vpn-1172, latency: 547ms
+easy-proxies  | INFO[0029] outbound/pool[proxy-pool]: initial probe success for join-telegram-farah-vpn-3867, latency: 925ms
+easy-proxies  | INFO[0029] outbound/pool[proxy-pool]: initial probe success for iepl-09-3, latency: 1106ms
+easy-proxies  | INFO[0030] outbound/pool[proxy-pool]: initial probe success for join-telegram-farah-vpn-33, latency: 759ms
+easy-proxies  | INFO[0031] outbound/pool[proxy-pool]: initial probe success for vn-103-186-155-207-5396, latency: 2325ms
+easy-proxies  | INFO[0031] outbound/pool[proxy-pool]: initial probe success for join-telegram-farah-vpn-4616, latency: 448ms
+easy-proxies  | INFO[0031] outbound/pool[proxy-pool]: initial probe success for vn-103-186-154-199-5336, latency: 1213ms
+easy-proxies  | INFO[0032] outbound/pool[proxy-pool]: initial probe success for join-telegram-farah-vpn-1439, latency: 756ms
+easy-proxies  | INFO[0032] outbound/pool[proxy-pool]: initial probe success for vn-103-186-154-190-5450, latency: 1081ms
+easy-proxies  | INFO[0032] outbound/pool[proxy-pool]: initial probe success for uk-manchester, latency: 603ms
+easy-proxies  | INFO[0033] outbound/pool[proxy-pool]: initial probe success for join-telegram-farah-vpn-693, latency: 880ms
+easy-proxies  | INFO[0033] outbound/pool[proxy-pool]: initial probe success for join-telegram-farah-vpn-1001, latency: 2668ms
+easy-proxies  | INFO[0033] outbound/pool[proxy-pool]: initial probe success for join-telegram-farah-vpn-3238, latency: 1093ms
+easy-proxies  | INFO[0034] outbound/pool[proxy-pool]: initial probe success for vn-103-186-155-78-5157, latency: 1119ms
+easy-proxies  | INFO[0034] outbound/pool[proxy-pool]: initial probe success for join-telegram-farah-vpn-3439, latency: 997ms
+easy-proxies  | INFO[0034] outbound/pool[proxy-pool]: initial probe success for join-telegram-farah-vpn-3093, latency: 1057ms
+easy-proxies  | INFO[0035] outbound/pool[proxy-pool]: initial probe success for iepl-30, latency: 1110ms
+easy-proxies  | INFO[0035] outbound/pool[proxy-pool]: initial probe success for github-com-ruk1ng001-62363938626436, latency: 1092ms
+easy-proxies  | INFO[0036] outbound/pool[proxy-pool]: initial probe success for join-telegram-farah-vpn-1383, latency: 856ms
+easy-proxies  | INFO[0036] outbound/pool[proxy-pool]: initial probe success for vn-103-186-155-63-5440, latency: 1072ms
+easy-proxies  | INFO[0036] outbound/pool[proxy-pool]: initial probe success for join-telegram-farah-vpn-2773, latency: 1161ms
+easy-proxies  | INFO[0036] outbound/pool[proxy-pool]: initial probe success for join-telegram-farah-vpn-1252, latency: 1138ms
+easy-proxies  | INFO[0036] outbound/pool[proxy-pool]: initial probe success for join-telegram-farah-vpn-1804, latency: 2044ms
+easy-proxies  | INFO[0037] outbound/pool[proxy-pool]: initial probe success for join-telegram-farah-vpn-3601, latency: 480ms
+easy-proxies  | INFO[0037] outbound/pool[proxy-pool]: initial probe success for join-telegram-farah-vpn-318, latency: 2202ms
+easy-proxies  | INFO[0038] outbound/pool[proxy-pool]: initial probe success for vn-103-186-155-137-5167, latency: 1149ms
+easy-proxies  | INFO[0038] outbound/pool[proxy-pool]: initial probe success for join-telegram-farah-vpn-1143, latency: 3012ms
+easy-proxies  | INFO[0038] outbound/pool[proxy-pool]: initial probe success for join-telegram-farah-vpn-2281, latency: 798ms
+easy-proxies  | INFO[0038] outbound/pool[proxy-pool]: initial probe success for nl, latency: 584ms
+easy-proxies  | INFO[0038] outbound/pool[proxy-pool]: initial probe success for 178-239-125-108-gemini-claude, latency: 1800ms
+easy-proxies  | INFO[0038] outbound/pool[proxy-pool]: initial probe success for join-telegram-farah-vpn-2543, latency: 2425ms
+easy-proxies  | INFO[0039] outbound/pool[proxy-pool]: initial probe success for join-telegram-farah-vpn-457, latency: 560ms
+easy-proxies  | INFO[0039] outbound/pool[proxy-pool]: initial probe success for join-telegram-farah-vpn-2631, latency: 555ms
+easy-proxies  | INFO[0039] outbound/pool[proxy-pool]: initial probe success for iepl-23-2, latency: 1283ms
+easy-proxies  | INFO[0039] outbound/pool[proxy-pool]: initial probe success for japan, latency: 676ms
+easy-proxies  | INFO[0041] outbound/pool[proxy-pool]: initial probe success for join-telegram-farah-vpn-3406, latency: 1988ms
+easy-proxies  | INFO[0041] outbound/pool[proxy-pool]: initial probe success for vn-103-186-154-164-5207, latency: 1367ms
+easy-proxies  | INFO[0041] outbound/pool[proxy-pool]: initial probe success for join-telegram-farah-vpn-3246, latency: 552ms
+easy-proxies  | INFO[0042] outbound/pool[proxy-pool]: initial probe success for vn-103-186-154-41-5321, latency: 1066ms
+easy-proxies  | INFO[0042] outbound/pool[proxy-pool]: initial probe success for iepl-01-6, latency: 1086ms
+easy-proxies  | INFO[0042] outbound/pool[proxy-pool]: initial probe success for 49, latency: 2678ms
+easy-proxies  | INFO[0043] outbound/pool[proxy-pool]: initial probe success for join-telegram-farah-vpn-3327, latency: 787ms
+easy-proxies  | INFO[0043] outbound/pool[proxy-pool]: initial probe success for vn-103-186-155-23-4999, latency: 1075ms
+easy-proxies  | INFO[0044] outbound/pool[proxy-pool]: initial probe success for vn-103-186-154-141-5181, latency: 1365ms
+easy-proxies  | INFO[0044] outbound/pool[proxy-pool]: initial probe success for vn-103-186-154-35-4989, latency: 1208ms
+root@ubuntu:/mydata/EasyProxies-Docker#
