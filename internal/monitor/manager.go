@@ -106,7 +106,7 @@ func NewManager(cfg Config, store *state.Store) (*Manager, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	m := &Manager{
 		cfg:    cfg,
-		nodes:  make(map[string]*entry),
+		nodes:  make(map[string]*entry, 128), // Pre-allocate for typical node count
 		ctx:    ctx,
 		cancel: cancel,
 		state:  store,

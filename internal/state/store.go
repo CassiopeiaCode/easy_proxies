@@ -55,7 +55,7 @@ func Open(path string, flushInterval time.Duration) (*Store, error) {
 	s := &Store{
 		path:          path,
 		flushInterval: flushInterval,
-		data:          make(map[string]*Record),
+		data:          make(map[string]*Record, 256), // Pre-allocate for typical node count
 	}
 	if err := s.load(); err != nil {
 		return nil, err

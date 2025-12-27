@@ -162,6 +162,13 @@ func newPool(ctx context.Context, _ adapter.Router, logger log.ContextLogger, ta
 	}
 	monitorMgr := monitor.FromContext(ctx)
 	normalized := normalizeOptions(options)
+
+	// Pre-allocate activeConns slice with reasonable capacity
+	initialConnCap := 64
+	if normalized.MaxConcurrent > 0 && normalized.MaxConcurrent < initialConnCap {
+		initialConnCap = normalized.MaxConcurrent
+	}
+
 	p := &poolOutbound{
 		Adapter:       outbound.NewAdapter(Type, tag, []string{N.NetworkTCP, N.NetworkUDP}, normalized.Members),
 		ctx:           ctx,
@@ -172,6 +179,7 @@ func newPool(ctx context.Context, _ adapter.Router, logger log.ContextLogger, ta
 		rng:           rand.New(rand.NewSource(time.Now().UnixNano())),
 		monitor:       monitorMgr,
 		maxConcurrent: int32(normalized.MaxConcurrent),
+		activeConns:   make([]*trackedConn, 0, initialConnCap),
 	}
 
 	// Register nodes immediately if monitor is available

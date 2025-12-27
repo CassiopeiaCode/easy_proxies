@@ -82,9 +82,11 @@ type buildResult struct {
 
 // Build converts high level config into sing-box Options tree.
 func Build(cfg *config.Config) (Result, error) {
+	nodeCount := len(cfg.Nodes)
+
 	// 1. Pre-computation loop (serial) to generate unique tags
-	jobs := make([]buildJob, 0, len(cfg.Nodes))
-	usedTags := make(map[string]int) // Track tag usage for uniqueness
+	jobs := make([]buildJob, 0, nodeCount)
+	usedTags := make(map[string]int, nodeCount) // Track tag usage for uniqueness
 	for idx, node := range cfg.Nodes {
 		baseTag := sanitizeTag(node.Name)
 		if baseTag == "" {
@@ -149,13 +151,13 @@ func Build(cfg *config.Config) (Result, error) {
 
 	baseOutbounds := make([]option.Outbound, 0, numJobs)
 	memberTags := make([]string, 0, numJobs)
-	metadata := make(map[string]poolout.MemberMeta)
-	tagToNodeIndex := make(map[string]int)
+	metadata := make(map[string]poolout.MemberMeta, numJobs)
+	tagToNodeIndex := make(map[string]int, numJobs)
 	var failedNodes []string
 	var failedIndices []int
 
 	// Track error types for summary logging
-	errorCounts := make(map[string]int)
+	errorCounts := make(map[string]int, 8)
 
 	for _, res := range orderedResults {
 		originalNode := cfg.Nodes[res.idx]

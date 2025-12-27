@@ -520,9 +520,17 @@ func loadNodesFromFile(path string) ([]NodeConfig, error) {
 // loadNodesFromSubscription fetches and parses nodes from a subscription URL
 // Supports multiple formats: base64 encoded, plain text, clash yaml, etc.
 func loadNodesFromSubscription(subURL string) ([]NodeConfig, error) {
-	client := &http.Client{
-		Timeout: 30 * time.Second,
+	transport := &http.Transport{
+		MaxIdleConns:        1,
+		MaxIdleConnsPerHost: 1,
+		IdleConnTimeout:     10 * time.Second,
+		DisableKeepAlives:   true, // Don't reuse connections
 	}
+	client := &http.Client{
+		Timeout:   30 * time.Second,
+		Transport: transport,
+	}
+	defer transport.CloseIdleConnections()
 
 	req, err := http.NewRequest("GET", subURL, nil)
 	if err != nil {
@@ -543,7 +551,9 @@ func loadNodesFromSubscription(subURL string) ([]NodeConfig, error) {
 		return nil, fmt.Errorf("subscription returned status %d", resp.StatusCode)
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	// Limit response body size to prevent memory exhaustion (10MB max)
+	limitedReader := io.LimitReader(resp.Body, 10*1024*1024)
+	body, err := io.ReadAll(limitedReader)
 	if err != nil {
 		return nil, fmt.Errorf("read response: %w", err)
 	}
