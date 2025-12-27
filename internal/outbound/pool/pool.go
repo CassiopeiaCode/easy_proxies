@@ -284,6 +284,13 @@ func (p *poolOutbound) Start(stage adapter.StartStage) error {
 	return nil
 }
 
+// Close implements adapter.Lifecycle interface.
+// This is required for sing-box to call Start() on the outbound.
+func (p *poolOutbound) Close() error {
+	p.logger.Info("pool.Close: shutting down")
+	return nil
+}
+
 // initializeMembersLocked must be called with p.mu held
 func (p *poolOutbound) initializeMembersLocked() error {
 	if len(p.members) > 0 {
