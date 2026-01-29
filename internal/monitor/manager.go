@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"net"
+	"net/url"
 	"runtime"
 	"sort"
 	"strconv"
@@ -101,14 +102,21 @@ type entry struct {
 
 // Manager aggregates all node states for the UI/API.
 type Manager struct {
-	cfg        Config
-	probeDst   M.Socksaddr
-	probeReady bool
-	mu         sync.RWMutex
-	nodes      map[string]*entry
-	ctx        context.Context
-	cancel     context.CancelFunc
-	logger     Logger
+	cfg Config
+
+	probeDst        M.Socksaddr
+	probeReady      bool
+	probeUseTLS     bool
+	probeHostHeader string // Host header value (may include :port)
+	probeServerName string // TLS SNI server name (hostname only)
+	probePath       string // HTTP request path (includes query)
+	probeInsecure   bool   // TLS insecure (skip verify)
+
+	mu     sync.RWMutex
+	nodes  map[string]*entry
+	ctx    context.Context
+	cancel context.CancelFunc
+	logger Logger
 
 	db   *database.DB
 	dbMu sync.Mutex
@@ -129,33 +137,20 @@ func NewManager(cfg Config) (*Manager, error) {
 		ctx:    ctx,
 		cancel: cancel,
 	}
+
 	if cfg.ProbeTarget != "" {
-		target := cfg.ProbeTarget
-		// Strip URL scheme if present (e.g., "https://www.google.com:443" -> "www.google.com:443")
-		if strings.HasPrefix(target, "https://") {
-			target = strings.TrimPrefix(target, "https://")
-		} else if strings.HasPrefix(target, "http://") {
-			target = strings.TrimPrefix(target, "http://")
+		dst, useTLS, hostHeader, serverName, path, insecure, ok := parseProbeTarget(cfg.ProbeTarget, cfg.SkipCertVerify)
+		if ok {
+			m.probeDst = dst
+			m.probeUseTLS = useTLS
+			m.probeHostHeader = hostHeader
+			m.probeServerName = serverName
+			m.probePath = path
+			m.probeInsecure = insecure
+			m.probeReady = true
 		}
-		// Remove trailing path if present
-		if idx := strings.Index(target, "/"); idx != -1 {
-			target = target[:idx]
-		}
-		host, port, err := net.SplitHostPort(target)
-		if err != nil {
-			// If no port specified, use default based on original scheme
-			if strings.HasPrefix(cfg.ProbeTarget, "https://") {
-				host = target
-				port = "443"
-			} else {
-				host = target
-				port = "80"
-			}
-		}
-		parsed := M.ParseSocksaddrHostPort(host, parsePort(port))
-		m.probeDst = parsed
-		m.probeReady = true
 	}
+
 	if cfg.Database.Enabled && strings.TrimSpace(cfg.Database.Path) != "" {
 		openCtx, cancelOpen := context.WithTimeout(ctx, 5*time.Second)
 		db, err := database.Open(openCtx, cfg.Database.Path)
@@ -400,6 +395,108 @@ func (m *Manager) DestinationForProbe() (M.Socksaddr, bool) {
 		return M.Socksaddr{}, false
 	}
 	return m.probeDst, true
+}
+
+// ProbeHTTPInfo exposes the configured HTTP probe settings.
+// - If probe_target has https scheme, UseTLS will be true and TLS handshake is required.
+// - HostHeader is used for the HTTP Host header (may include port).
+// - Path is the HTTP request path (includes query if configured).
+func (m *Manager) ProbeHTTPInfo() (dst M.Socksaddr, useTLS bool, hostHeader, path, serverName string, insecure bool, ok bool) {
+	if !m.probeReady {
+		return M.Socksaddr{}, false, "", "", "", false, false
+	}
+	return m.probeDst, m.probeUseTLS, m.probeHostHeader, m.probePath, m.probeServerName, m.probeInsecure, true
+}
+
+const defaultProbePath = "/generate_204"
+
+// parseProbeTarget parses probe_target as either:
+// - URL: http(s)://host[:port][/path][?query]
+// - host[:port] (treated as http, path defaultProbePath)
+func parseProbeTarget(raw string, skipCertVerify bool) (dst M.Socksaddr, useTLS bool, hostHeader, serverName, path string, insecure bool, ok bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return M.Socksaddr{}, false, "", "", "", false, false
+	}
+
+	// Prefer URL parsing when scheme is present.
+	if strings.Contains(raw, "://") {
+		u, err := url.Parse(raw)
+		if err != nil || u.Host == "" {
+			return M.Socksaddr{}, false, "", "", "", false, false
+		}
+		scheme := strings.ToLower(u.Scheme)
+		switch scheme {
+		case "http":
+			useTLS = false
+		case "https":
+			useTLS = true
+		default:
+			// Unsupported scheme: do not enable probing.
+			return M.Socksaddr{}, false, "", "", "", false, false
+		}
+
+		host := u.Hostname()
+		if host == "" {
+			return M.Socksaddr{}, false, "", "", "", false, false
+		}
+		portStr := u.Port()
+		if portStr == "" {
+			if useTLS {
+				portStr = "443"
+			} else {
+				portStr = "80"
+			}
+		}
+
+		dst = M.ParseSocksaddrHostPort(host, parsePort(portStr))
+
+		// Host header: include explicit port only if present in original URL.
+		if u.Port() != "" {
+			hostHeader = net.JoinHostPort(host, u.Port())
+		} else {
+			hostHeader = host
+		}
+
+		serverName = host
+		path = u.EscapedPath()
+		if path == "" || path == "/" {
+			path = defaultProbePath
+		}
+		if u.RawQuery != "" {
+			path = path + "?" + u.RawQuery
+		}
+		insecure = skipCertVerify
+		return dst, useTLS, hostHeader, serverName, path, insecure, true
+	}
+
+	// Fallback: host[:port] (http)
+	target := raw
+	// Strip any accidental path component.
+	if idx := strings.Index(target, "/"); idx != -1 {
+		target = target[:idx]
+	}
+	host, port, err := net.SplitHostPort(target)
+	if err != nil {
+		host = target
+		port = "80"
+	}
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return M.Socksaddr{}, false, "", "", "", false, false
+	}
+
+	dst = M.ParseSocksaddrHostPort(host, parsePort(port))
+	// Preserve port in Host header only when explicitly provided.
+	if _, _, err := net.SplitHostPort(target); err == nil {
+		hostHeader = target
+	} else {
+		hostHeader = host
+	}
+	serverName = host
+	path = defaultProbePath
+	insecure = skipCertVerify
+	return dst, false, hostHeader, serverName, path, insecure, true
 }
 
 // Snapshot returns a sorted copy of current node states.

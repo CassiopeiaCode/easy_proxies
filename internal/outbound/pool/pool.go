@@ -3,6 +3,7 @@ package pool
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"fmt"
 	"math/rand"
 	"net"
@@ -252,6 +253,19 @@ func (p *poolOutbound) probeAllMembersOnStartup() {
 		return
 	}
 
+	_, useTLS, hostHeader, path, serverName, insecure, ok := p.monitor.ProbeHTTPInfo()
+	if !ok {
+		p.logger.Warn("probe target not configured, skipping initial health check")
+		p.mu.Lock()
+		for _, member := range p.members {
+			if member.entry != nil {
+				member.entry.MarkInitialCheckDone(true)
+			}
+		}
+		p.mu.Unlock()
+		return
+	}
+
 	p.logger.Info("starting initial health check for all nodes")
 
 	p.mu.Lock()
@@ -280,8 +294,8 @@ func (p *poolOutbound) probeAllMembersOnStartup() {
 			continue
 		}
 
-		// Perform HTTP probe to measure actual latency (TTFB)
-		_, err = httpProbe(conn, destination.AddrString(), p.options.ExpectedStatuses)
+		// Perform HTTP(S) probe to measure actual latency (TTFB)
+		_, err = httpProbe(conn, useTLS, hostHeader, path, serverName, insecure, p.options.ExpectedStatuses)
 		conn.Close()
 
 		if err != nil {
@@ -488,9 +502,37 @@ func (p *poolOutbound) makeReleaseFunc(member *memberState) func() {
 
 // httpProbe performs an HTTP probe through the connection and measures TTFB.
 // It sends a minimal HTTP request and validates the HTTP status code if expectedStatuses is non-empty.
-func httpProbe(conn net.Conn, host string, expectedStatuses []int) (time.Duration, error) {
+func httpProbe(conn net.Conn, useTLS bool, hostHeader, path, serverName string, insecure bool, expectedStatuses []int) (time.Duration, error) {
+	if strings.TrimSpace(path) == "" {
+		path = "/"
+	}
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	if strings.TrimSpace(hostHeader) == "" {
+		hostHeader = serverName
+	}
+
+	// If https, wrap the connection with TLS and handshake first.
+	if useTLS {
+		cfg := &tls.Config{
+			ServerName:         serverName,
+			InsecureSkipVerify: insecure,
+		}
+		tlsConn := tls.Client(conn, cfg)
+
+		_ = tlsConn.SetDeadline(time.Now().Add(10 * time.Second))
+		if err := tlsConn.Handshake(); err != nil {
+			return 0, fmt.Errorf("tls handshake: %w", err)
+		}
+
+		// Clear deadline; we'll set per-operation deadlines below.
+		_ = tlsConn.SetDeadline(time.Time{})
+		conn = tlsConn
+	}
+
 	// Build HTTP request
-	req := fmt.Sprintf("GET /generate_204 HTTP/1.1\r\nHost: %s\r\nConnection: close\r\nUser-Agent: Mozilla/5.0\r\n\r\n", host)
+	req := fmt.Sprintf("GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\nUser-Agent: Mozilla/5.0\r\n\r\n", path, hostHeader)
 
 	// Try to set write deadline (ignore errors for connections that don't support it)
 	_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
@@ -558,6 +600,10 @@ func (p *poolOutbound) makeProbeFunc(member *memberState) func(ctx context.Conte
 	if !ok {
 		return nil
 	}
+	_, useTLS, hostHeader, path, serverName, insecure, ok := p.monitor.ProbeHTTPInfo()
+	if !ok {
+		return nil
+	}
 	return func(ctx context.Context) (time.Duration, error) {
 		start := time.Now()
 		conn, err := member.outbound.DialContext(ctx, N.NetworkTCP, destination)
@@ -569,8 +615,8 @@ func (p *poolOutbound) makeProbeFunc(member *memberState) func(ctx context.Conte
 		}
 		defer conn.Close()
 
-		// Perform HTTP probe to measure actual latency (TTFB)
-		_, err = httpProbe(conn, destination.AddrString(), p.options.ExpectedStatuses)
+		// Perform HTTP(S) probe to measure actual latency (TTFB)
+		_, err = httpProbe(conn, useTLS, hostHeader, path, serverName, insecure, p.options.ExpectedStatuses)
 		if err != nil {
 			if member.entry != nil {
 				member.entry.RecordFailure(err)
@@ -593,6 +639,10 @@ func (p *poolOutbound) makeProbeByTagFunc(tag string) func(ctx context.Context) 
 		return nil
 	}
 	destination, ok := p.monitor.DestinationForProbe()
+	if !ok {
+		return nil
+	}
+	_, useTLS, hostHeader, path, serverName, insecure, ok := p.monitor.ProbeHTTPInfo()
 	if !ok {
 		return nil
 	}
@@ -630,8 +680,8 @@ func (p *poolOutbound) makeProbeByTagFunc(tag string) func(ctx context.Context) 
 		}
 		defer conn.Close()
 
-		// Perform HTTP probe to measure actual latency (TTFB)
-		_, err = httpProbe(conn, destination.AddrString(), p.options.ExpectedStatuses)
+		// Perform HTTP(S) probe to measure actual latency (TTFB)
+		_, err = httpProbe(conn, useTLS, hostHeader, path, serverName, insecure, p.options.ExpectedStatuses)
 		if err != nil {
 			if member.entry != nil {
 				member.entry.RecordFailure(err)
