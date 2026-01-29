@@ -27,6 +27,8 @@ nodes.txt
 
 # Go
 vendor/
+.gocache/
+.gomodcache/
 
 # Test artifacts
 coverage.out

@@ -17,6 +17,11 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+type DatabaseConfig struct {
+	Enabled bool   `yaml:"enabled"`
+	Path    string `yaml:"path"`
+}
+
 // Config describes the high level settings for the proxy pool server.
 type Config struct {
 	Mode                string                    `yaml:"mode"`
@@ -24,6 +29,7 @@ type Config struct {
 	MultiPort           MultiPortConfig           `yaml:"multi_port"`
 	Pool                PoolConfig                `yaml:"pool"`
 	Management          ManagementConfig          `yaml:"management"`
+	Database            DatabaseConfig            `yaml:"database"`
 	SubscriptionRefresh SubscriptionRefreshConfig `yaml:"subscription_refresh"`
 	Nodes               []NodeConfig              `yaml:"nodes"`
 	NodesFile           string                    `yaml:"nodes_file"`    // 节点文件路径，每行一个 URI
@@ -60,10 +66,12 @@ type MultiPortConfig struct {
 
 // ManagementConfig controls the monitoring HTTP endpoint.
 type ManagementConfig struct {
-	Enabled     *bool  `yaml:"enabled"`
-	Listen      string `yaml:"listen"`
-	ProbeTarget string `yaml:"probe_target"`
-	Password    string `yaml:"password"` // WebUI 访问密码，为空则不需要密码
+	Enabled               *bool  `yaml:"enabled"`
+	Listen                string `yaml:"listen"`
+	ProbeTarget            string `yaml:"probe_target"`
+	ProbeExpectedStatus    int    `yaml:"probe_expected_status"`
+	ProbeExpectedStatuses  []int  `yaml:"probe_expected_statuses"`
+	Password              string `yaml:"password"` // WebUI 访问密码，为空则不需要密码
 }
 
 // SubscriptionRefreshConfig controls subscription auto-refresh and reload settings.
@@ -119,6 +127,12 @@ func Load(path string) (*Config, error) {
 		cfg.NodesFile = filepath.Join(configDir, cfg.NodesFile)
 	}
 
+	// Resolve database path relative to config file directory
+	if cfg.Database.Path != "" && !filepath.IsAbs(cfg.Database.Path) {
+		configDir := filepath.Dir(path)
+		cfg.Database.Path = filepath.Join(configDir, cfg.Database.Path)
+	}
+
 	if err := cfg.normalize(); err != nil {
 		return nil, err
 	}
@@ -168,6 +182,10 @@ func (c *Config) normalize() error {
 	if c.Management.Enabled == nil {
 		defaultEnabled := true
 		c.Management.Enabled = &defaultEnabled
+	}
+	if c.Database.Path == "" {
+		// Default db path next to config.yaml
+		c.Database.Path = filepath.Join(filepath.Dir(c.filePath), "easy_proxies.db")
 	}
 
 	// Subscription refresh defaults

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/rand"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -41,6 +42,7 @@ type Options struct {
 	FailureThreshold  int
 	BlacklistDuration time.Duration
 	Metadata          map[string]MemberMeta
+	ExpectedStatuses  []int
 }
 
 // MemberMeta carries optional descriptive information for monitoring UI.
@@ -279,7 +281,7 @@ func (p *poolOutbound) probeAllMembersOnStartup() {
 		}
 
 		// Perform HTTP probe to measure actual latency (TTFB)
-		_, err = httpProbe(conn, destination.AddrString())
+		_, err = httpProbe(conn, destination.AddrString(), p.options.ExpectedStatuses)
 		conn.Close()
 
 		if err != nil {
@@ -476,8 +478,8 @@ func (p *poolOutbound) makeReleaseFunc(member *memberState) func() {
 }
 
 // httpProbe performs an HTTP probe through the connection and measures TTFB.
-// It sends a minimal HTTP request and waits for the first byte of response.
-func httpProbe(conn net.Conn, host string) (time.Duration, error) {
+// It sends a minimal HTTP request and validates the HTTP status code if expectedStatuses is non-empty.
+func httpProbe(conn net.Conn, host string, expectedStatuses []int) (time.Duration, error) {
 	// Build HTTP request
 	req := fmt.Sprintf("GET /generate_204 HTTP/1.1\r\nHost: %s\r\nConnection: close\r\nUser-Agent: Mozilla/5.0\r\n\r\n", host)
 
@@ -495,16 +497,48 @@ func httpProbe(conn net.Conn, host string) (time.Duration, error) {
 	// Try to set read deadline (ignore errors for connections that don't support it)
 	_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 
-	// Read first byte (TTFB - Time To First Byte)
 	reader := bufio.NewReader(conn)
-	_, err := reader.ReadByte()
+
+	// Read HTTP status line
+	line, err := reader.ReadString('\n')
 	if err != nil {
-		return 0, fmt.Errorf("read response: %w", err)
+		return 0, fmt.Errorf("read status line: %w", err)
+	}
+	status, err := parseHTTPStatusCode(line)
+	if err != nil {
+		return 0, err
 	}
 
-	// Calculate TTFB
+	// Validate status code if required
+	if len(expectedStatuses) > 0 && !containsInt(expectedStatuses, status) {
+		return 0, fmt.Errorf("unexpected HTTP status %d (expected %v)", status, expectedStatuses)
+	}
+
+	// TTFB: we already got the first line; measure from request send until now
 	ttfb := time.Since(start)
 	return ttfb, nil
+}
+
+func parseHTTPStatusCode(statusLine string) (int, error) {
+	// Typical: "HTTP/1.1 204 No Content\r\n"
+	parts := strings.Fields(statusLine)
+	if len(parts) < 2 {
+		return 0, fmt.Errorf("invalid HTTP status line: %q", strings.TrimSpace(statusLine))
+	}
+	code, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return 0, fmt.Errorf("invalid HTTP status code in line: %q", strings.TrimSpace(statusLine))
+	}
+	return code, nil
+}
+
+func containsInt(list []int, v int) bool {
+	for _, x := range list {
+		if x == v {
+			return true
+		}
+	}
+	return false
 }
 
 func (p *poolOutbound) makeProbeFunc(member *memberState) func(ctx context.Context) (time.Duration, error) {
@@ -527,7 +561,7 @@ func (p *poolOutbound) makeProbeFunc(member *memberState) func(ctx context.Conte
 		defer conn.Close()
 
 		// Perform HTTP probe to measure actual latency (TTFB)
-		_, err = httpProbe(conn, destination.AddrString())
+		_, err = httpProbe(conn, destination.AddrString(), p.options.ExpectedStatuses)
 		if err != nil {
 			if member.entry != nil {
 				member.entry.RecordFailure(err)
@@ -588,7 +622,7 @@ func (p *poolOutbound) makeProbeByTagFunc(tag string) func(ctx context.Context) 
 		defer conn.Close()
 
 		// Perform HTTP probe to measure actual latency (TTFB)
-		_, err = httpProbe(conn, destination.AddrString())
+		_, err = httpProbe(conn, destination.AddrString(), p.options.ExpectedStatuses)
 		if err != nil {
 			if member.entry != nil {
 				member.entry.RecordFailure(err)

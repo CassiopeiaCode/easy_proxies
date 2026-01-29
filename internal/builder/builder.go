@@ -103,12 +103,17 @@ func Build(cfg *config.Config) (option.Options, error) {
 			return option.Options{}, err
 		}
 		inbounds = append(inbounds, inbound)
+		expected := cfg.Management.ProbeExpectedStatuses
+		if len(expected) == 0 && cfg.Management.ProbeExpectedStatus != 0 {
+			expected = []int{cfg.Management.ProbeExpectedStatus}
+		}
 		poolOptions := poolout.Options{
 			Mode:              cfg.Pool.Mode,
 			Members:           memberTags,
 			FailureThreshold:  cfg.Pool.FailureThreshold,
 			BlacklistDuration: cfg.Pool.BlacklistDuration,
 			Metadata:          metadata,
+			ExpectedStatuses:  expected,
 		}
 		outbounds = append(outbounds, option.Outbound{
 			Type:    poolout.Type,
@@ -128,12 +133,17 @@ func Build(cfg *config.Config) (option.Options, error) {
 			meta := metadata[tag]
 			perMeta := map[string]poolout.MemberMeta{tag: meta}
 			poolTag := fmt.Sprintf("%s-%s", poolout.Tag, tag)
+			expected := cfg.Management.ProbeExpectedStatuses
+			if len(expected) == 0 && cfg.Management.ProbeExpectedStatus != 0 {
+				expected = []int{cfg.Management.ProbeExpectedStatus}
+			}
 			perOptions := poolout.Options{
 				Mode:              "sequential",
 				Members:           []string{tag},
 				FailureThreshold:  cfg.Pool.FailureThreshold,
 				BlacklistDuration: cfg.Pool.BlacklistDuration,
 				Metadata:          perMeta,
+				ExpectedStatuses:  expected,
 			}
 			perPool := option.Outbound{
 				Type:    poolout.Type,
