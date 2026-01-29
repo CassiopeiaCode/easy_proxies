@@ -210,8 +210,8 @@ func (c *Config) normalize() error {
 		c.Nodes[idx].Source = NodeSourceInline
 	}
 
-	// Load nodes from file if specified (but NOT if subscriptions exist - subscription takes priority)
-	if c.NodesFile != "" && len(c.Subscriptions) == 0 {
+	// Load nodes from file if specified (nodes.txt is always a data source, even when subscriptions exist).
+	if c.NodesFile != "" {
 		fileNodes, err := loadNodesFromFile(c.NodesFile)
 		if err != nil {
 			return fmt.Errorf("load nodes from file %q: %w", c.NodesFile, err)
@@ -222,38 +222,10 @@ func (c *Config) normalize() error {
 		c.Nodes = append(c.Nodes, fileNodes...)
 	}
 
-	// Load nodes from subscriptions (highest priority - writes to nodes.txt)
-	if len(c.Subscriptions) > 0 {
-		var subNodes []NodeConfig
-		subTimeout := c.SubscriptionRefresh.Timeout
-		for _, subURL := range c.Subscriptions {
-			nodes, err := loadNodesFromSubscription(subURL, subTimeout)
-			if err != nil {
-				log.Printf("⚠️ Failed to load subscription %q: %v (skipping)", subURL, err)
-				continue
-			}
-			log.Printf("✅ Loaded %d nodes from subscription", len(nodes))
-			subNodes = append(subNodes, nodes...)
-		}
-		// Mark subscription nodes and write to nodes.txt
-		for idx := range subNodes {
-			subNodes[idx].Source = NodeSourceSubscription
-		}
-		if len(subNodes) > 0 {
-			// Determine nodes.txt path
-			nodesFilePath := c.NodesFile
-			if nodesFilePath == "" {
-				nodesFilePath = filepath.Join(filepath.Dir(c.filePath), "nodes.txt")
-				c.NodesFile = nodesFilePath
-			}
-			// Write subscription nodes to nodes.txt
-			if err := writeNodesToFile(nodesFilePath, subNodes); err != nil {
-				log.Printf("⚠️ Failed to write nodes to %q: %v", nodesFilePath, err)
-			} else {
-				log.Printf("✅ Written %d subscription nodes to %s", len(subNodes), nodesFilePath)
-			}
-		}
-		c.Nodes = append(c.Nodes, subNodes...)
+	// If subscriptions are configured, ensure nodes_file has a default path (nodes.txt).
+	// Subscription fetching is handled asynchronously by subscription manager at runtime, not during config load.
+	if len(c.Subscriptions) > 0 && c.NodesFile == "" {
+		c.NodesFile = filepath.Join(filepath.Dir(c.filePath), "nodes.txt")
 	}
 
 	if len(c.Nodes) == 0 {

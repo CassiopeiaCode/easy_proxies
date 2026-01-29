@@ -3,18 +3,66 @@ package app
 import (
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
+	"time"
 
 	"easy_proxies/internal/boxmgr"
 	"easy_proxies/internal/config"
+	"easy_proxies/internal/database"
 	"easy_proxies/internal/monitor"
 	"easy_proxies/internal/subscription"
 )
 
 // Run builds the runtime components from config and blocks until shutdown.
 func Run(ctx context.Context, cfg *config.Config) error {
+	// If database is enabled:
+	// - import nodes from config (inline) and nodes.txt (nodes_file) into DB (best-effort)
+	// - load active nodes from DB as the primary runtime node list
+	// nodes.txt remains a data source; subscription refresh is handled asynchronously.
+	if cfg != nil && cfg.Database.Enabled && strings.TrimSpace(cfg.Database.Path) != "" {
+		openCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		db, err := database.Open(openCtx, cfg.Database.Path)
+		cancel()
+		if err != nil {
+			log.Printf("⚠️  open database failed, continue with config nodes: %v", err)
+		} else {
+			importCtx, cancelImport := context.WithTimeout(ctx, 10*time.Second)
+			for _, n := range cfg.Nodes {
+				// Import into DB; if host:port can't be extracted, drop it (filtered out).
+				if _, upErr := db.UpsertNodeByHostPort(importCtx, database.UpsertNodeInput{
+					URI:  n.URI,
+					Name: n.Name,
+				}); upErr != nil {
+					log.Printf("⚠️  drop node (cannot extract host:port): %s (%v)", n.Name, upErr)
+				}
+			}
+			cancelImport()
+
+			loadCtx, cancelLoad := context.WithTimeout(ctx, 5*time.Second)
+			active, listErr := db.ListActiveNodes(loadCtx)
+			cancelLoad()
+			_ = db.Close()
+
+			if listErr != nil {
+				log.Printf("⚠️  list active nodes from database failed, continue with config nodes: %v", listErr)
+			} else if len(active) > 0 {
+				nodes := make([]config.NodeConfig, 0, len(active))
+				for _, n := range active {
+					nodes = append(nodes, config.NodeConfig{
+						Name: n.Name,
+						URI:  n.URI,
+					})
+				}
+				cfg.Nodes = nodes
+				log.Printf("✅ loaded %d active nodes from database", len(active))
+			}
+		}
+	}
+
 	// Build monitor config
 	proxyUsername := cfg.Listener.Username
 	proxyPassword := cfg.Listener.Password
@@ -31,6 +79,13 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		ProxyUsername: proxyUsername,
 		ProxyPassword: proxyPassword,
 		ExternalIP:    cfg.ExternalIP,
+		Database: struct {
+			Enabled bool
+			Path    string
+		}{
+			Enabled: cfg.Database.Enabled,
+			Path:    cfg.Database.Path,
+		},
 	}
 
 	// Create and start BoxManager

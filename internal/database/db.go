@@ -3,6 +3,8 @@ package database
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -36,6 +38,14 @@ type Node struct {
 	BlacklistedUntil        *time.Time
 	CreatedAt               time.Time
 	UpdatedAt               time.Time
+}
+
+type NodeRate struct {
+	Host         string
+	Port         int
+	SuccessCount int64
+	FailCount    int64
+	Rate         float64 // 0..1; when total==0 -> 0
 }
 
 func Open(ctx context.Context, path string) (*DB, error) {
@@ -88,29 +98,46 @@ func (d *DB) Migrate(ctx context.Context) error {
 	}
 	const schema = `
 CREATE TABLE IF NOT EXISTS nodes (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  host TEXT NOT NULL,
-  port INTEGER NOT NULL,
-  uri TEXT NOT NULL,
-  name TEXT NOT NULL DEFAULT '',
-  protocol TEXT NOT NULL DEFAULT '',
-  is_damaged INTEGER NOT NULL DEFAULT 0,
-  damage_reason TEXT NOT NULL DEFAULT '',
-  health_check_count INTEGER NOT NULL DEFAULT 0,
-  health_check_success_count INTEGER NOT NULL DEFAULT 0,
-  last_check_at DATETIME NULL,
-  last_success_at DATETIME NULL,
-  last_latency_ms INTEGER NULL,
-  failure_count INTEGER NOT NULL DEFAULT 0,
-  blacklisted_until DATETIME NULL,
-  created_at DATETIME NOT NULL DEFAULT (datetime('now')),
-  updated_at DATETIME NOT NULL DEFAULT (datetime('now')),
-  UNIQUE(host, port)
+	 id INTEGER PRIMARY KEY AUTOINCREMENT,
+	 host TEXT NOT NULL,
+	 port INTEGER NOT NULL,
+	 uri TEXT NOT NULL,
+	 name TEXT NOT NULL DEFAULT '',
+	 protocol TEXT NOT NULL DEFAULT '',
+	 is_damaged INTEGER NOT NULL DEFAULT 0,
+	 damage_reason TEXT NOT NULL DEFAULT '',
+	 health_check_count INTEGER NOT NULL DEFAULT 0,
+	 health_check_success_count INTEGER NOT NULL DEFAULT 0,
+	 last_check_at DATETIME NULL,
+	 last_success_at DATETIME NULL,
+	 last_latency_ms INTEGER NULL,
+	 failure_count INTEGER NOT NULL DEFAULT 0,
+	 blacklisted_until DATETIME NULL,
+	 created_at DATETIME NOT NULL DEFAULT (datetime('now')),
+	 updated_at DATETIME NOT NULL DEFAULT (datetime('now')),
+	 UNIQUE(host, port)
+);
+
+-- Hourly aggregated health check stats per node.
+-- hour_ts is truncated to the hour (UTC).
+CREATE TABLE IF NOT EXISTS node_health_hourly (
+	 host TEXT NOT NULL,
+	 port INTEGER NOT NULL,
+	 hour_ts DATETIME NOT NULL,
+	 success_count INTEGER NOT NULL DEFAULT 0,
+	 fail_count INTEGER NOT NULL DEFAULT 0,
+	 latency_sum_ms INTEGER NOT NULL DEFAULT 0,
+	 latency_count INTEGER NOT NULL DEFAULT 0,
+	 updated_at DATETIME NOT NULL DEFAULT (datetime('now')),
+	 PRIMARY KEY(host, port, hour_ts)
 );
 
 CREATE INDEX IF NOT EXISTS idx_nodes_damaged ON nodes(is_damaged);
 CREATE INDEX IF NOT EXISTS idx_nodes_health_count ON nodes(health_check_count);
 CREATE INDEX IF NOT EXISTS idx_nodes_blacklisted_until ON nodes(blacklisted_until);
+
+CREATE INDEX IF NOT EXISTS idx_node_health_hourly_hour ON node_health_hourly(hour_ts);
+CREATE INDEX IF NOT EXISTS idx_node_health_hourly_hostport ON node_health_hourly(host, port);
 `
 	_, err := d.sql.ExecContext(ctx, schema)
 	if err != nil {
@@ -204,6 +231,12 @@ func (d *DB) RecordHealthCheck(ctx context.Context, u HealthCheckUpdate) error {
 	if u.Host == "" || u.Port <= 0 {
 		return errors.New("host/port invalid")
 	}
+
+	// Record into hourly aggregation (last 24h logic is query-time).
+	if err := d.recordHourlyHealthCheck(ctx, u); err != nil {
+		return err
+	}
+
 	if u.Success {
 		_, err := d.sql.ExecContext(ctx, `
 UPDATE nodes
@@ -212,9 +245,7 @@ SET health_check_count = health_check_count + 1,
     last_check_at = datetime('now'),
     last_success_at = datetime('now'),
     last_latency_ms = ?,
-    updated_at = datetime('now'),
-    is_damaged = 0,
-    damage_reason = ''
+    updated_at = datetime('now')
 WHERE host = ? AND port = ?
 `, u.LatencyMs, u.Host, u.Port)
 		if err != nil {
@@ -234,6 +265,85 @@ WHERE host = ? AND port = ?
 		return fmt.Errorf("record health check (fail): %w", err)
 	}
 	return nil
+}
+
+func (d *DB) recordHourlyHealthCheck(ctx context.Context, u HealthCheckUpdate) error {
+	// Truncate to hour (UTC) to satisfy "each hour" aggregation.
+	hour := time.Now().UTC().Truncate(time.Hour)
+
+	var addSuccess, addFail int64
+	if u.Success {
+		addSuccess = 1
+	} else {
+		addFail = 1
+	}
+
+	var addLatencySum, addLatencyCount int64
+	if u.Success && u.LatencyMs != nil && *u.LatencyMs > 0 {
+		addLatencySum = *u.LatencyMs
+		addLatencyCount = 1
+	}
+
+	_, err := d.sql.ExecContext(ctx, `
+INSERT INTO node_health_hourly (
+  host, port, hour_ts,
+  success_count, fail_count,
+  latency_sum_ms, latency_count,
+  updated_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
+ON CONFLICT(host, port, hour_ts) DO UPDATE SET
+  success_count = node_health_hourly.success_count + excluded.success_count,
+  fail_count = node_health_hourly.fail_count + excluded.fail_count,
+  latency_sum_ms = node_health_hourly.latency_sum_ms + excluded.latency_sum_ms,
+  latency_count = node_health_hourly.latency_count + excluded.latency_count,
+  updated_at = datetime('now')
+`, u.Host, u.Port, hour.Format("2006-01-02 15:04:05"), addSuccess, addFail, addLatencySum, addLatencyCount)
+	if err != nil {
+		return fmt.Errorf("record hourly health check: %w", err)
+	}
+	return nil
+}
+
+func (d *DB) QueryNodeRatesSince(ctx context.Context, since time.Time) ([]NodeRate, error) {
+	if d == nil || d.sql == nil {
+		return nil, errors.New("db not initialized")
+	}
+	since = since.UTC()
+	sinceStr := since.Format("2006-01-02 15:04:05")
+
+	rows, err := d.sql.QueryContext(ctx, `
+SELECT
+	 host,
+	 port,
+	 SUM(success_count) AS success_sum,
+	 SUM(fail_count) AS fail_sum
+FROM node_health_hourly
+WHERE hour_ts >= ?
+GROUP BY host, port
+`, sinceStr)
+	if err != nil {
+		return nil, fmt.Errorf("query node rates: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]NodeRate, 0)
+	for rows.Next() {
+		var r NodeRate
+		if err := rows.Scan(&r.Host, &r.Port, &r.SuccessCount, &r.FailCount); err != nil {
+			return nil, fmt.Errorf("scan node rate: %w", err)
+		}
+		total := r.SuccessCount + r.FailCount
+		if total > 0 {
+			r.Rate = float64(r.SuccessCount) / float64(total)
+		} else {
+			r.Rate = 0
+		}
+		out = append(out, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("query node rates rows: %w", err)
+	}
+	return out, nil
 }
 
 func (d *DB) ListActiveNodes(ctx context.Context) ([]Node, error) {
@@ -294,6 +404,30 @@ ORDER BY updated_at DESC
 	return out, nil
 }
 
+func (d *DB) IsNodeDamaged(ctx context.Context, host string, port int) (bool, error) {
+	if d == nil || d.sql == nil {
+		return false, errors.New("db not initialized")
+	}
+	host = strings.TrimSpace(host)
+	if host == "" || port <= 0 {
+		return false, errors.New("host/port invalid")
+	}
+
+	var isDamaged int64
+	err := d.sql.QueryRowContext(ctx, `
+SELECT is_damaged
+FROM nodes
+WHERE host = ? AND port = ?
+`, host, port).Scan(&isDamaged)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, fmt.Errorf("query is_damaged: %w", err)
+	}
+	return isDamaged != 0, nil
+}
+
 type rowScanner interface {
 	Scan(dest ...any) error
 }
@@ -350,22 +484,73 @@ func NameFromURI(raw string) string {
 	return u.Fragment
 }
 
+type vmessJSONHostPort struct {
+	Add  string      `json:"add"`
+	Port interface{} `json:"port"`
+}
+
+func (v vmessJSONHostPort) portInt() int {
+	switch p := v.Port.(type) {
+	case float64:
+		return int(p)
+	case int:
+		return p
+	case int64:
+		return int(p)
+	case string:
+		n, _ := net.LookupPort("tcp", strings.TrimSpace(p))
+		return n
+	default:
+		return 0
+	}
+}
+
 // HostPortFromURI extracts the host/port used as dedup primary key.
 //
 // Rules:
 // - Prefer URL host:port (u.Hostname/u.Port).
-// - Default port when missing: 443 for most TLS-like schemes; 80 for http; 0 when unknown.
-// - For ss://... formats, url.Parse still provides Host/Port in most cases.
-// - For vmess base64-json format, we do not decode here (will be treated as damaged upstream).
+// - Default port when missing: 443 for most TLS-like schemes; 80 for http.
+// - For vmess:// base64-json format, decode and extract (add, port) so it can participate in DB dedup/damaged/health.
 func HostPortFromURI(raw string) (host string, port int, protocol string, err error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return "", 0, "", errors.New("uri empty")
 	}
+
+	// Special-case: vmess base64-json (vmess://<base64(json)>)
+	// builder already supports this; DB must be able to extract host:port for dedup/tracking.
+	if strings.HasPrefix(strings.ToLower(raw), "vmess://") {
+		encoded := strings.TrimSpace(strings.TrimPrefix(raw, "vmess://"))
+		if encoded != "" && !strings.Contains(encoded, "@") {
+			var decoded []byte
+			if b, decErr := base64.StdEncoding.DecodeString(encoded); decErr == nil {
+				decoded = b
+			} else if b, decErr := base64.RawStdEncoding.DecodeString(encoded); decErr == nil {
+				decoded = b
+			} else if b, decErr := base64.RawURLEncoding.DecodeString(encoded); decErr == nil {
+				decoded = b
+			} else if b, decErr := base64.URLEncoding.DecodeString(encoded); decErr == nil {
+				decoded = b
+			}
+
+			if len(decoded) > 0 {
+				var v vmessJSONHostPort
+				if jErr := json.Unmarshal(decoded, &v); jErr == nil {
+					h := strings.TrimSpace(v.Add)
+					p := v.portInt()
+					if h != "" && p > 0 && p <= 65535 {
+						return h, p, "vmess", nil
+					}
+				}
+			}
+		}
+	}
+
 	u, parseErr := url.Parse(raw)
 	if parseErr != nil {
 		return "", 0, "", fmt.Errorf("parse uri: %w", parseErr)
 	}
+
 	protocol = strings.ToLower(u.Scheme)
 	host = strings.TrimSpace(u.Hostname())
 	portStr := strings.TrimSpace(u.Port())
@@ -386,10 +571,6 @@ func HostPortFromURI(raw string) (host string, port int, protocol string, err er
 
 	p, convErr := net.LookupPort("tcp", portStr)
 	if convErr != nil {
-		// net.LookupPort expects service names too; try atoi via SplitHostPort as fallback.
-		if _, p2, splitErr := net.SplitHostPort(host + ":" + portStr); splitErr == nil {
-			_ = p2
-		}
 		return "", 0, protocol, fmt.Errorf("invalid port %q: %w", portStr, convErr)
 	}
 	return host, p, protocol, nil

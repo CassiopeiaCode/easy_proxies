@@ -1,6 +1,7 @@
 package builder
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -10,8 +11,10 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"easy_proxies/internal/config"
+	"easy_proxies/internal/database"
 	poolout "easy_proxies/internal/outbound/pool"
 
 	C "github.com/sagernet/sing-box/constant"
@@ -28,6 +31,24 @@ func Build(cfg *config.Config) (option.Options, error) {
 	var failedNodes []string
 	usedTags := make(map[string]int) // Track tag usage for uniqueness
 
+	// Best-effort: when database is enabled:
+	// - skip nodes already marked as damaged (so they will not be built into sing-box)
+	// - mark "build-time" invalid nodes as damaged
+	var db *database.DB
+	if cfg != nil && cfg.Database.Enabled && strings.TrimSpace(cfg.Database.Path) != "" {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		var err error
+		db, err = database.Open(ctx, cfg.Database.Path)
+		cancel()
+		if err != nil {
+			log.Printf("⚠️  database open failed, damaged tracking disabled: %v", err)
+			db = nil
+		}
+	}
+	if db != nil {
+		defer db.Close()
+	}
+
 	for _, node := range cfg.Nodes {
 		baseTag := sanitizeTag(node.Name)
 		if baseTag == "" {
@@ -43,12 +64,41 @@ func Build(cfg *config.Config) (option.Options, error) {
 			usedTags[baseTag] = 1
 		}
 
+		// If already damaged, do not build into sing-box (damaged changes should accompany reload/import flows).
+		if db != nil {
+			if host, port, _, hpErr := database.HostPortFromURI(node.URI); hpErr == nil && host != "" && port > 0 {
+				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+				damaged, dErr := db.IsNodeDamaged(ctx, host, port)
+				cancel()
+				if dErr != nil {
+					log.Printf("⚠️  query damaged failed for %s:%d: %v (continue building)", host, port, dErr)
+				} else if damaged {
+					log.Printf("⚠️  node '%s' is marked damaged in DB, skipping build", node.Name)
+					failedNodes = append(failedNodes, node.Name)
+					continue
+				}
+			}
+		}
+
 		outbound, err := buildNodeOutbound(tag, node.URI, cfg.SkipCertVerify)
 		if err != nil {
 			log.Printf("❌ Failed to build node '%s': %v (skipping)", node.Name, err)
 			failedNodes = append(failedNodes, node.Name)
+
+			// Build-time invalid: mark damaged (only when we can extract host:port).
+			if db != nil {
+				if host, port, _, hpErr := database.HostPortFromURI(node.URI); hpErr == nil && host != "" && port > 0 {
+					ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+					if markErr := db.MarkNodeDamaged(ctx, host, port, err.Error()); markErr != nil {
+						log.Printf("⚠️  mark damaged failed for %s:%d: %v", host, port, markErr)
+					}
+					cancel()
+				}
+			}
+
 			continue
 		}
+
 		memberTags = append(memberTags, tag)
 		baseOutbounds = append(baseOutbounds, outbound)
 		meta := poolout.MemberMeta{
@@ -258,6 +308,17 @@ func buildNodeOutbound(tag, rawURI string, skipCertVerify bool) (option.Outbound
 	default:
 		return option.Outbound{}, fmt.Errorf("unsupported scheme %q", parsed.Scheme)
 	}
+}
+
+// ValidateNodeURI checks whether a node URI can be converted into sing-box outbound options.
+// It is intended for "build-time" validation before triggering a reload.
+func ValidateNodeURI(rawURI string, skipCertVerify bool) error {
+	rawURI = strings.TrimSpace(rawURI)
+	if rawURI == "" {
+		return errors.New("empty uri")
+	}
+	_, err := buildNodeOutbound("validate", rawURI, skipCertVerify)
+	return err
 }
 
 func buildVLESSOptions(u *url.URL, skipCertVerify bool) (option.VLESSOutboundOptions, error) {

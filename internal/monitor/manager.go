@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"runtime"
 	"sort"
@@ -12,6 +13,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"easy_proxies/internal/database"
 
 	M "github.com/sagernet/sing/common/metadata"
 )
@@ -26,6 +29,10 @@ type Config struct {
 	ProxyPassword  string // 代理池的密码（用于导出）
 	ExternalIP     string // 外部 IP 地址，用于导出时替换 0.0.0.0
 	SkipCertVerify bool   // 全局跳过 SSL 证书验证
+	Database       struct {
+		Enabled bool
+		Path    string
+	}
 }
 
 // NodeInfo is static metadata about a proxy entry.
@@ -102,6 +109,9 @@ type Manager struct {
 	ctx        context.Context
 	cancel     context.CancelFunc
 	logger     Logger
+
+	db   *database.DB
+	dbMu sync.Mutex
 }
 
 // Logger interface for logging
@@ -145,6 +155,19 @@ func NewManager(cfg Config) (*Manager, error) {
 		parsed := M.ParseSocksaddrHostPort(host, parsePort(port))
 		m.probeDst = parsed
 		m.probeReady = true
+	}
+	if cfg.Database.Enabled && strings.TrimSpace(cfg.Database.Path) != "" {
+		openCtx, cancelOpen := context.WithTimeout(ctx, 5*time.Second)
+		db, err := database.Open(openCtx, cfg.Database.Path)
+		cancelOpen()
+		if err != nil {
+			// Best-effort: monitoring can still work without DB.
+			if m.logger != nil {
+				m.logger.Warn("open database failed, health persistence disabled: ", err)
+			}
+		} else {
+			m.db = db
+		}
 	}
 	return m, nil
 }
@@ -217,6 +240,7 @@ func (m *Manager) probeAllNodes(timeout time.Duration) {
 		e.mu.RLock()
 		probeFn := e.probe
 		tag := e.info.Tag
+		info := e.info
 		e.mu.RUnlock()
 
 		if probeFn == nil {
@@ -225,13 +249,37 @@ func (m *Manager) probeAllNodes(timeout time.Duration) {
 
 		sem <- struct{}{}
 		wg.Add(1)
-		go func(entry *entry, probe probeFunc, tag string) {
+		go func(entry *entry, probe probeFunc, tag string, info NodeInfo) {
 			defer wg.Done()
 			defer func() { <-sem }()
 
 			ctx, cancel := context.WithTimeout(m.ctx, timeout)
 			latency, err := probe(ctx)
 			cancel()
+
+			// Persist health check into DB (hourly aggregation) if enabled.
+			if m.shouldPersistHealth() {
+				host, port, _, hpErr := database.HostPortFromURI(info.URI)
+				if hpErr == nil && host != "" && port > 0 {
+					var latencyMs *int64
+					if err == nil {
+						ms := latency.Milliseconds()
+						if ms == 0 && latency > 0 {
+							ms = 1
+						}
+						latencyMs = &ms
+					}
+					u := database.HealthCheckUpdate{
+						Host:      host,
+						Port:      port,
+						Success:   err == nil,
+						LatencyMs: latencyMs,
+					}
+					saveCtx, cancelSave := context.WithTimeout(m.ctx, 3*time.Second)
+					_ = m.recordHealthCheck(saveCtx, u)
+					cancelSave()
+				}
+			}
 
 			entry.mu.Lock()
 			if err != nil {
@@ -252,20 +300,35 @@ func (m *Manager) probeAllNodes(timeout time.Duration) {
 			if err != nil && m.logger != nil {
 				m.logger.Warn("probe failed for ", tag, ": ", err)
 			}
-		}(e, probeFn, tag)
+		}(e, probeFn, tag, info)
 	}
 	wg.Wait()
+
+	// After recording all probes, recompute the 24h success-rate threshold (p95 - 5%)
+	// and mark nodes as schedulable based on hourly stats. If DB isn't enabled, keep
+	// existing "available" semantics.
+	if m.shouldPersistHealth() {
+		if err := m.applyHealthThresholdFromDB(); err != nil && m.logger != nil {
+			m.logger.Warn("apply health threshold failed: ", err)
+		}
+	}
 
 	if m.logger != nil {
 		m.logger.Info("health check completed: ", availableCount.Load(), " available, ", failedCount.Load(), " failed")
 	}
 }
 
-// Stop stops the periodic health check.
+	// Stop stops the periodic health check.
 func (m *Manager) Stop() {
 	if m.cancel != nil {
 		m.cancel()
 	}
+	m.dbMu.Lock()
+	if m.db != nil {
+		_ = m.db.Close()
+		m.db = nil
+	}
+	m.dbMu.Unlock()
 }
 
 func parsePort(value string) uint16 {
@@ -603,4 +666,168 @@ func (h *EntryHandle) MarkAvailable(available bool) {
 	h.ref.mu.Lock()
 	h.ref.available = available
 	h.ref.mu.Unlock()
+}
+
+func (h *EntryHandle) Snapshot() Snapshot {
+	if h == nil || h.ref == nil {
+		return Snapshot{}
+	}
+	return h.ref.snapshot()
+}
+
+func (m *Manager) shouldPersistHealth() bool {
+	m.dbMu.Lock()
+	defer m.dbMu.Unlock()
+	return m.db != nil
+}
+
+func (m *Manager) recordHealthCheck(ctx context.Context, u database.HealthCheckUpdate) error {
+	m.dbMu.Lock()
+	db := m.db
+	m.dbMu.Unlock()
+	if db == nil {
+		return nil
+	}
+	return db.RecordHealthCheck(ctx, u)
+}
+
+type nodeRate struct {
+	host string
+	port int
+	rate float64
+}
+
+func (m *Manager) applyHealthThresholdFromDB() error {
+	m.dbMu.Lock()
+	db := m.db
+	m.dbMu.Unlock()
+	if db == nil {
+		return nil
+	}
+
+	// Build rates map from node_health_hourly in last 24h.
+	cutoff := time.Now().UTC().Add(-24 * time.Hour)
+	rows, err := dbInternalQueryRates(m.ctx, db, cutoff)
+	if err != nil {
+		return err
+	}
+	if len(rows) == 0 {
+		return nil
+	}
+
+	// Compute p95 of rates (0..1).
+	rates := make([]float64, 0, len(rows))
+	for _, r := range rows {
+		rates = append(rates, r.rate)
+	}
+	p95 := percentile(rates, 0.95)
+	threshold := p95 - 0.05
+	if threshold < 0 {
+		threshold = 0
+	}
+	if threshold > 1 {
+		threshold = 1
+	}
+
+	// Apply availability based on threshold:
+	// - Must have 24h stats to be schedulable
+	// - rate >= threshold means healthy schedulable
+	m.mu.RLock()
+	entries := make([]*entry, 0, len(m.nodes))
+	for _, e := range m.nodes {
+		entries = append(entries, e)
+	}
+	m.mu.RUnlock()
+
+	for _, e := range entries {
+		e.mu.Lock()
+		host, port, _, hpErr := database.HostPortFromURI(e.info.URI)
+		if hpErr != nil || host == "" || port <= 0 {
+			// No host:port mapping => cannot join 24h stats => not schedulable.
+			e.available = false
+			e.initialCheckDone = true
+			e.mu.Unlock()
+			continue
+		}
+
+		rate := lookupRate(rows, host, port)
+		if rate < 0 {
+			// No 24h stats => not schedulable.
+			e.available = false
+			e.initialCheckDone = true
+			e.mu.Unlock()
+			continue
+		}
+
+		e.available = rate >= threshold
+		e.initialCheckDone = true
+		e.mu.Unlock()
+	}
+	return nil
+}
+
+func lookupRate(rows []nodeRate, host string, port int) float64 {
+	for _, r := range rows {
+		if r.host == host && r.port == port {
+			return r.rate
+		}
+	}
+	return -1
+}
+
+func dbInternalQueryRates(ctx context.Context, db *database.DB, cutoff time.Time) ([]nodeRate, error) {
+	rates, err := db.QueryNodeRatesSince(ctx, cutoff)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]nodeRate, 0, len(rates))
+	for _, r := range rates {
+		out = append(out, nodeRate{
+			host: r.Host,
+			port: r.Port,
+			rate: r.Rate,
+		})
+	}
+	return out, nil
+}
+
+func percentile(values []float64, q float64) float64 {
+	if len(values) == 0 {
+		return 0
+	}
+	if q <= 0 {
+		return minFloat(values)
+	}
+	if q >= 1 {
+		return maxFloat(values)
+	}
+	sort.Float64s(values)
+	pos := q * float64(len(values)-1)
+	lower := int(math.Floor(pos))
+	upper := int(math.Ceil(pos))
+	if lower == upper {
+		return values[lower]
+	}
+	weight := pos - float64(lower)
+	return values[lower]*(1-weight) + values[upper]*weight
+}
+
+func minFloat(values []float64) float64 {
+	min := values[0]
+	for _, v := range values[1:] {
+		if v < min {
+			min = v
+		}
+	}
+	return min
+}
+
+func maxFloat(values []float64) float64 {
+	max := values[0]
+	for _, v := range values[1:] {
+		if v > max {
+			max = v
+		}
+	}
+	return max
 }

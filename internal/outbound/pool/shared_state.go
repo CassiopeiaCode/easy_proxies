@@ -11,12 +11,10 @@ import (
 // sharedMemberState holds failure/blacklist state shared across all pool instances.
 // This enables hybrid mode where pool and multi-port modes share the same node state.
 type sharedMemberState struct {
-	mu               sync.Mutex
-	failures         int
-	blacklisted      bool
-	blacklistedUntil time.Time
-	entry            atomic.Pointer[monitor.EntryHandle]
-	active           atomic.Int32
+	mu       sync.Mutex
+	failures int
+	entry    atomic.Pointer[monitor.EntryHandle]
+	active   atomic.Int32
 }
 
 var sharedStateStore sync.Map // map[tag]*sharedMemberState
@@ -61,28 +59,17 @@ func (s *sharedMemberState) entryHandle() *monitor.EntryHandle {
 
 // recordFailure increments failure count and triggers blacklist if threshold reached.
 // Returns: (current failures, blacklisted, blacklist until time)
-func (s *sharedMemberState) recordFailure(cause error, threshold int, duration time.Duration) (int, bool, time.Time) {
+func (s *sharedMemberState) recordFailure(cause error, _ int, _ time.Duration) (int, bool, time.Time) {
+	// Blacklist is disabled; health gating is handled by monitor's 24h success-rate threshold.
 	s.mu.Lock()
 	s.failures++
 	count := s.failures
-	triggered := false
-	var until time.Time
-	if s.failures >= threshold {
-		triggered = true
-		until = time.Now().Add(duration)
-		s.failures = 0
-		s.blacklisted = true
-		s.blacklistedUntil = until
-	}
 	s.mu.Unlock()
 
 	if entry := s.entry.Load(); entry != nil {
 		entry.RecordFailure(cause)
-		if triggered {
-			entry.Blacklist(until)
-		}
 	}
-	return count, triggered, until
+	return count, false, time.Time{}
 }
 
 func (s *sharedMemberState) recordSuccess() {
@@ -96,34 +83,16 @@ func (s *sharedMemberState) recordSuccess() {
 }
 
 // isBlacklisted checks if the node is currently blacklisted, auto-clearing if expired.
-func (s *sharedMemberState) isBlacklisted(now time.Time) bool {
-	s.mu.Lock()
-	expired := s.blacklisted && now.After(s.blacklistedUntil)
-	if expired {
-		s.blacklisted = false
-		s.blacklistedUntil = time.Time{}
-	}
-	blacklisted := s.blacklisted
-	s.mu.Unlock()
-
-	if expired {
-		if entry := s.entry.Load(); entry != nil {
-			entry.ClearBlacklist()
-		}
-	}
-	return blacklisted
+func (s *sharedMemberState) isBlacklisted(_ time.Time) bool {
+	// Blacklist is disabled.
+	return false
 }
 
 func (s *sharedMemberState) forceRelease() {
+	// Blacklist is disabled; keep as a no-op for API compatibility.
 	s.mu.Lock()
 	s.failures = 0
-	s.blacklisted = false
-	s.blacklistedUntil = time.Time{}
 	s.mu.Unlock()
-
-	if entry := s.entry.Load(); entry != nil {
-		entry.ClearBlacklist()
-	}
 }
 
 func (s *sharedMemberState) incActive() {

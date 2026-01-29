@@ -383,6 +383,15 @@ func (p *poolOutbound) availableMembersLocked(now time.Time, network string, buf
 		if member.shared != nil && member.shared.isBlacklisted(now) {
 			continue
 		}
+		// Health gating: if monitor has completed checks and marked node unavailable, do not schedule it.
+		// This is where the ">= p95-5% success rate in last 24h" policy takes effect, because monitor
+		// updates EntryHandle.Available based on DB-derived threshold.
+		if member.entry != nil {
+			snap := member.entry.Snapshot()
+			if snap.InitialCheckDone && !snap.Available {
+				continue
+			}
+		}
 		if network != "" && !common.Contains(member.outbound.Network(), network) {
 			continue
 		}

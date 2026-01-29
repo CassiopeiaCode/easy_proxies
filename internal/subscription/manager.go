@@ -18,6 +18,7 @@ import (
 
 	"easy_proxies/internal/boxmgr"
 	"easy_proxies/internal/config"
+	"easy_proxies/internal/database"
 	"easy_proxies/internal/monitor"
 )
 
@@ -221,9 +222,58 @@ func (m *Manager) doRefresh() {
 
 	m.logger.Infof("fetched %d nodes from subscriptions", len(nodes))
 
-	// Write subscription nodes to nodes.txt
+	// If DB is enabled, treat DB as the primary node store:
+	// - upsert nodes by host:port (dedup)
+	// - reload from DB active nodes
+	// nodes.txt is still written as a cache/data source.
+	var merged []config.NodeConfig
+
+	if m.baseCfg != nil && m.baseCfg.Database.Enabled && strings.TrimSpace(m.baseCfg.Database.Path) != "" {
+		openCtx, cancelOpen := context.WithTimeout(m.ctx, 5*time.Second)
+		db, dbErr := database.Open(openCtx, m.baseCfg.Database.Path)
+		cancelOpen()
+		if dbErr != nil {
+			m.logger.Warnf("open database failed, fallback to nodes.txt only: %v", dbErr)
+		} else {
+			upCtx, cancelUp := context.WithTimeout(m.ctx, 15*time.Second)
+			for _, n := range nodes {
+				if _, upErr := db.UpsertNodeByHostPort(upCtx, database.UpsertNodeInput{
+					URI:  n.URI,
+					Name: n.Name,
+				}); upErr != nil {
+					// Cannot extract host:port => drop.
+					m.logger.Warnf("drop node (cannot extract host:port): %s (%v)", n.Name, upErr)
+				}
+			}
+			cancelUp()
+
+			loadCtx, cancelLoad := context.WithTimeout(m.ctx, 5*time.Second)
+			active, listErr := db.ListActiveNodes(loadCtx)
+			cancelLoad()
+			_ = db.Close()
+
+			if listErr != nil {
+				m.logger.Warnf("list active nodes from database failed, fallback to nodes.txt only: %v", listErr)
+			} else if len(active) > 0 {
+				merged = make([]config.NodeConfig, 0, len(active))
+				for _, n := range active {
+					merged = append(merged, config.NodeConfig{
+						Name: n.Name,
+						URI:  n.URI,
+					})
+				}
+			}
+		}
+	}
+
+	// Fallback: no DB or DB result empty => use fetched nodes.
+	if len(merged) == 0 {
+		merged = nodes
+	}
+
+	// Write merged nodes to nodes.txt (cache + also acts as a data source on next startup)
 	nodesFilePath := m.getNodesFilePath()
-	if err := m.writeNodesToFile(nodesFilePath, nodes); err != nil {
+	if err := m.writeNodesToFile(nodesFilePath, merged); err != nil {
 		m.logger.Errorf("failed to write nodes.txt: %v", err)
 		m.mu.Lock()
 		m.status.LastError = fmt.Sprintf("write nodes.txt: %v", err)
@@ -231,10 +281,10 @@ func (m *Manager) doRefresh() {
 		m.mu.Unlock()
 		return
 	}
-	m.logger.Infof("written %d nodes to %s", len(nodes), nodesFilePath)
+	m.logger.Infof("written %d nodes to %s", len(merged), nodesFilePath)
 
 	// Update hash and mod time after writing
-	newHash := m.computeNodesHash(nodes)
+	newHash := m.computeNodesHash(merged)
 	m.mu.Lock()
 	m.lastSubHash = newHash
 	if info, err := os.Stat(nodesFilePath); err == nil {
@@ -249,7 +299,7 @@ func (m *Manager) doRefresh() {
 	portMap := m.boxMgr.CurrentPortMap()
 
 	// Create new config with updated nodes
-	newCfg := m.createNewConfig(nodes)
+	newCfg := m.createNewConfig(merged)
 
 	// Trigger BoxManager reload with port preservation
 	if err := m.boxMgr.ReloadWithPortMap(newCfg, portMap); err != nil {
@@ -263,11 +313,11 @@ func (m *Manager) doRefresh() {
 
 	m.mu.Lock()
 	m.status.LastRefresh = time.Now()
-	m.status.NodeCount = len(nodes)
+	m.status.NodeCount = len(merged)
 	m.status.LastError = ""
 	m.mu.Unlock()
 
-	m.logger.Infof("subscription refresh completed, %d nodes active", len(nodes))
+	m.logger.Infof("subscription refresh completed, %d nodes active", len(merged))
 }
 
 // getNodesFilePath returns the path to nodes.txt.
