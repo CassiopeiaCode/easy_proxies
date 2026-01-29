@@ -321,7 +321,7 @@ func (p *poolOutbound) probeAllMembersOnStartup() {
 		}
 
 		// Perform HTTP(S) probe to measure actual latency (TTFB)
-		_, err = httpProbe(conn, useTLS, hostHeader, path, serverName, insecure, p.options.ExpectedStatuses)
+		_, err = httpProbe(ctx, conn, useTLS, hostHeader, path, serverName, insecure, p.options.ExpectedStatuses)
 		conn.Close()
 
 		if err != nil {
@@ -527,7 +527,7 @@ func (p *poolOutbound) makeReleaseFunc(member *memberState) func() {
 
 // httpProbe performs an HTTP probe through the connection and measures TTFB.
 // It sends a minimal HTTP request and validates the HTTP status code if expectedStatuses is non-empty.
-func httpProbe(conn net.Conn, useTLS bool, hostHeader, path, serverName string, insecure bool, expectedStatuses []int) (time.Duration, error) {
+func httpProbe(ctx context.Context, conn net.Conn, useTLS bool, hostHeader, path, serverName string, insecure bool, expectedStatuses []int) (time.Duration, error) {
 	if strings.TrimSpace(path) == "" {
 		path = "/"
 	}
@@ -538,6 +538,17 @@ func httpProbe(conn net.Conn, useTLS bool, hostHeader, path, serverName string, 
 		hostHeader = serverName
 	}
 
+	// Ensure the probe is bounded by ctx if provided.
+	var hasDeadline bool
+	var deadline time.Time
+	if ctx != nil {
+		if d, ok := ctx.Deadline(); ok {
+			hasDeadline = true
+			deadline = d
+			_ = conn.SetDeadline(deadline)
+		}
+	}
+
 	// If https, wrap the connection with TLS and handshake first.
 	if useTLS {
 		cfg := &tls.Config{
@@ -546,13 +557,21 @@ func httpProbe(conn net.Conn, useTLS bool, hostHeader, path, serverName string, 
 		}
 		tlsConn := tls.Client(conn, cfg)
 
-		_ = tlsConn.SetDeadline(time.Now().Add(10 * time.Second))
+		if hasDeadline {
+			_ = tlsConn.SetDeadline(deadline)
+		} else {
+			_ = tlsConn.SetDeadline(time.Now().Add(10 * time.Second))
+		}
 		if err := tlsConn.Handshake(); err != nil {
 			return 0, fmt.Errorf("tls handshake: %w", err)
 		}
 
-		// Clear deadline; we'll set per-operation deadlines below.
-		_ = tlsConn.SetDeadline(time.Time{})
+		// Keep ctx-bound deadline (or clear if none).
+		if hasDeadline {
+			_ = tlsConn.SetDeadline(deadline)
+		} else {
+			_ = tlsConn.SetDeadline(time.Time{})
+		}
 		conn = tlsConn
 	}
 
@@ -565,7 +584,11 @@ func httpProbe(conn net.Conn, useTLS bool, hostHeader, path, serverName string, 
 	)
 
 	// Try to set write deadline (ignore errors for connections that don't support it)
-	_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	if hasDeadline {
+		_ = conn.SetWriteDeadline(deadline)
+	} else {
+		_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	}
 
 	// Record time just before sending request
 	start := time.Now()
@@ -576,7 +599,11 @@ func httpProbe(conn net.Conn, useTLS bool, hostHeader, path, serverName string, 
 	}
 
 	// Try to set read deadline (ignore errors for connections that don't support it)
-	_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	if hasDeadline {
+		_ = conn.SetReadDeadline(deadline)
+	} else {
+		_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	}
 
 	reader := bufio.NewReader(conn)
 
@@ -646,7 +673,7 @@ func (p *poolOutbound) makeProbeFunc(member *memberState) func(ctx context.Conte
 		defer conn.Close()
 
 		// Perform HTTP(S) probe to measure actual latency (TTFB)
-		_, err = httpProbe(conn, useTLS, hostHeader, path, serverName, insecure, p.options.ExpectedStatuses)
+		_, err = httpProbe(ctx, conn, useTLS, hostHeader, path, serverName, insecure, p.options.ExpectedStatuses)
 		if err != nil {
 			if member.entry != nil {
 				member.entry.RecordFailure(err)
@@ -711,7 +738,7 @@ func (p *poolOutbound) makeProbeByTagFunc(tag string) func(ctx context.Context) 
 		defer conn.Close()
 
 		// Perform HTTP(S) probe to measure actual latency (TTFB)
-		_, err = httpProbe(conn, useTLS, hostHeader, path, serverName, insecure, p.options.ExpectedStatuses)
+		_, err = httpProbe(ctx, conn, useTLS, hostHeader, path, serverName, insecure, p.options.ExpectedStatuses)
 		if err != nil {
 			if member.entry != nil {
 				member.entry.RecordFailure(err)
