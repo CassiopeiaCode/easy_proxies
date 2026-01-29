@@ -67,9 +67,11 @@
 
 在配置文件 management 部分新增 probe_expected_status / probe_expected_statuses，用于 HTTP probe 期望状态码校验；仅当状态码匹配才算成功；未配置时保持兼容（任何成功读到响应行都算成功）。受影响模块包括 internal/config/config.go、internal/outbound/pool/pool.go、internal/builder/builder.go。
 
-### 6. 日志节流（规划中/未完全落地）
+### 6. 日志节流（已实现）
 
 目标：按“调用点（go 文件 + 行号）”进行节流，同一个日志调用点每秒最多输出 10 条，避免错误风暴刷屏并影响性能。
+
+已实现
 
 ## 关键语义：damaged vs health
 

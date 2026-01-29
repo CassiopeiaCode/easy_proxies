@@ -655,6 +655,8 @@ func buildVMessOptions(rawURI string, skipCertVerify bool) (option.VMessOutbound
 	}
 
 	// Build transport options
+	// VMess JSON "net" must be a valid sing-box v2ray transport.
+	// Unknown values (e.g. "none") should fail fast so the node can be marked damaged and skipped.
 	if vmess.Net != "" && vmess.Net != "tcp" {
 		transport := &option.V2RayTransportOptions{}
 		switch vmess.Net {
@@ -688,7 +690,7 @@ func buildVMessOptions(rawURI string, skipCertVerify bool) (option.VMessOutbound
 			transport.Type = C.V2RayTransportTypeGRPC
 			transport.GRPCOptions.ServiceName = vmess.Path
 		default:
-			transport.Type = vmess.Net
+			return option.VMessOutboundOptions{}, fmt.Errorf("unsupported transport type %q", vmess.Net)
 		}
 		opts.Transport = transport
 	}
