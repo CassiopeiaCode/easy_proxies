@@ -325,6 +325,7 @@ func (m *Manager) Close() error {
 		m.monitorMgr = nil
 		m.healthCheckStarted = false
 	}
+	pool.SetDefaultMonitorManager(nil)
 	m.baseCtx = nil
 	return err
 }
@@ -499,6 +500,7 @@ func (m *Manager) ensureMonitor(ctx context.Context) error {
 	}
 	monitorMgr.SetLogger(monitorLoggerAdapter{logger: m.logger})
 	m.monitorMgr = monitorMgr
+	pool.SetDefaultMonitorManager(monitorMgr)
 
 	var serverToStart *monitor.Server
 	if m.monitorCfg.Enabled {

@@ -60,6 +60,18 @@ func Register(registry *outbound.Registry) {
 	outbound.Register[Options](registry, Type, newPool)
 }
 
+var defaultMonitor atomic.Pointer[monitor.Manager]
+
+// SetDefaultMonitorManager provides a fallback monitor manager when the sing-box context does not
+// preserve context.Value entries.
+func SetDefaultMonitorManager(m *monitor.Manager) {
+	defaultMonitor.Store(m)
+}
+
+func getDefaultMonitorManager() *monitor.Manager {
+	return defaultMonitor.Load()
+}
+
 type memberState struct {
 	outbound adapter.Outbound
 	tag      string
@@ -92,6 +104,9 @@ func newPool(ctx context.Context, _ adapter.Router, logger log.ContextLogger, ta
 		return nil, E.New("missing outbound manager in context")
 	}
 	monitorMgr := monitor.FromContext(ctx)
+	if monitorMgr == nil {
+		monitorMgr = getDefaultMonitorManager()
+	}
 	normalized := normalizeOptions(options)
 	memberCount := len(normalized.Members)
 	p := &poolOutbound{
