@@ -66,9 +66,28 @@
 注意：
 - 成功率统计与阈值过滤依赖从 URI 提取 host:port；若某类 URI 无法提取 host:port，则不会参与 hourly 统计与阈值过滤（保持原先可用性语义）。
 
-### 5. 自定义状态码验证（已实现）
+### 5. 探测目标 URL/HTTPS + 自定义状态码验证（已实现）
 
-在配置文件 management 部分新增 probe_expected_status / probe_expected_statuses，用于 HTTP probe 期望状态码校验；仅当状态码匹配才算成功；未配置时保持兼容（任何成功读到响应行都算成功）。受影响模块包括 internal/config/config.go、internal/outbound/pool/pool.go、internal/builder/builder.go。
+目标：`management.probe_target` 支持直接填 URL（含 https），并且可通过 `probe_expected_status` / `probe_expected_statuses` 对返回 HTTP 状态码做校验；只有状态码匹配才算探测成功。
+
+当前实现行为：
+- `management.probe_target` 支持两类写法：
+  - `host:port`：按 HTTP 探测，默认 path 为 `/generate_204`。
+  - `http(s)://host[:port]/path[?query]`：按 URL 解析；`https://` 会启用 TLS；未显式写端口时 http 默认 80、https 默认 443；path 为空或 `/` 时回退到 `/generate_204`。
+- 探测逻辑支持 HTTP + HTTPS：
+  - 当 `probe_target` 为 https 时，会先进行 TLS 握手（SNI=hostname）；证书校验遵循全局 `skip_cert_verify`（跳过校验时会启用 `InsecureSkipVerify`）。
+  - 发送 `GET <path> HTTP/1.1` 并读取 status line，用于计算 TTFB（探测耗时 = dial + probe）。
+- 状态码校验：
+  - `probe_expected_statuses` 优先；否则使用单值 `probe_expected_status`。
+  - 若未配置期望状态码，则保持兼容：只要能成功读到响应 status line 即视为成功（不强制校验 code）。
+- 超时：
+  - TLS 握手/写入/读取均设置了 deadline，避免探测卡死。
+
+涉及模块：
+- internal/monitor/manager.go：probe_target URL 解析与 https 探测参数下发。
+- internal/outbound/pool/pool.go：HTTP/HTTPS 探测实现（含状态码校验与 TLS 握手）。
+- internal/builder/builder.go：把期望状态码配置下发到 pool outbound。
+- internal/monitor/manager_test.go：probe_target 解析行为单测覆盖（https/http/host:port 等）。
 
 ### 6. 日志节流（已实现）
 
