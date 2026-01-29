@@ -211,11 +211,22 @@ func (c *Config) normalize() error {
 		c.Nodes[idx].Source = NodeSourceInline
 	}
 
-	// Load nodes from file if specified (nodes.txt is always a data source, even when subscriptions exist).
+	// If subscriptions are configured, ensure nodes_file has a default path (nodes.txt).
+	// nodes.txt acts as a cache/data source for next startup and for WebUI edits.
+	if len(c.Subscriptions) > 0 && c.NodesFile == "" {
+		c.NodesFile = filepath.Join(filepath.Dir(c.filePath), "nodes.txt")
+	}
+
+	// Load nodes from file if specified.
+	// If subscriptions are configured and nodes_file doesn't exist yet, treat it as empty (it can be populated later).
 	if c.NodesFile != "" {
 		fileNodes, err := loadNodesFromFile(c.NodesFile)
 		if err != nil {
-			return fmt.Errorf("load nodes from file %q: %w", c.NodesFile, err)
+			if errors.Is(err, os.ErrNotExist) && len(c.Subscriptions) > 0 {
+				fileNodes = nil
+			} else {
+				return fmt.Errorf("load nodes from file %q: %w", c.NodesFile, err)
+			}
 		}
 		for idx := range fileNodes {
 			fileNodes[idx].Source = NodeSourceFile
@@ -223,14 +234,35 @@ func (c *Config) normalize() error {
 		c.Nodes = append(c.Nodes, fileNodes...)
 	}
 
-	// If subscriptions are configured, ensure nodes_file has a default path (nodes.txt).
-	// Subscription fetching is handled asynchronously by subscription manager at runtime, not during config load.
-	if len(c.Subscriptions) > 0 && c.NodesFile == "" {
-		c.NodesFile = filepath.Join(filepath.Dir(c.filePath), "nodes.txt")
+	// Subscription-only bootstrap:
+	// If there are no nodes yet but subscriptions are configured, fetch once during startup so sing-box can start.
+	if len(c.Nodes) == 0 && len(c.Subscriptions) > 0 {
+		var subNodes []NodeConfig
+		var lastErr error
+		timeout := c.SubscriptionRefresh.Timeout
+		if timeout <= 0 {
+			timeout = 30 * time.Second
+		}
+		for _, subURL := range c.Subscriptions {
+			nodes, err := loadNodesFromSubscription(subURL, timeout)
+			if err != nil {
+				lastErr = err
+				continue
+			}
+			for i := range nodes {
+				nodes[i].Source = NodeSourceSubscription
+			}
+			subNodes = append(subNodes, nodes...)
+		}
+		if len(subNodes) > 0 {
+			c.Nodes = append(c.Nodes, subNodes...)
+		} else if lastErr != nil {
+			return fmt.Errorf("no nodes loaded from subscriptions: %w", lastErr)
+		}
 	}
 
 	if len(c.Nodes) == 0 {
-		return errors.New("config.nodes cannot be empty (configure nodes in config or use nodes_file)")
+		return errors.New("config.nodes cannot be empty (configure nodes in config, use nodes_file, or configure subscriptions)")
 	}
 	portCursor := c.MultiPort.BasePort
 	for idx := range c.Nodes {
