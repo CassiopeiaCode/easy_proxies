@@ -115,7 +115,7 @@ func (m *Manager) Start(ctx context.Context) error {
 	// we will best-effort mark that node as damaged and retry quickly. After 5 attempts, we give up.
 	var instance *box.Box
 	maxRetries := 10
-	maxDamagedRetries := 5
+	maxDamagedRetries := 50
 	damagedRetries := 0
 	for retry := 0; retry < maxRetries; retry++ {
 		var err error
@@ -217,7 +217,7 @@ func (m *Manager) Reload(newCfg *config.Config) error {
 	// On outbound init failures, best-effort mark damaged and retry quickly (up to 5 times).
 	var instance *box.Box
 	maxRetries := 10
-	maxDamagedRetries := 5
+	maxDamagedRetries := 50
 	damagedRetries := 0
 	for retry := 0; retry < maxRetries; retry++ {
 		var err error
