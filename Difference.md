@@ -95,6 +95,29 @@
 
 已实现
 
+### 7. 启动/重载时的监控注册与健康检查时序修复（已实现）
+
+背景：节点管理页（配置态）能看到节点，但监控页（运行态）可能显示“暂无调试数据 / 0 个节点”，常见原因是 sing-box 启动成功后，monitor 的节点注册回调还未完成就开始统计/健康检查，导致短时间内 Snapshot 为空（0/0 假象）。
+
+当前实现行为：
+- 启动 sing-box 成功后，会等待 monitor 观察到至少 1 个节点注册（或超时告警），再启动 periodic health check 与 initial health check 等逻辑，避免 0/0 假象与空列表。
+- 等待逻辑：默认等待 30 秒（大量节点场景下更稳）。
+
+涉及模块：
+- internal/boxmgr/manager.go：waitForMonitorRegistration + 启动/重载流程里的调用。
+
+### 8. 重载时取消正在进行的健康检查，避免旧实例探测污染（已实现）
+
+背景：健康检查进行中触发重载时，旧 sing-box instance 会被关闭，但 monitor 的 probe goroutine 可能仍在跑；探测继续使用旧 outbound 的 probe 会造成大量失败、UI 抖动、DB 统计被污染。
+
+当前实现行为：
+- 重载开始时，先取消 monitor 的运行时 context（终止 in-flight probes/periodic loop），并清空运行时节点注册表（nodes map）；等待新实例启动后重新注册节点。
+- 重载成功后，同样等待 monitor 重新注册，再启动 periodic health check。
+
+涉及模块：
+- internal/monitor/manager.go：新增 ResetRuntime（保留 DB/Config，仅重置运行态）。
+- internal/boxmgr/manager.go：Reload 中调用 ResetRuntime，重载后重启 periodic health check。
+
 ## 关键语义：damaged vs health
 
 - damaged：持久化状态（DB），用于“导入/重载阶段”剔除明显错误/不应被加载的节点；damaged 的变动应伴随 sing-box 重载/构建发生。
