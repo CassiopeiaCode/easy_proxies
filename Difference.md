@@ -55,7 +55,7 @@
 - 每轮周期性健康检查（monitor 侧 probe）会写入 DB 的 hourly 统计，并同步更新 nodes 表里的累计计数与 last_* 字段（用于展示/快速查询）。
 - 统计窗口为最近 24h：从 hourly 表聚合出每个节点的成功率（success / (success+fail)）。
 - 计算 p95 成功率并下调 5% 形成阈值：threshold = p95 - 0.05。
-- pool 调度过滤：被标记为 `InitialCheckDone=true 且 Available=false` 的节点不进入候选集（即成功率低于阈值的“不健康节点”不可调度；且没有 24h 内健康检查统计的节点也不可调度）。
+- pool 调度过滤：仅允许 `InitialCheckDone=true 且 Available=true` 的节点进入候选集；`InitialCheckDone=false`（尚未完成初始检查/尚未应用 DB 阈值）也不会被调度，避免未检查节点承载真实流量。
 - 自动清理：`node_health_hourly` 表自动删除 7 天前的历史聚合数据。
 
 涉及模块：
@@ -77,11 +77,12 @@
 - 探测逻辑支持 HTTP + HTTPS：
   - 当 `probe_target` 为 https 时，会先进行 TLS 握手（SNI=hostname）；证书校验遵循全局 `skip_cert_verify`（跳过校验时会启用 `InsecureSkipVerify`）。
   - 发送 `GET <path> HTTP/1.1` 并读取 status line，用于计算 TTFB（探测耗时 = dial + probe）。
+  - HTTP 请求头至少包含 `Host`，并补齐常见头（如 `Accept`/`Accept-Encoding`）以避免部分站点拦截过于精简的探测请求。
 - 状态码校验：
   - `probe_expected_statuses` 优先；否则使用单值 `probe_expected_status`。
   - 若未配置期望状态码，则保持兼容：只要能成功读到响应 status line 即视为成功（不强制校验 code）。
 - 超时：
-  - TLS 握手/写入/读取均设置了 deadline，避免探测卡死。
+  - 探测严格受 `context` 超时控制；当上层设置了 `context.WithTimeout` 时，TLS 握手/写入/读取会绑定到同一个 deadline，避免单次健康检查卡住超过预期。
 
 涉及模块：
 - internal/monitor/manager.go：probe_target URL 解析与 https 探测参数下发。
@@ -102,6 +103,7 @@
 当前实现行为：
 - 启动 sing-box 成功后，会等待 monitor 观察到至少 1 个节点注册（或超时告警），再启动 periodic health check 与 initial health check 等逻辑，避免 0/0 假象与空列表。
 - 等待逻辑：默认等待 30 秒（大量节点场景下更稳）。
+- 在观察到节点注册后，会立即将 DB 的 24h 健康阈值应用到运行态节点（不必等待下一轮 periodic probe），用于尽快收敛 `Available/InitialCheckDone` 语义与调度/展示口径。
 
 涉及模块：
 - internal/boxmgr/manager.go：waitForMonitorRegistration + 启动/重载流程里的调用。
@@ -113,6 +115,7 @@
 当前实现行为：
 - 重载开始时，先取消 monitor 的运行时 context（终止 in-flight probes/periodic loop），并清空运行时节点注册表（nodes map）；等待新实例启动后重新注册节点。
 - 重载成功后，同样等待 monitor 重新注册，再启动 periodic health check。
+- 在观察到节点重新注册后，会立即将 DB 的 24h 健康阈值应用到运行态节点（不必等待下一轮 periodic probe），用于尽快收敛 `Available/InitialCheckDone` 语义与调度/展示口径。
 
 涉及模块：
 - internal/monitor/manager.go：新增 ResetRuntime（保留 DB/Config，仅重置运行态）。
