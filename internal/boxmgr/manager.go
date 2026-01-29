@@ -110,13 +110,26 @@ func (m *Manager) Start(ctx context.Context) error {
 	cfg := m.cfg
 	m.mu.Unlock()
 
-	// Try to start, with automatic port conflict resolution
+	// Try to start, with automatic port conflict resolution.
+	// Additionally, if sing-box fails during outbound initialization (e.g. "initialize outbound[N]: ... unknown ..."),
+	// we will best-effort mark that node as damaged and retry quickly. After 5 attempts, we give up.
 	var instance *box.Box
 	maxRetries := 10
+	maxDamagedRetries := 5
+	damagedRetries := 0
 	for retry := 0; retry < maxRetries; retry++ {
 		var err error
 		instance, err = m.createBox(ctx, cfg)
 		if err != nil {
+			// If this looks like an outbound init failure, createBox() already did best-effort damaged marking.
+			// Retry to allow builder to skip damaged nodes on the next Build().
+			if extractSingBoxInitOutboundIndex(err) >= 0 && damagedRetries < maxDamagedRetries {
+				damagedRetries++
+				m.logger.Warnf("create sing-box failed (init outbound), retrying after marking damaged (attempt %d/%d): %v", damagedRetries, maxDamagedRetries, err)
+				pool.ResetSharedStateStore()
+				time.Sleep(200 * time.Millisecond)
+				continue
+			}
 			return err
 		}
 		if err = instance.Start(); err != nil {
@@ -200,13 +213,23 @@ func (m *Manager) Reload(newCfg *config.Config) error {
 	// Reset shared state store to ensure clean state for new config
 	pool.ResetSharedStateStore()
 
-	// Create and start new box instance with automatic port conflict resolution
+	// Create and start new box instance with automatic port conflict resolution.
+	// On outbound init failures, best-effort mark damaged and retry quickly (up to 5 times).
 	var instance *box.Box
 	maxRetries := 10
+	maxDamagedRetries := 5
+	damagedRetries := 0
 	for retry := 0; retry < maxRetries; retry++ {
 		var err error
 		instance, err = m.createBox(ctx, newCfg)
 		if err != nil {
+			if extractSingBoxInitOutboundIndex(err) >= 0 && damagedRetries < maxDamagedRetries {
+				damagedRetries++
+				m.logger.Warnf("create new box failed (init outbound), retrying after marking damaged (attempt %d/%d): %v", damagedRetries, maxDamagedRetries, err)
+				pool.ResetSharedStateStore()
+				time.Sleep(200 * time.Millisecond)
+				continue
+			}
 			m.rollbackToOldConfig(ctx, oldCfg)
 			return fmt.Errorf("create new box: %w", err)
 		}
