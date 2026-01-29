@@ -154,7 +154,7 @@ func (m *Manager) Start(ctx context.Context) error {
 	// sing-box 的 outbound 初始化/Start 流程与我们这里的控制流并非严格同步：
 	// 即使 instance.Start() 返回成功，monitor 注册可能还在后续阶段发生。
 	// 如果我们过早启动健康检查或统计可用节点，会出现 0/0 的假象。
-	m.waitForMonitorRegistration(10 * time.Second)
+	m.waitForMonitorRegistration(30 * time.Second)
 
 	// Start periodic health check after nodes are registered
 	m.mu.Lock()
@@ -195,7 +195,15 @@ func (m *Manager) Reload(newCfg *config.Config) error {
 	ctx := m.baseCtx
 	oldBox := m.currentBox
 	oldCfg := m.cfg
+	monitorMgr := m.monitorMgr
 	m.currentBox = nil // Mark as reloading
+
+	// Reload 期间如果 monitor 正在健康检查，会继续用旧 probe/旧 outbound 产生大量失败与脏数据。
+	// 这里先取消正在进行的探测并清空运行时节点注册表，等待新实例重新注册。
+	if monitorMgr != nil {
+		monitorMgr.ResetRuntime()
+		m.healthCheckStarted = false
+	}
 	m.mu.Unlock()
 
 	if ctx == nil {
@@ -259,6 +267,16 @@ func (m *Manager) Reload(newCfg *config.Config) error {
 	m.mu.Lock()
 	m.currentBox = instance
 	m.cfg = newCfg
+	m.mu.Unlock()
+
+	// Reload 后同样需要等待新实例完成注册，再启动周期健康检查，避免 0/0 与空列表。
+	m.waitForMonitorRegistration(30 * time.Second)
+
+	m.mu.Lock()
+	if m.monitorMgr != nil && !m.healthCheckStarted {
+		m.monitorMgr.StartPeriodicHealthCheck(periodicHealthInterval, periodicHealthTimeout)
+		m.healthCheckStarted = true
+	}
 	m.mu.Unlock()
 
 	m.logger.Infof("reload completed successfully with %d nodes", len(newCfg.Nodes))

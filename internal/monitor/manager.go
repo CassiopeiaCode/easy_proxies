@@ -351,7 +351,30 @@ func (m *Manager) probeAllNodes(timeout time.Duration) {
 	}
 }
 
-	// Stop stops the periodic health check.
+// ResetRuntime cancels in-flight probes/periodic checks and clears runtime node registry.
+// It keeps the DB connection and Config intact so the monitor HTTP server can continue serving.
+func (m *Manager) ResetRuntime() {
+	if m == nil {
+		return
+	}
+
+	// Cancel any in-flight probes / periodic loops.
+	if m.cancel != nil {
+		m.cancel()
+	}
+
+	// Create a fresh context for subsequent periodic checks / DB ops.
+	ctx, cancel := context.WithCancel(context.Background())
+	m.ctx = ctx
+	m.cancel = cancel
+
+	// Clear registered nodes (new sing-box instance will re-register).
+	m.mu.Lock()
+	m.nodes = make(map[string]*entry)
+	m.mu.Unlock()
+}
+
+// Stop stops the periodic health check and closes DB.
 func (m *Manager) Stop() {
 	if m.cancel != nil {
 		m.cancel()
