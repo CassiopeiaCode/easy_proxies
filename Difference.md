@@ -18,9 +18,11 @@
 - 构建期（sing-box build/reload）对每个节点先做 outbound 构建校验；构建失败则该节点不会进入 sing-box outbounds。
 - 若启用 database（database.enabled=true），构建失败的节点会 best-effort 标记为 is_damaged=1，并写入 damage_reason（仅当能从 URI 提取 host:port 时）。
 - 若某节点在 DB 中已经 is_damaged=1，则构建期会直接跳过该节点（不会载入 sing-box）。
+- 若 sing-box 在启动/重载时出现 `initialize outbound[N]` 这类初始化错误，会 best-effort 标记对应节点 damaged 并快速重试；重试超过 5 次才退出。
 
 涉及模块：
 - internal/builder/builder.go：构建期校验、写入 damaged、跳过 damaged 节点。
+- internal/boxmgr/manager.go：sing-box init outbound 错误映射 damaged + 启动/重载重试。
 - internal/database/db.go：is_damaged/damage_reason 字段与查询接口。
 
 注意：host:port 主键现在支持从 `vmess://<base64(json)>` 解析（提取 json 的 `add` + `port`），因此这类节点也可以去重入库、标记 damaged、参与健康统计与阈值调度。若仍有极端 URI 无法提取 host:port，则该节点会被直接过滤掉（不入库、不载入、不参与调度）。
@@ -54,10 +56,11 @@
 - 统计窗口为最近 24h：从 hourly 表聚合出每个节点的成功率（success / (success+fail)）。
 - 计算 p95 成功率并下调 5% 形成阈值：threshold = p95 - 0.05。
 - pool 调度过滤：被标记为 `InitialCheckDone=true 且 Available=false` 的节点不进入候选集（即成功率低于阈值的“不健康节点”不可调度；且没有 24h 内健康检查统计的节点也不可调度）。
+- 自动清理：`node_health_hourly` 表自动删除 7 天前的历史聚合数据。
 
 涉及模块：
-- internal/database/db.go：新增 `node_health_hourly` 表；写入聚合统计；提供 24h 成功率聚合查询接口。
-- internal/monitor/manager.go：周期性 probe 结果写库；按 24h 成功率计算 p95-5% 阈值并更新节点 Available。
+- internal/database/db.go：新增 `node_health_hourly` 表；写入聚合统计；提供 24h 成功率聚合查询接口；提供历史数据清理接口。
+- internal/monitor/manager.go：周期性 probe 结果写库；按 24h 成功率计算 p95-5% 阈值并更新节点 Available；定时清理 7 天前统计数据。
 - internal/outbound/pool/pool.go：调度时读取 monitor 的 Available/InitialCheckDone 进行过滤。
 
 注意：
