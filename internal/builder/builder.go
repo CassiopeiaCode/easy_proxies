@@ -493,24 +493,56 @@ func buildShadowsocksOptions(u *url.URL) (option.ShadowsocksOutboundOptions, err
 		return option.ShadowsocksOutboundOptions{}, err
 	}
 
-	// Decode userinfo (base64 encoded method:password)
-	userInfo := u.User.String()
-	decoded, err := base64.RawURLEncoding.DecodeString(userInfo)
-	if err != nil {
-		// Try standard base64
-		decoded, err = base64.StdEncoding.DecodeString(userInfo)
-		if err != nil {
-			return option.ShadowsocksOutboundOptions{}, fmt.Errorf("decode shadowsocks userinfo: %w", err)
+	// ss:// supports two common userinfo formats:
+	// 1) SIP002 base64: ss://<base64(method:password)>@host:port
+	// 2) Plain:        ss://method:password@host:port
+	//
+	// Some subscriptions contain broken/non-SS strings that still look like ss://... and would decode into
+	// garbage bytes, which later causes sing-box init errors (e.g. "unknown method: u�").
+	userInfo := strings.TrimSpace(u.User.String())
+	if userInfo == "" {
+		return option.ShadowsocksOutboundOptions{}, errors.New("shadowsocks uri missing userinfo")
+	}
+
+	var method, password string
+
+	if strings.Contains(userInfo, ":") {
+		parts := strings.SplitN(userInfo, ":", 2)
+		if len(parts) != 2 {
+			return option.ShadowsocksOutboundOptions{}, errors.New("shadowsocks userinfo format must be method:password")
 		}
+		method = parts[0]
+		password = parts[1]
+	} else {
+		decoded, decErr := base64.RawURLEncoding.DecodeString(userInfo)
+		if decErr != nil {
+			decoded, decErr = base64.StdEncoding.DecodeString(userInfo)
+			if decErr != nil {
+				return option.ShadowsocksOutboundOptions{}, fmt.Errorf("decode shadowsocks userinfo: %w", decErr)
+			}
+		}
+
+		parts := strings.SplitN(string(decoded), ":", 2)
+		if len(parts) != 2 {
+			return option.ShadowsocksOutboundOptions{}, errors.New("shadowsocks userinfo format must be method:password")
+		}
+		method = parts[0]
+		password = parts[1]
 	}
 
-	parts := strings.SplitN(string(decoded), ":", 2)
-	if len(parts) != 2 {
-		return option.ShadowsocksOutboundOptions{}, errors.New("shadowsocks userinfo format must be method:password")
-	}
+	method = strings.ToLower(strings.TrimSpace(method))
+	password = strings.TrimSpace(password)
 
-	method := parts[0]
-	password := parts[1]
+	// Method must be ASCII and look like a real cipher name; otherwise fail fast so the node can be skipped/marked damaged.
+	if method == "" || password == "" {
+		return option.ShadowsocksOutboundOptions{}, errors.New("shadowsocks userinfo missing method or password")
+	}
+	for _, r := range method {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
+			continue
+		}
+		return option.ShadowsocksOutboundOptions{}, fmt.Errorf("invalid shadowsocks method %q", method)
+	}
 
 	opts := option.ShadowsocksOutboundOptions{
 		ServerOptions: option.ServerOptions{Server: server, ServerPort: uint16(port)},
@@ -852,6 +884,8 @@ func atoiDefault(value string) int {
 
 // printProxyLinks prints all proxy connection information at startup
 func printProxyLinks(cfg *config.Config, metadata map[string]poolout.MemberMeta) {
+	const maxListLines = 50
+
 	logx.Println("")
 	logx.Println("📡 Proxy Links:")
 	logx.Println("═══════════════════════════════════════════════════════════════")
@@ -869,10 +903,23 @@ func printProxyLinks(cfg *config.Config, metadata map[string]poolout.MemberMeta)
 		logx.Printf("🌐 Pool Entry Point:")
 		logx.Printf("   %s", proxyURL)
 		logx.Println("")
-		logx.Printf("   Nodes in pool (%d):", len(metadata))
+
+		total := len(metadata)
+		logx.Printf("   Nodes in pool (%d):", total)
+
+		// metadata is a map; order is not stable. We only print a small sample to avoid huge logs and slow startups.
+		shown := 0
 		for _, meta := range metadata {
 			logx.Printf("   • %s", meta.Name)
+			shown++
+			if shown >= maxListLines {
+				break
+			}
 		}
+		if total > shown {
+			logx.Printf("   ... (%d more omitted)", total-shown)
+		}
+
 		if showMultiPort {
 			logx.Println("")
 		}
@@ -880,8 +927,11 @@ func printProxyLinks(cfg *config.Config, metadata map[string]poolout.MemberMeta)
 
 	if showMultiPort {
 		// Multi-port mode: each node has its own port
-		logx.Printf("🔌 Multi-Port Entry Points (%d nodes):", len(cfg.Nodes))
+		total := len(cfg.Nodes)
+		logx.Printf("🔌 Multi-Port Entry Points (%d nodes):", total)
 		logx.Println("")
+
+		shown := 0
 		for _, node := range cfg.Nodes {
 			var auth string
 			username := node.Username
@@ -896,6 +946,14 @@ func printProxyLinks(cfg *config.Config, metadata map[string]poolout.MemberMeta)
 			proxyURL := fmt.Sprintf("http://%s%s:%d", auth, cfg.MultiPort.Address, node.Port)
 			logx.Printf("   [%d] %s", node.Port, node.Name)
 			logx.Printf("       %s", proxyURL)
+
+			shown++
+			if shown >= maxListLines {
+				break
+			}
+		}
+		if total > shown {
+			logx.Printf("   ... (%d more omitted)", total-shown)
 		}
 	}
 
