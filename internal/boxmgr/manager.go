@@ -7,6 +7,7 @@ import (
 	"log"
 	"net"
 	"net/url"
+	"reflect"
 	"regexp"
 	"strings"
 	"sync"
@@ -14,6 +15,7 @@ import (
 
 	"easy_proxies/internal/builder"
 	"easy_proxies/internal/config"
+	"easy_proxies/internal/database"
 	"easy_proxies/internal/logx"
 	"easy_proxies/internal/monitor"
 	"easy_proxies/internal/outbound/pool"
@@ -321,6 +323,9 @@ func (m *Manager) createBox(ctx context.Context, cfg *config.Config) (*box.Box, 
 
 	instance, err := box.New(box.Options{Context: boxCtx, Options: opts})
 	if err != nil {
+		// Best-effort: if sing-box fails while initializing outbounds, try to map the failing outbound
+		// to a node URI and mark it as damaged, so next run can start with remaining nodes.
+		m.tryMarkDamagedFromSingBoxInitError(cfg, opts, err)
 		return nil, fmt.Errorf("create sing-box instance: %w", err)
 	}
 	return instance, nil
@@ -653,8 +658,14 @@ func (m *Manager) CurrentPortMap() map[string]uint16 {
 
 // --- Helper functions ---
 
+var (
 // portBindErrorRegex matches "listen tcp4 0.0.0.0:24282: bind: address already in use"
-var portBindErrorRegex = regexp.MustCompile(`listen tcp[46]? [^:]+:(\d+): bind: address already in use`)
+portBindErrorRegex = regexp.MustCompile(`listen tcp[46]? [^:]+:(\d+): bind: address already in use`)
+
+// singBoxInitOutboundIdxRegex matches sing-box init errors like:
+// "initialize outbound[107]: create client transport: none: unknown transport type: none"
+singBoxInitOutboundIdxRegex = regexp.MustCompile(`initialize outbound\[(\d+)\]`)
+)
 
 // extractPortFromBindError extracts the port number from a bind error message.
 func extractPortFromBindError(err error) uint16 {
@@ -682,6 +693,140 @@ func isPortAvailable(address string, port uint16) bool {
 	}
 	_ = ln.Close()
 	return true
+}
+
+func extractSingBoxInitOutboundIndex(err error) int {
+	if err == nil {
+		return -1
+	}
+	matches := singBoxInitOutboundIdxRegex.FindStringSubmatch(err.Error())
+	if len(matches) < 2 {
+		return -1
+	}
+	var idx int
+	_, _ = fmt.Sscanf(matches[1], "%d", &idx)
+	if idx < 0 {
+		return -1
+	}
+	return idx
+}
+
+func sanitizeTag(name string) string {
+	lower := strings.ToLower(name)
+	lower = strings.TrimSpace(lower)
+	if lower == "" {
+		return ""
+	}
+	segments := strings.FieldsFunc(lower, func(r rune) bool {
+		return !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9')
+	})
+	result := strings.Join(segments, "-")
+	result = strings.Trim(result, "-")
+	return result
+}
+
+// buildTagToURIMap reconstructs the outbound tag assignment used by builder.Build() for node outbounds.
+// It must stay consistent with builder's sanitizeTag + uniqueness rules.
+func buildTagToURIMap(cfg *config.Config) map[string]string {
+	out := make(map[string]string, len(cfg.Nodes))
+	usedTags := make(map[string]int)
+
+	for _, node := range cfg.Nodes {
+		baseTag := sanitizeTag(node.Name)
+		if baseTag == "" {
+			baseTag = fmt.Sprintf("node-%d", len(out)+1)
+		}
+
+		tag := baseTag
+		if count, exists := usedTags[baseTag]; exists {
+			usedTags[baseTag] = count + 1
+			tag = fmt.Sprintf("%s-%d", baseTag, count+1)
+		} else {
+			usedTags[baseTag] = 1
+		}
+		out[tag] = node.URI
+	}
+	return out
+}
+
+func outboundTagAtIndex(opts any, idx int) string {
+	if idx < 0 {
+		return ""
+	}
+	v := reflect.ValueOf(opts)
+	if !v.IsValid() {
+		return ""
+	}
+	if v.Kind() == reflect.Pointer {
+		if v.IsNil() {
+			return ""
+		}
+		v = v.Elem()
+	}
+	if v.Kind() != reflect.Struct {
+		return ""
+	}
+	outbounds := v.FieldByName("Outbounds")
+	if !outbounds.IsValid() || outbounds.Kind() != reflect.Slice || idx >= outbounds.Len() {
+		return ""
+	}
+	ob := outbounds.Index(idx)
+	if ob.Kind() == reflect.Pointer {
+		if ob.IsNil() {
+			return ""
+		}
+		ob = ob.Elem()
+	}
+	if ob.Kind() != reflect.Struct {
+		return ""
+	}
+	tagField := ob.FieldByName("Tag")
+	if !tagField.IsValid() || tagField.Kind() != reflect.String {
+		return ""
+	}
+	return tagField.String()
+}
+
+func (m *Manager) tryMarkDamagedFromSingBoxInitError(cfg *config.Config, opts any, cause error) {
+	if cfg == nil || cause == nil {
+		return
+	}
+	if !cfg.Database.Enabled || strings.TrimSpace(cfg.Database.Path) == "" {
+		return
+	}
+
+	idx := extractSingBoxInitOutboundIndex(cause)
+	if idx < 0 {
+		return
+	}
+
+	tag := outboundTagAtIndex(opts, idx)
+	if tag == "" {
+		return
+	}
+
+	// Only mark if the tag belongs to a node outbound (not pool/proxy-pool-* etc.).
+	tagToURI := buildTagToURIMap(cfg)
+	rawURI := strings.TrimSpace(tagToURI[tag])
+	if rawURI == "" {
+		return
+	}
+
+	host, port, _, err := database.HostPortFromURI(rawURI)
+	if err != nil || host == "" || port <= 0 {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	db, err := database.Open(ctx, cfg.Database.Path)
+	if err != nil {
+		return
+	}
+	defer db.Close()
+
+	_ = db.MarkNodeDamaged(ctx, host, port, cause.Error())
 }
 
 // reassignConflictingPort finds the node using the conflicting port and assigns a new port.
