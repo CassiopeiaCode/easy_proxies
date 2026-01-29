@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"net/netip"
 	"net/url"
 	"strconv"
@@ -15,6 +14,7 @@ import (
 
 	"easy_proxies/internal/config"
 	"easy_proxies/internal/database"
+	"easy_proxies/internal/logx"
 	poolout "easy_proxies/internal/outbound/pool"
 
 	C "github.com/sagernet/sing-box/constant"
@@ -41,7 +41,7 @@ func Build(cfg *config.Config) (option.Options, error) {
 		db, err = database.Open(ctx, cfg.Database.Path)
 		cancel()
 		if err != nil {
-			log.Printf("⚠️  database open failed, damaged tracking disabled: %v", err)
+			logx.Printf("⚠️  database open failed, damaged tracking disabled: %v", err)
 			db = nil
 		}
 	}
@@ -71,9 +71,9 @@ func Build(cfg *config.Config) (option.Options, error) {
 				damaged, dErr := db.IsNodeDamaged(ctx, host, port)
 				cancel()
 				if dErr != nil {
-					log.Printf("⚠️  query damaged failed for %s:%d: %v (continue building)", host, port, dErr)
+					logx.Printf("⚠️  query damaged failed for %s:%d: %v (continue building)", host, port, dErr)
 				} else if damaged {
-					log.Printf("⚠️  node '%s' is marked damaged in DB, skipping build", node.Name)
+					logx.Printf("⚠️  node '%s' is marked damaged in DB, skipping build", node.Name)
 					failedNodes = append(failedNodes, node.Name)
 					continue
 				}
@@ -82,7 +82,7 @@ func Build(cfg *config.Config) (option.Options, error) {
 
 		outbound, err := buildNodeOutbound(tag, node.URI, cfg.SkipCertVerify)
 		if err != nil {
-			log.Printf("❌ Failed to build node '%s': %v (skipping)", node.Name, err)
+			logx.Printf("❌ Failed to build node '%s': %v (skipping)", node.Name, err)
 			failedNodes = append(failedNodes, node.Name)
 
 			// Build-time invalid: mark damaged (only when we can extract host:port).
@@ -90,7 +90,7 @@ func Build(cfg *config.Config) (option.Options, error) {
 				if host, port, _, hpErr := database.HostPortFromURI(node.URI); hpErr == nil && host != "" && port > 0 {
 					ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 					if markErr := db.MarkNodeDamaged(ctx, host, port, err.Error()); markErr != nil {
-						log.Printf("⚠️  mark damaged failed for %s:%d: %v", host, port, markErr)
+						logx.Printf("⚠️  mark damaged failed for %s:%d: %v", host, port, markErr)
 					}
 					cancel()
 				}
@@ -124,9 +124,9 @@ func Build(cfg *config.Config) (option.Options, error) {
 
 	// Log summary
 	if len(failedNodes) > 0 {
-		log.Printf("⚠️  %d/%d nodes failed and were skipped: %v", len(failedNodes), len(cfg.Nodes), failedNodes)
+		logx.Printf("⚠️  %d/%d nodes failed and were skipped: %v", len(failedNodes), len(cfg.Nodes), failedNodes)
 	}
-	log.Printf("✅ Successfully built %d/%d nodes", len(baseOutbounds), len(cfg.Nodes))
+	logx.Printf("✅ Successfully built %d/%d nodes", len(baseOutbounds), len(cfg.Nodes))
 
 	// Print proxy links for each node
 	printProxyLinks(cfg, metadata)
@@ -475,7 +475,7 @@ func buildV2RayTransport(query url.Values) (*option.V2RayTransportOptions, error
 		options.HTTPUpgradeOptions.Path = query.Get("path")
 	case "xhttp":
 		// XHTTP is not supported by sing-box, fallback to HTTPUpgrade
-		log.Printf("⚠️  XHTTP transport not supported by sing-box, falling back to HTTPUpgrade")
+		logx.Printf("⚠️  XHTTP transport not supported by sing-box, falling back to HTTPUpgrade")
 		options.Type = C.V2RayTransportTypeHTTPUpgrade
 		options.HTTPUpgradeOptions.Path = query.Get("path")
 		if host := query.Get("host"); host != "" {
@@ -850,9 +850,9 @@ func atoiDefault(value string) int {
 
 // printProxyLinks prints all proxy connection information at startup
 func printProxyLinks(cfg *config.Config, metadata map[string]poolout.MemberMeta) {
-	log.Println("")
-	log.Println("📡 Proxy Links:")
-	log.Println("═══════════════════════════════════════════════════════════════")
+	logx.Println("")
+	logx.Println("📡 Proxy Links:")
+	logx.Println("═══════════════════════════════════════════════════════════════")
 
 	showPoolEntry := cfg.Mode == "pool" || cfg.Mode == "hybrid"
 	showMultiPort := cfg.Mode == "multi-port" || cfg.Mode == "hybrid"
@@ -864,22 +864,22 @@ func printProxyLinks(cfg *config.Config, metadata map[string]poolout.MemberMeta)
 			auth = fmt.Sprintf("%s:%s@", cfg.Listener.Username, cfg.Listener.Password)
 		}
 		proxyURL := fmt.Sprintf("http://%s%s:%d", auth, cfg.Listener.Address, cfg.Listener.Port)
-		log.Printf("🌐 Pool Entry Point:")
-		log.Printf("   %s", proxyURL)
-		log.Println("")
-		log.Printf("   Nodes in pool (%d):", len(metadata))
+		logx.Printf("🌐 Pool Entry Point:")
+		logx.Printf("   %s", proxyURL)
+		logx.Println("")
+		logx.Printf("   Nodes in pool (%d):", len(metadata))
 		for _, meta := range metadata {
-			log.Printf("   • %s", meta.Name)
+			logx.Printf("   • %s", meta.Name)
 		}
 		if showMultiPort {
-			log.Println("")
+			logx.Println("")
 		}
 	}
 
 	if showMultiPort {
 		// Multi-port mode: each node has its own port
-		log.Printf("🔌 Multi-Port Entry Points (%d nodes):", len(cfg.Nodes))
-		log.Println("")
+		logx.Printf("🔌 Multi-Port Entry Points (%d nodes):", len(cfg.Nodes))
+		logx.Println("")
 		for _, node := range cfg.Nodes {
 			var auth string
 			username := node.Username
@@ -892,11 +892,11 @@ func printProxyLinks(cfg *config.Config, metadata map[string]poolout.MemberMeta)
 				auth = fmt.Sprintf("%s:%s@", username, password)
 			}
 			proxyURL := fmt.Sprintf("http://%s%s:%d", auth, cfg.MultiPort.Address, node.Port)
-			log.Printf("   [%d] %s", node.Port, node.Name)
-			log.Printf("       %s", proxyURL)
+			logx.Printf("   [%d] %s", node.Port, node.Name)
+			logx.Printf("       %s", proxyURL)
 		}
 	}
 
-	log.Println("═══════════════════════════════════════════════════════════════")
-	log.Println("")
+	logx.Println("═══════════════════════════════════════════════════════════════")
+	logx.Println("")
 }

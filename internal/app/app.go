@@ -3,7 +3,6 @@ package app
 import (
 	"context"
 	"fmt"
-	"log"
 	"os"
 	"os/signal"
 	"strings"
@@ -13,6 +12,7 @@ import (
 	"easy_proxies/internal/boxmgr"
 	"easy_proxies/internal/config"
 	"easy_proxies/internal/database"
+	"easy_proxies/internal/logx"
 	"easy_proxies/internal/monitor"
 	"easy_proxies/internal/subscription"
 )
@@ -28,7 +28,7 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		db, err := database.Open(openCtx, cfg.Database.Path)
 		cancel()
 		if err != nil {
-			log.Printf("⚠️  open database failed, continue with config nodes: %v", err)
+			logx.Printf("⚠️  open database failed, continue with config nodes: %v", err)
 		} else {
 			importCtx, cancelImport := context.WithTimeout(ctx, 10*time.Second)
 			for _, n := range cfg.Nodes {
@@ -37,7 +37,7 @@ func Run(ctx context.Context, cfg *config.Config) error {
 					URI:  n.URI,
 					Name: n.Name,
 				}); upErr != nil {
-					log.Printf("⚠️  drop node (cannot extract host:port): %s (%v)", n.Name, upErr)
+					logx.Printf("⚠️  drop node (cannot extract host:port): %s (%v)", n.Name, upErr)
 				}
 			}
 			cancelImport()
@@ -48,7 +48,7 @@ func Run(ctx context.Context, cfg *config.Config) error {
 			_ = db.Close()
 
 			if listErr != nil {
-				log.Printf("⚠️  list active nodes from database failed, continue with config nodes: %v", listErr)
+				logx.Printf("⚠️  list active nodes from database failed, continue with config nodes: %v", listErr)
 			} else if len(active) > 0 {
 				nodes := make([]config.NodeConfig, 0, len(active))
 				for _, n := range active {
@@ -58,7 +58,7 @@ func Run(ctx context.Context, cfg *config.Config) error {
 					})
 				}
 				cfg.Nodes = nodes
-				log.Printf("✅ loaded %d active nodes from database", len(active))
+				logx.Printf("✅ loaded %d active nodes from database", len(active))
 			}
 		}
 	}

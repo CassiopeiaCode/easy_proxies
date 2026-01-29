@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -13,6 +12,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"easy_proxies/internal/logx"
 
 	"gopkg.in/yaml.v3"
 )
@@ -260,7 +261,7 @@ func (c *Config) normalize() error {
 		// Auto-assign port in multi-port/hybrid mode, skip occupied ports
 		if c.Nodes[idx].Port == 0 && (c.Mode == "multi-port" || c.Mode == "hybrid") {
 			for !isPortAvailable(c.MultiPort.Address, portCursor) {
-				log.Printf("⚠️  Port %d is in use, trying next port", portCursor)
+				logx.Printf("⚠️  Port %d is in use, trying next port", portCursor)
 				portCursor++
 				if portCursor > 65535 {
 					return fmt.Errorf("no available ports found starting from %d", c.MultiPort.BasePort)
@@ -302,7 +303,7 @@ func (c *Config) normalize() error {
 						return fmt.Errorf("no available port for node %q after conflict with pool port %d", c.Nodes[idx].Name, poolPort)
 					}
 				}
-				log.Printf("⚠️  Node %q port %d conflicts with pool port, reassigned to %d", c.Nodes[idx].Name, poolPort, newPort)
+				logx.Printf("⚠️  Node %q port %d conflicts with pool port, reassigned to %d", c.Nodes[idx].Name, poolPort, newPort)
 				usedPorts[newPort] = true
 				c.Nodes[idx].Port = newPort
 			}
@@ -423,7 +424,7 @@ func (c *Config) NormalizeWithPortMap(portMap map[string]uint16) error {
 			if existingPort, ok := portMap[nodeKey]; ok && existingPort > 0 {
 				c.Nodes[idx].Port = existingPort
 				usedPorts[existingPort] = true
-				log.Printf("✅ Preserved port %d for node %q", existingPort, c.Nodes[idx].Name)
+				logx.Printf("✅ Preserved port %d for node %q", existingPort, c.Nodes[idx].Name)
 			}
 		}
 	}
@@ -441,7 +442,7 @@ func (c *Config) NormalizeWithPortMap(portMap map[string]uint16) error {
 			}
 			c.Nodes[idx].Port = portCursor
 			usedPorts[portCursor] = true
-			log.Printf("📌 Assigned new port %d for node %q", portCursor, c.Nodes[idx].Name)
+			logx.Printf("📌 Assigned new port %d for node %q", portCursor, c.Nodes[idx].Name)
 			portCursor++
 		} else if c.Nodes[idx].Port == 0 {
 			c.Nodes[idx].Port = portCursor
