@@ -253,6 +253,9 @@ func (m *Manager) probeAllNodes(timeout time.Duration) {
 	m.mu.RUnlock()
 
 	if len(entries) == 0 {
+		if m.logger != nil {
+			m.logger.Info("health check tick: 0 nodes registered, skipping probe")
+		}
 		return
 	}
 
@@ -837,6 +840,19 @@ func (m *Manager) shouldPersistHealth() bool {
 	m.dbMu.Lock()
 	defer m.dbMu.Unlock()
 	return m.db != nil
+}
+
+// RefreshHealthFromDB applies DB-derived health threshold (24h success-rate) to runtime entries.
+// This makes API/UI availability reflect persisted health stats immediately after node registration,
+// without waiting for the first periodic probe cycle.
+func (m *Manager) RefreshHealthFromDB() {
+	if m == nil {
+		return
+	}
+	if !m.shouldPersistHealth() {
+		return
+	}
+	_ = m.applyHealthThresholdFromDB()
 }
 
 func (m *Manager) recordHealthCheck(ctx context.Context, u database.HealthCheckUpdate) error {

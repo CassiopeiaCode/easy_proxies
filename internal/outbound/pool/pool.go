@@ -558,7 +558,12 @@ func httpProbe(conn net.Conn, useTLS bool, hostHeader, path, serverName string, 
 	}
 
 	// Build HTTP request
-	req := fmt.Sprintf("GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\nUser-Agent: Mozilla/5.0\r\n\r\n", path, hostHeader)
+	// Minimal required headers for HTTP/1.1 + some common headers to avoid being blocked.
+	req := fmt.Sprintf(
+		"GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\nUser-Agent: Mozilla/5.0\r\nAccept: */*\r\nAccept-Encoding: identity\r\n\r\n",
+		path,
+		hostHeader,
+	)
 
 	// Try to set write deadline (ignore errors for connections that don't support it)
 	_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))

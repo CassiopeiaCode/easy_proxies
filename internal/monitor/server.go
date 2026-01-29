@@ -203,8 +203,19 @@ func (s *Server) handleNodes(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-	// 只返回初始检查通过的可用节点
-	payload := map[string]any{"nodes": s.mgr.SnapshotFiltered(true)}
+
+	// Only return nodes that have completed initial check AND are available.
+	// SnapshotFiltered(true) keeps nodes that haven't been checked yet (InitialCheckDone=false),
+	// which can look like "healthy" even though probes are still failing.
+	all := s.mgr.Snapshot()
+	nodes := make([]Snapshot, 0, len(all))
+	for _, snap := range all {
+		if snap.InitialCheckDone && snap.Available {
+			nodes = append(nodes, snap)
+		}
+	}
+
+	payload := map[string]any{"nodes": nodes}
 	writeJSON(w, payload)
 }
 
@@ -484,8 +495,14 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 只导出初始检查通过的可用节点
-	snapshots := s.mgr.SnapshotFiltered(true)
+	// Only export nodes that have completed initial check AND are available.
+	all := s.mgr.Snapshot()
+	snapshots := make([]Snapshot, 0, len(all))
+	for _, snap := range all {
+		if snap.InitialCheckDone && snap.Available {
+			snapshots = append(snapshots, snap)
+		}
+	}
 	var lines []string
 
 	for _, snap := range snapshots {

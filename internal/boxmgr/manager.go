@@ -156,6 +156,13 @@ func (m *Manager) Start(ctx context.Context) error {
 	// 如果我们过早启动健康检查或统计可用节点，会出现 0/0 的假象。
 	m.waitForMonitorRegistration(30 * time.Second)
 
+	// Apply persisted health stats to runtime entries immediately after registration.
+	m.mu.RLock()
+	if m.monitorMgr != nil {
+		m.monitorMgr.RefreshHealthFromDB()
+	}
+	m.mu.RUnlock()
+
 	// Start periodic health check after nodes are registered
 	m.mu.Lock()
 	if m.monitorMgr != nil && !m.healthCheckStarted {
@@ -271,6 +278,13 @@ func (m *Manager) Reload(newCfg *config.Config) error {
 
 	// Reload 后同样需要等待新实例完成注册，再启动周期健康检查，避免 0/0 与空列表。
 	m.waitForMonitorRegistration(30 * time.Second)
+
+	// Apply persisted health stats to runtime entries immediately after registration.
+	m.mu.RLock()
+	if m.monitorMgr != nil {
+		m.monitorMgr.RefreshHealthFromDB()
+	}
+	m.mu.RUnlock()
 
 	m.mu.Lock()
 	if m.monitorMgr != nil && !m.healthCheckStarted {
