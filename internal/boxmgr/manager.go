@@ -365,6 +365,10 @@ func (m *Manager) createBox(ctx context.Context, cfg *config.Config) (*box.Box, 
 	dnsRegistry := include.DNSTransportRegistry()
 	serviceRegistry := include.ServiceRegistry()
 
+	// Pre-register nodes so monitor APIs can see them even if sing-box does not instantiate
+	// our pool outbounds early (or context values are dropped internally).
+	m.preRegisterMonitorNodes(cfg)
+
 	boxCtx := box.Context(ctx, inboundRegistry, outboundRegistry, endpointRegistry, dnsRegistry, serviceRegistry)
 	boxCtx = monitor.ContextWith(boxCtx, m.monitorMgr)
 
@@ -825,6 +829,47 @@ func buildTagToURIMap(cfg *config.Config) map[string]string {
 		out[tag] = node.URI
 	}
 	return out
+}
+
+func (m *Manager) preRegisterMonitorNodes(cfg *config.Config) {
+	if m == nil || m.monitorMgr == nil || cfg == nil {
+		return
+	}
+
+	usedTags := make(map[string]int)
+	for i := range cfg.Nodes {
+		node := cfg.Nodes[i]
+
+		baseTag := sanitizeTag(node.Name)
+		if baseTag == "" {
+			baseTag = fmt.Sprintf("node-%d", i+1)
+		}
+
+		tag := baseTag
+		if count, exists := usedTags[baseTag]; exists {
+			usedTags[baseTag] = count + 1
+			tag = fmt.Sprintf("%s-%d", baseTag, count+1)
+		} else {
+			usedTags[baseTag] = 1
+		}
+
+		info := monitor.NodeInfo{
+			Tag:  tag,
+			Name: node.Name,
+			URI:  node.URI,
+			Mode: cfg.Mode,
+		}
+
+		if cfg.Mode == "multi-port" || cfg.Mode == "hybrid" {
+			info.ListenAddress = cfg.MultiPort.Address
+			info.Port = node.Port
+		} else {
+			info.ListenAddress = cfg.Listener.Address
+			info.Port = cfg.Listener.Port
+		}
+
+		_ = m.monitorMgr.Register(info)
+	}
 }
 
 func outboundTagAtIndex(opts any, idx int) string {
