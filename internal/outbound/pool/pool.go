@@ -103,10 +103,21 @@ func newPool(ctx context.Context, _ adapter.Router, logger log.ContextLogger, ta
 	if manager == nil {
 		return nil, E.New("missing outbound manager in context")
 	}
-	monitorMgr := monitor.FromContext(ctx)
+
+	ctxMonitor := monitor.FromContext(ctx)
+	defaultMonitor := getDefaultMonitorManager()
+	monitorMgr := ctxMonitor
 	if monitorMgr == nil {
-		monitorMgr = getDefaultMonitorManager()
+		monitorMgr = defaultMonitor
+		if monitorMgr != nil {
+			logger.Warn("monitor manager missing in context; using default monitor manager fallback")
+		} else {
+			logger.Warn("monitor manager missing in context and default monitor manager is nil; monitoring will be disabled")
+		}
+	} else if defaultMonitor != nil && defaultMonitor != ctxMonitor {
+		logger.Warn("monitor manager from context differs from default monitor manager (using context)")
 	}
+
 	normalized := normalizeOptions(options)
 	memberCount := len(normalized.Members)
 	p := &poolOutbound{
