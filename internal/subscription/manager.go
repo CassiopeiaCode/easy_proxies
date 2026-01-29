@@ -90,6 +90,10 @@ func (m *Manager) Start() {
 	m.logger.Infof("starting subscription refresh, interval: %s", interval)
 
 	go m.refreshLoop(interval)
+
+	// Bootstrap: trigger an immediate refresh asynchronously on startup,
+	// so users don't have to wait for the first ticker interval.
+	go m.doRefresh()
 }
 
 // Stop stops the periodic refresh.
