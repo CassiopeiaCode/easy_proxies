@@ -151,6 +151,11 @@ func (m *Manager) Start(ctx context.Context) error {
 	m.currentBox = instance
 	m.mu.Unlock()
 
+	// sing-box 的 outbound 初始化/Start 流程与我们这里的控制流并非严格同步：
+	// 即使 instance.Start() 返回成功，monitor 注册可能还在后续阶段发生。
+	// 如果我们过早启动健康检查或统计可用节点，会出现 0/0 的假象。
+	m.waitForMonitorRegistration(10 * time.Second)
+
 	// Start periodic health check after nodes are registered
 	m.mu.Lock()
 	if m.monitorMgr != nil && !m.healthCheckStarted {
@@ -410,6 +415,36 @@ func (m *Manager) waitForHealthCheck(timeout time.Duration) error {
 		}
 		if time.Now().After(deadline) {
 			return fmt.Errorf("timeout: %d/%d nodes available (need >= %d)", available, total, m.minAvailableNodes)
+		}
+		<-ticker.C
+	}
+}
+
+func (m *Manager) waitForMonitorRegistration(timeout time.Duration) {
+	m.mu.RLock()
+	mgr := m.monitorMgr
+	m.mu.RUnlock()
+	if mgr == nil {
+		return
+	}
+
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+
+	deadline := time.Now().Add(timeout)
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		total := len(mgr.Snapshot())
+		if total > 0 {
+			m.logger.Infof("monitor registered %d nodes", total)
+			return
+		}
+		if time.Now().After(deadline) {
+			m.logger.Warnf("monitor node registration not observed within %s (still 0 nodes)", timeout)
+			return
 		}
 		<-ticker.C
 	}
