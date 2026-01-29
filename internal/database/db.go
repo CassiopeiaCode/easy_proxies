@@ -346,6 +346,26 @@ GROUP BY host, port
 	return out, nil
 }
 
+// CleanupHealthStatsBefore deletes aggregated health check stats strictly before the given cutoff time.
+// cutoff is treated as UTC and compared against hour_ts (stored as UTC "YYYY-MM-DD HH:MM:SS").
+func (d *DB) CleanupHealthStatsBefore(ctx context.Context, cutoff time.Time) (int64, error) {
+	if d == nil || d.sql == nil {
+		return 0, errors.New("db not initialized")
+	}
+	cutoff = cutoff.UTC()
+	cutoffStr := cutoff.Format("2006-01-02 15:04:05")
+
+	res, err := d.sql.ExecContext(ctx, `
+DELETE FROM node_health_hourly
+WHERE hour_ts < ?
+`, cutoffStr)
+	if err != nil {
+		return 0, fmt.Errorf("cleanup node_health_hourly: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
+}
+
 func (d *DB) ListActiveNodes(ctx context.Context) ([]Node, error) {
 	if d == nil || d.sql == nil {
 		return nil, errors.New("db not initialized")

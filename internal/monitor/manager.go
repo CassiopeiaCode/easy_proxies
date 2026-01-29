@@ -192,8 +192,14 @@ func (m *Manager) StartPeriodicHealthCheck(interval, timeout time.Duration) {
 		// 启动后立即进行一次检查
 		m.probeAllNodes(timeout)
 
+		// 启动后做一次历史统计清理（仅清理健康检查 hourly 聚合表，保留最近 7 天）
+		m.cleanupOldHealthStats()
+
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
+
+		cleanupTicker := time.NewTicker(12 * time.Hour)
+		defer cleanupTicker.Stop()
 
 		for {
 			select {
@@ -201,12 +207,44 @@ func (m *Manager) StartPeriodicHealthCheck(interval, timeout time.Duration) {
 				return
 			case <-ticker.C:
 				m.probeAllNodes(timeout)
+			case <-cleanupTicker.C:
+				m.cleanupOldHealthStats()
 			}
 		}
 	}()
 
 	if m.logger != nil {
 		m.logger.Info("periodic health check started, interval: ", interval)
+	}
+}
+
+func (m *Manager) cleanupOldHealthStats() {
+	if !m.shouldPersistHealth() {
+		return
+	}
+
+	// 保留最近 7 天（按 hour_ts 存储；这里用 UTC 截断到整点）
+	cutoff := time.Now().UTC().Add(-7 * 24 * time.Hour).Truncate(time.Hour)
+
+	m.dbMu.Lock()
+	db := m.db
+	m.dbMu.Unlock()
+	if db == nil {
+		return
+	}
+
+	cctx, cancel := context.WithTimeout(m.ctx, 5*time.Second)
+	deleted, err := db.CleanupHealthStatsBefore(cctx, cutoff)
+	cancel()
+
+	if err != nil {
+		if m.logger != nil {
+			m.logger.Warn("cleanup old health stats failed: ", err)
+		}
+		return
+	}
+	if deleted > 0 && m.logger != nil {
+		m.logger.Info("cleanup old health stats deleted rows: ", deleted)
 	}
 }
 
