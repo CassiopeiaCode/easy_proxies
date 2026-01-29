@@ -26,6 +26,8 @@ services:
     #   - 端口冲突时自动重分配到下一个可用端口
     volumes:
       # 配置文件需要可写权限以支持 WebUI 设置保存
-      # 如遇权限问题，请在宿主机执行: chmod 666 config.yaml nodes.txt
+      # 如遇权限问题，请在宿主机执行: chmod 666 config.yaml nodes.txt easy_proxies.db
       - ./config.yaml:/etc/easy-proxies/config.yaml
       - ./nodes.txt:/etc/easy-proxies/nodes.txt
+      # SQLite 数据库持久化（与 config.yaml 同目录；默认路径 /etc/easy-proxies/easy_proxies.db）
+      - ./easy_proxies.db:/etc/easy-proxies/easy_proxies.db
