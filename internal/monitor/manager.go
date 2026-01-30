@@ -97,7 +97,14 @@ type entry struct {
 	release          releaseFunc
 	initialCheckDone bool
 	available        bool
-	mu               sync.RWMutex
+
+	mgr *Manager
+
+	// dbEventMinInterval throttles RecordFailure/RecordSuccess persistence so high QPS traffic
+	// doesn't turn into high QPS SQLite writes. Periodic probes still persist separately.
+	lastDBEventUnix atomic.Int64
+
+	mu sync.RWMutex
 }
 
 // Manager aggregates all node states for the UI/API.
@@ -117,6 +124,9 @@ type Manager struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	logger Logger
+
+	// throttle health recompute triggered by real traffic.
+	lastHealthRecomputeUnix atomic.Int64
 
 	db   *database.DB
 	dbMu sync.Mutex
@@ -193,6 +203,11 @@ func (m *Manager) StartPeriodicHealthCheck(interval, timeout time.Duration) {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 
+		// In DB mode, recompute availability periodically even if probes are infrequent
+		// or traffic-triggered recomputes are throttled.
+		recomputeTicker := time.NewTicker(5 * time.Minute)
+		defer recomputeTicker.Stop()
+
 		cleanupTicker := time.NewTicker(12 * time.Hour)
 		defer cleanupTicker.Stop()
 
@@ -202,6 +217,12 @@ func (m *Manager) StartPeriodicHealthCheck(interval, timeout time.Duration) {
 				return
 			case <-ticker.C:
 				m.probeAllNodes(timeout)
+			case <-recomputeTicker.C:
+				if m.shouldPersistHealth() {
+					if err := m.applyHealthThresholdFromDB(); err != nil && m.logger != nil {
+						m.logger.Warn("apply health threshold failed: ", err)
+					}
+				}
 			case <-cleanupTicker.C:
 				m.cleanupOldHealthStats()
 			}
@@ -322,14 +343,20 @@ func (m *Manager) probeAllNodes(timeout time.Duration) {
 				failedCount.Add(1)
 				entry.lastError = err.Error()
 				entry.lastFail = time.Now()
-				entry.available = false
-				entry.initialCheckDone = true
+				// When DB is enabled, Available is derived only from DB (p95-5%) so do not set it here.
+				if !m.shouldPersistHealth() {
+					entry.available = false
+					entry.initialCheckDone = true
+				}
 			} else {
 				availableCount.Add(1)
 				entry.lastOK = time.Now()
 				entry.lastProbe = latency
-				entry.available = true
-				entry.initialCheckDone = true
+				// When DB is enabled, Available is derived only from DB (p95-5%) so do not set it here.
+				if !m.shouldPersistHealth() {
+					entry.available = true
+					entry.initialCheckDone = true
+				}
 			}
 			entry.mu.Unlock()
 
@@ -407,10 +434,14 @@ func (m *Manager) Register(info NodeInfo) *EntryHandle {
 		e = &entry{
 			info:     info,
 			timeline: make([]TimelineEvent, 0, maxTimelineSize),
+			mgr:      m,
 		}
 		m.nodes[info.Tag] = e
 	} else {
 		e.info = info
+		if e.mgr == nil {
+			e.mgr = m
+		}
 	}
 	return &EntryHandle{ref: e}
 }
@@ -651,34 +682,95 @@ func (e *entry) snapshot() Snapshot {
 }
 
 func (e *entry) recordFailure(err error) {
+	now := time.Now()
+
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	errStr := err.Error()
 	e.failure++
 	e.lastError = errStr
-	e.lastFail = time.Now()
+	e.lastFail = now
 	e.appendTimelineLocked(false, 0, errStr)
+	mgr := e.mgr
+	uri := e.info.URI
+	e.mu.Unlock()
+
+	if mgr != nil && mgr.shouldPersistHealth() && mgr.throttleDBEvent(e) {
+		host, port, _, hpErr := database.HostPortFromURI(uri)
+		if hpErr == nil && host != "" && port > 0 {
+			u := database.HealthCheckUpdate{
+				Host:      host,
+				Port:      port,
+				Success:   false,
+				LatencyMs: nil,
+			}
+			saveCtx, cancelSave := context.WithTimeout(mgr.ctx, 3*time.Second)
+			_ = mgr.recordHealthCheck(saveCtx, u)
+			cancelSave()
+			mgr.scheduleHealthRecompute()
+		}
+	}
 }
 
 func (e *entry) recordSuccess() {
+	now := time.Now()
+
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	e.success++
-	e.lastOK = time.Now()
+	e.lastOK = now
 	e.appendTimelineLocked(true, 0, "")
+	mgr := e.mgr
+	uri := e.info.URI
+	e.mu.Unlock()
+
+	if mgr != nil && mgr.shouldPersistHealth() && mgr.throttleDBEvent(e) {
+		host, port, _, hpErr := database.HostPortFromURI(uri)
+		if hpErr == nil && host != "" && port > 0 {
+			u := database.HealthCheckUpdate{
+				Host:      host,
+				Port:      port,
+				Success:   true,
+				LatencyMs: nil,
+			}
+			saveCtx, cancelSave := context.WithTimeout(mgr.ctx, 3*time.Second)
+			_ = mgr.recordHealthCheck(saveCtx, u)
+			cancelSave()
+			mgr.scheduleHealthRecompute()
+		}
+	}
 }
 
 func (e *entry) recordSuccessWithLatency(latency time.Duration) {
+	now := time.Now()
+
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	e.success++
-	e.lastOK = time.Now()
+	e.lastOK = now
 	e.lastProbe = latency
 	latencyMs := latency.Milliseconds()
 	if latencyMs == 0 && latency > 0 {
 		latencyMs = 1
 	}
 	e.appendTimelineLocked(true, latencyMs, "")
+	mgr := e.mgr
+	uri := e.info.URI
+	e.mu.Unlock()
+
+	if mgr != nil && mgr.shouldPersistHealth() && mgr.throttleDBEvent(e) {
+		host, port, _, hpErr := database.HostPortFromURI(uri)
+		if hpErr == nil && host != "" && port > 0 {
+			ms := latencyMs
+			u := database.HealthCheckUpdate{
+				Host:      host,
+				Port:      port,
+				Success:   true,
+				LatencyMs: &ms,
+			}
+			saveCtx, cancelSave := context.WithTimeout(mgr.ctx, 3*time.Second)
+			_ = mgr.recordHealthCheck(saveCtx, u)
+			cancelSave()
+			mgr.scheduleHealthRecompute()
+		}
+	}
 }
 
 func (e *entry) appendTimelineLocked(success bool, latencyMs int64, errStr string) {
@@ -813,6 +905,10 @@ func (h *EntryHandle) MarkInitialCheckDone(available bool) {
 	if h == nil || h.ref == nil {
 		return
 	}
+	// In DB mode, availability is derived only from DB (p95-5%), so ignore external writes.
+	if h.ref.mgr != nil && h.ref.mgr.shouldPersistHealth() {
+		return
+	}
 	h.ref.mu.Lock()
 	h.ref.initialCheckDone = true
 	h.ref.available = available
@@ -822,6 +918,10 @@ func (h *EntryHandle) MarkInitialCheckDone(available bool) {
 // MarkAvailable updates the availability status.
 func (h *EntryHandle) MarkAvailable(available bool) {
 	if h == nil || h.ref == nil {
+		return
+	}
+	// In DB mode, availability is derived only from DB (p95-5%), so ignore external writes.
+	if h.ref.mgr != nil && h.ref.mgr.shouldPersistHealth() {
 		return
 	}
 	h.ref.mu.Lock()
@@ -840,6 +940,43 @@ func (m *Manager) shouldPersistHealth() bool {
 	m.dbMu.Lock()
 	defer m.dbMu.Unlock()
 	return m.db != nil
+}
+
+const (
+	dbEventMinInterval          = 5 * time.Second
+	healthRecomputeMinInterval  = 5 * time.Second
+)
+
+func (m *Manager) throttleDBEvent(e *entry) bool {
+	if m == nil || e == nil {
+		return false
+	}
+	nowUnix := time.Now().Unix()
+	prev := e.lastDBEventUnix.Load()
+	if prev != 0 && time.Unix(prev, 0).Add(dbEventMinInterval).After(time.Now()) {
+		return false
+	}
+	return e.lastDBEventUnix.CompareAndSwap(prev, nowUnix)
+}
+
+// scheduleHealthRecompute triggers a DB-based availability recompute (p95-5% threshold)
+// after real-traffic health events are persisted, so runtime Available reflects DB quickly.
+// It is throttled globally to avoid frequent full-table scans.
+func (m *Manager) scheduleHealthRecompute() {
+	if m == nil || !m.shouldPersistHealth() {
+		return
+	}
+	nowUnix := time.Now().Unix()
+	prev := m.lastHealthRecomputeUnix.Load()
+	if prev != 0 && time.Unix(prev, 0).Add(healthRecomputeMinInterval).After(time.Now()) {
+		return
+	}
+	if !m.lastHealthRecomputeUnix.CompareAndSwap(prev, nowUnix) {
+		return
+	}
+	go func() {
+		_ = m.applyHealthThresholdFromDB()
+	}()
 }
 
 // RefreshHealthFromDB applies DB-derived health threshold (24h success-rate) to runtime entries.
@@ -886,6 +1023,20 @@ func (m *Manager) applyHealthThresholdFromDB() error {
 		return err
 	}
 	if len(rows) == 0 {
+		// DB enabled but no 24h stats => mark all nodes unavailable so only DB path determines availability.
+		m.mu.RLock()
+		entries := make([]*entry, 0, len(m.nodes))
+		for _, e := range m.nodes {
+			entries = append(entries, e)
+		}
+		m.mu.RUnlock()
+
+		for _, e := range entries {
+			e.mu.Lock()
+			e.available = false
+			e.initialCheckDone = true
+			e.mu.Unlock()
+		}
 		return nil
 	}
 

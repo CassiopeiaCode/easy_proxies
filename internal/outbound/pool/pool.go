@@ -506,9 +506,16 @@ func (p *poolOutbound) recordSuccess(member *memberState) {
 }
 
 func (p *poolOutbound) wrapConn(conn net.Conn, member *memberState) net.Conn {
-	return &trackedConn{Conn: conn, release: func() {
+	wrapped := &trackedConn{Conn: conn, release: func() {
 		p.decActive(member)
 	}}
+	// Soft-failure: if a connection is established but we don't receive at least 1KB within 10s,
+	// record a failure for this member without interrupting the connection.
+	return newReadWatchConn(wrapped, 10*time.Second, 1024, func() {
+		if member != nil && member.shared != nil {
+			_, _, _ = member.shared.recordFailure(fmt.Errorf("no 1KB received within 10s"), p.options.FailureThreshold, p.options.BlacklistDuration)
+		}
+	})
 }
 
 func (p *poolOutbound) wrapPacketConn(conn net.PacketConn, member *memberState) net.PacketConn {
@@ -772,6 +779,71 @@ func (c *trackedConn) Close() error {
 	err := c.Conn.Close()
 	c.once.Do(c.release)
 	return err
+}
+
+type readWatchConn struct {
+	net.Conn
+	needBytes   int64
+	deadline    time.Duration
+	onTimeout   func()
+	readBytes   atomic.Int64
+	timeoutFired atomic.Bool
+	done        chan struct{}
+}
+
+func newReadWatchConn(conn net.Conn, deadline time.Duration, needBytes int64, onTimeout func()) net.Conn {
+	if conn == nil || deadline <= 0 || needBytes <= 0 || onTimeout == nil {
+		return conn
+	}
+	w := &readWatchConn{
+		Conn:     conn,
+		needBytes: needBytes,
+		deadline: deadline,
+		onTimeout: onTimeout,
+		done:     make(chan struct{}),
+	}
+	go w.watch()
+	return w
+}
+
+func (w *readWatchConn) watch() {
+	timer := time.NewTimer(w.deadline)
+	defer timer.Stop()
+
+	select {
+	case <-w.done:
+		return
+	case <-timer.C:
+		if w.timeoutFired.CompareAndSwap(false, true) && w.readBytes.Load() < w.needBytes {
+			w.onTimeout()
+		}
+		return
+	}
+}
+
+func (w *readWatchConn) Read(p []byte) (int, error) {
+	n, err := w.Conn.Read(p)
+	if n > 0 {
+		total := w.readBytes.Add(int64(n))
+		if total >= w.needBytes {
+			// Cancel watchdog early once we've seen enough bytes.
+			select {
+			case <-w.done:
+			default:
+				close(w.done)
+			}
+		}
+	}
+	return n, err
+}
+
+func (w *readWatchConn) Close() error {
+	select {
+	case <-w.done:
+	default:
+		close(w.done)
+	}
+	return w.Conn.Close()
 }
 
 type trackedPacketConn struct {

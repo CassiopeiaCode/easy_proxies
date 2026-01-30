@@ -52,19 +52,27 @@
 
 当前实现行为：
 - 健康检查结果按“小时”聚合落库：新增 `node_health_hourly` 表，按 UTC 小时累计 `success_count/fail_count/latency_sum_ms/latency_count`。
-- 每轮周期性健康检查（monitor 侧 probe）会写入 DB 的 hourly 统计，并同步更新 nodes 表里的累计计数与 last_* 字段（用于展示/快速查询）。
+- 周期性健康检查（monitor 侧 probe）：
+  - 写入 DB 的 hourly 统计，并同步更新 nodes 表里的累计计数与 last_* 字段（用于展示/快速查询）。
+  - DB 启用时，不再由 probe 结果直接写入 `Available`，只更新 last_* 观测字段；`Available` 统一由 DB 阈值计算产出。
+- 真实连接（业务流量）健康事件入库（DB 启用时）：
+  - `RecordFailure/RecordSuccess/RecordSuccessWithLatency` 会（节流）写入 `node_health_hourly`，使真实连接的成功/失败也能影响 24h 成功率。
+  - 写入后会触发（节流的）DB 阈值重算，使运行态 `Available` 尽快收敛到最新 DB 统计口径。
 - 统计窗口为最近 24h：从 hourly 表聚合出每个节点的成功率（success / (success+fail)）。
 - 计算 p95 成功率并下调 5% 形成阈值：threshold = p95 - 0.05。
+- DB 启用时，`Available` 的唯一写入来源：p95-5% 阈值计算（无其它路径可覆写）。
+  - 若 DB 启用但近 24h 没有任何统计行，则所有节点视为不可调度（Available=false），避免沿用历史脏状态。
 - pool 调度过滤：仅允许 `InitialCheckDone=true 且 Available=true` 的节点进入候选集；`InitialCheckDone=false`（尚未完成初始检查/尚未应用 DB 阈值）也不会被调度，避免未检查节点承载真实流量。
+- 全量重算：DB 启用时，每 5 分钟强制全量重算全部节点的 `Available`（即使 probe 间隔更长或真实流量触发被节流）。
 - 自动清理：`node_health_hourly` 表自动删除 7 天前的历史聚合数据。
 
 涉及模块：
 - internal/database/db.go：新增 `node_health_hourly` 表；写入聚合统计；提供 24h 成功率聚合查询接口；提供历史数据清理接口。
-- internal/monitor/manager.go：周期性 probe 结果写库；按 24h 成功率计算 p95-5% 阈值并更新节点 Available；定时清理 7 天前统计数据。
-- internal/outbound/pool/pool.go：调度时读取 monitor 的 Available/InitialCheckDone 进行过滤。
+- internal/monitor/manager.go：周期性 probe 结果写库；真实连接健康事件写库；按 24h 成功率计算 p95-5% 阈值并更新节点 Available；每 5 分钟全量重算；定时清理 7 天前统计数据。
+- internal/outbound/pool/pool.go：调度时读取 monitor 的 Available/InitialCheckDone 进行过滤；新增“连接建立后 10 秒内累计未收到 1KB 数据则记一次失败（不影响连接）”的软失败逻辑。
 
 注意：
-- 成功率统计与阈值过滤依赖从 URI 提取 host:port；若某类 URI 无法提取 host:port，则不会参与 hourly 统计与阈值过滤（保持原先可用性语义）。
+- 成功率统计与阈值过滤依赖从 URI 提取 host:port；若某类 URI 无法提取 host:port，则不会参与 hourly 统计与阈值过滤。
 
 ### 5. 探测目标 URL/HTTPS + 自定义状态码验证（已实现）
 
@@ -124,4 +132,6 @@
 ## 关键语义：damaged vs health
 
 - damaged：持久化状态（DB），用于“导入/重载阶段”剔除明显错误/不应被加载的节点；damaged 的变动应伴随 sing-box 重载/构建发生。
-- health（健康度）：基于最近 24h 成功率（p95-5% 阈值）判断节点是否“可调度”；调度层不再使用运行时 blacklist 概念，运行时失败只会进入健康统计（hourly 聚合）并在后续周期性 probe 后影响可调度性。
+- health（健康度）：基于最近 24h 成功率（p95-5% 阈值）判断节点是否“可调度”。
+  - DB 启用时，`Available` 只由 DB 阈值计算写入（p95-5%）；启动初检/手动标记/probe 即时结果不会覆写可调度性口径。
+  - 运行时失败不仅来源于周期性 probe，也包括真实连接的成功/失败事件（节流入库），从而让业务流量能反馈到健康统计与可调度性。
