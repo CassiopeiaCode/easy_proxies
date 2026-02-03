@@ -3,7 +3,6 @@ package subscription
 import (
 	"context"
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -458,7 +457,7 @@ func (m *Manager) fetchSubscription(subURL string, timeout time.Duration) ([]con
 		return nil, fmt.Errorf("read body: %w", err)
 	}
 
-	return parseSubscriptionContent(string(body))
+	return config.ParseSubscriptionContent(string(body))
 }
 
 // createNewConfig creates a new config with updated nodes while preserving other settings.
@@ -504,63 +503,30 @@ func (m *Manager) createNewConfig(nodes []config.NodeConfig) *config.Config {
 	return &newCfg
 }
 
-// parseSubscriptionContent parses subscription content in various formats.
-// This is a simplified version - the full implementation is in config package.
-func parseSubscriptionContent(content string) ([]config.NodeConfig, error) {
-	content = strings.TrimSpace(content)
-
-	// Check if it's base64 encoded
-	if isBase64(content) {
-		decoded, err := base64.StdEncoding.DecodeString(content)
-		if err != nil {
-			decoded, err = base64.RawStdEncoding.DecodeString(content)
-			if err != nil {
-				return parseNodesFromContent(content)
-			}
-		}
-		content = string(decoded)
-	}
-
-	// Parse as plain text (one URI per line)
-	return parseNodesFromContent(content)
-}
-
-func isBase64(s string) bool {
-	s = strings.TrimSpace(s)
-	if len(s) == 0 {
-		return false
-	}
-	s = strings.ReplaceAll(s, "\n", "")
-	s = strings.ReplaceAll(s, "\r", "")
-	if strings.Contains(s, "://") {
-		return false
-	}
-	_, err := base64.StdEncoding.DecodeString(s)
-	if err != nil {
-		_, err = base64.RawStdEncoding.DecodeString(s)
-	}
-	return err == nil
-}
-
-func parseNodesFromContent(content string) ([]config.NodeConfig, error) {
-	var nodes []config.NodeConfig
-	lines := strings.Split(content, "\n")
-
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		if isProxyURI(line) {
-			nodes = append(nodes, config.NodeConfig{URI: line})
-		}
-	}
-	return nodes, nil
-}
-
+// isProxyURI is used for nodes.txt modification detection (fast parsing path).
+// Keep it in sync with config's supported schemes so "NodesModified" UI hint is accurate.
 func isProxyURI(s string) bool {
-	schemes := []string{"vmess://", "vless://", "trojan://", "ss://", "ssr://", "hysteria://", "hysteria2://", "hy2://"}
-	lower := strings.ToLower(s)
+	schemes := []string{
+		"vmess://",
+		"vless://",
+		"trojan://",
+		"ss://",
+		"ssr://",
+		"hysteria://",
+		"hysteria2://",
+		"hy2://",
+		"socks://",
+		"socks5://",
+		"socks4://",
+		"socks4a://",
+		"http://",
+		"https://",
+	}
+	lower := strings.ToLower(strings.TrimSpace(s))
+	// Support "URI 备注..." lines: only look at the first token.
+	if fields := strings.Fields(lower); len(fields) > 0 {
+		lower = fields[0]
+	}
 	for _, scheme := range schemes {
 		if strings.HasPrefix(lower, scheme) {
 			return true

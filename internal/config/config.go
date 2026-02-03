@@ -558,11 +558,12 @@ func loadNodesFromSubscription(subURL string, timeout time.Duration) ([]NodeConf
 	content := string(body)
 
 	// Try to detect and parse different formats
-	return parseSubscriptionContent(content)
+	return ParseSubscriptionContent(content)
 }
 
-// parseSubscriptionContent tries to parse subscription content in various formats
-func parseSubscriptionContent(content string) ([]NodeConfig, error) {
+// ParseSubscriptionContent tries to parse subscription content in various formats.
+// It is the shared implementation used by both startup-load and runtime subscription refresh.
+func ParseSubscriptionContent(content string) ([]NodeConfig, error) {
 	content = strings.TrimSpace(content)
 
 	// Check if it's base64 encoded (common for v2ray subscriptions)
