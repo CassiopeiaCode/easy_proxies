@@ -41,19 +41,20 @@
 - 订阅刷新异步去重入库：
   - SubscriptionManager 拉取订阅后先按 host:port upsert 入库去重；
   - 再从 DB 读取 active nodes 组装成新的运行时 nodes 并触发 reload；
-  - 同时把最终节点集合写回 `nodes.txt` 作为缓存/下次启动的数据源。
+  - 订阅内容解析与启动加载阶段统一：同一套完整解析逻辑（Base64 / Clash YAML / 纯文本逐行 URI）。
+  - 注意：本 fork 中 `nodes.txt` 为只读，订阅刷新不再写回 `nodes.txt`。
 
 涉及模块：
 - internal/app/app.go：启动时 upsert 导入 + 从 DB 加载 active nodes。
-- internal/config/config.go：nodes.txt 始终作为数据源；订阅仅作为运行时异步刷新，不在 Load 阶段拉取。
-- internal/subscription/manager.go：订阅刷新 upsert 去重入库 + 从 DB 读 active nodes reload + 写回 nodes.txt。
+- internal/config/config.go：订阅解析完整实现（Base64 / Clash YAML / 纯文本逐行 URI）。
+- internal/subscription/manager.go：订阅刷新复用 config 的订阅解析 + upsert 去重入库 + 从 DB 读 active nodes reload（不写 nodes.txt）。
 
 ### 4. 健康检查统计落库 + 24h 成功率阈值调度（已实现）
 
 目标：健康检查结果需要持久化，并用最近 24h 的成功率分布做“健康可调度”过滤：计算所有节点成功率的 p95，再取阈值 = p95 - 5%，只有成功率 >= (p95 - 5%) 的节点才可被调度。
 
 当前实现行为：
-- 健康检查结果按“小时”聚合落库：新增 `node_health_hourly` 表，按 UTC 小时累计 `success_count/fail_count/latency_sum_ms/latency_sum_ms/latency_count`。
+- 健康检查结果按“小时”聚合落库：新增 `node_health_hourly` 表，按 UTC 小时累计 `success_count/fail_count/latency_sum_ms/latency_count`。
 - 周期性健康检查（monitor 侧 probe）：
   - 每轮健康检查会随机打散节点探测顺序，避免固定顺序导致探测偏置与尾部节点长期延后。
   - 若新一轮健康检查到期启动时上一轮仍未结束，则强制取消上一轮并立即启动新一轮；已完成的节点探测结果不会丢失（逐节点写入内存状态与 DB hourly 聚合是边跑边落的）。
