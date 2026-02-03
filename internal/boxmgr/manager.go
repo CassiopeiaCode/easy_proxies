@@ -631,6 +631,23 @@ func (m *Manager) CreateNode(ctx context.Context, node config.NodeConfig) (confi
 		normalized.Source = config.NodeSourceInline
 	}
 
+	// Forced DB mode: persist node to DB as the primary store.
+	if m.cfg.Database.Enabled && strings.TrimSpace(m.cfg.Database.Path) != "" {
+		dbCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		db, err := database.Open(dbCtx, m.cfg.Database.Path)
+		cancel()
+		if err != nil {
+			return config.NodeConfig{}, fmt.Errorf("open database: %w", err)
+		}
+		upCtx, cancelUp := context.WithTimeout(context.Background(), 5*time.Second)
+		_, upErr := db.UpsertNodeByHostPort(upCtx, database.UpsertNodeInput{URI: normalized.URI, Name: normalized.Name})
+		cancelUp()
+		_ = db.Close()
+		if upErr != nil {
+			return config.NodeConfig{}, fmt.Errorf("upsert node to database: %w", upErr)
+		}
+	}
+
 	m.cfg.Nodes = append(m.cfg.Nodes, normalized)
 	if err := m.cfg.Save(); err != nil {
 		m.cfg.Nodes = m.cfg.Nodes[:len(m.cfg.Nodes)-1]
@@ -669,6 +686,33 @@ func (m *Manager) UpdateNode(ctx context.Context, name string, node config.NodeC
 	normalized.Source = m.cfg.Nodes[idx].Source
 
 	prev := m.cfg.Nodes[idx]
+
+	// Forced DB mode: update DB primary store first.
+	// If host:port changed, delete the old record and upsert the new one.
+	if m.cfg.Database.Enabled && strings.TrimSpace(m.cfg.Database.Path) != "" {
+		dbCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		db, err := database.Open(dbCtx, m.cfg.Database.Path)
+		cancel()
+		if err != nil {
+			return config.NodeConfig{}, fmt.Errorf("open database: %w", err)
+		}
+
+		// Best-effort delete old key if URI changed.
+		if strings.TrimSpace(prev.URI) != "" && strings.TrimSpace(prev.URI) != strings.TrimSpace(normalized.URI) {
+			delCtx, cancelDel := context.WithTimeout(context.Background(), 5*time.Second)
+			_ = db.DeleteNodeByURI(delCtx, prev.URI)
+			cancelDel()
+		}
+
+		upCtx, cancelUp := context.WithTimeout(context.Background(), 5*time.Second)
+		_, upErr := db.UpsertNodeByHostPort(upCtx, database.UpsertNodeInput{URI: normalized.URI, Name: normalized.Name})
+		cancelUp()
+		_ = db.Close()
+		if upErr != nil {
+			return config.NodeConfig{}, fmt.Errorf("upsert node to database: %w", upErr)
+		}
+	}
+
 	m.cfg.Nodes[idx] = normalized
 	if err := m.cfg.Save(); err != nil {
 		m.cfg.Nodes[idx] = prev
@@ -696,6 +740,25 @@ func (m *Manager) DeleteNode(ctx context.Context, name string) error {
 	idx := m.nodeIndexLocked(name)
 	if idx == -1 {
 		return monitor.ErrNodeNotFound
+	}
+
+	uriToDelete := m.cfg.Nodes[idx].URI
+
+	// Forced DB mode: delete from DB primary store.
+	if m.cfg.Database.Enabled && strings.TrimSpace(m.cfg.Database.Path) != "" && strings.TrimSpace(uriToDelete) != "" {
+		dbCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		db, err := database.Open(dbCtx, m.cfg.Database.Path)
+		cancel()
+		if err != nil {
+			return fmt.Errorf("open database: %w", err)
+		}
+		delCtx, cancelDel := context.WithTimeout(context.Background(), 5*time.Second)
+		delErr := db.DeleteNodeByURI(delCtx, uriToDelete)
+		cancelDel()
+		_ = db.Close()
+		if delErr != nil {
+			return fmt.Errorf("delete node from database: %w", delErr)
+		}
 	}
 
 	backup := cloneNodes(m.cfg.Nodes)

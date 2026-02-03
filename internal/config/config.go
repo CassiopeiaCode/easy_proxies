@@ -1,6 +1,7 @@
 package config
 
 import (
+	"context"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"easy_proxies/internal/database"
 	"easy_proxies/internal/logx"
 
 	"gopkg.in/yaml.v3"
@@ -188,6 +190,10 @@ func (c *Config) normalize() error {
 		// Default db path next to config.yaml
 		c.Database.Path = filepath.Join(filepath.Dir(c.filePath), "easy_proxies.db")
 	}
+
+	// Force-enable database mode.
+	// This repo treats SQLite as the primary persistence layer; nodes.txt is read-only and must not be written.
+	c.Database.Enabled = true
 
 	// Subscription refresh defaults
 	if c.SubscriptionRefresh.Interval <= 0 {
@@ -928,14 +934,28 @@ func (c *Config) SaveNodes() error {
 		}
 	}
 
-	// Write file-based nodes to nodes.txt
-	if len(fileNodes) > 0 || c.NodesFile != "" {
-		nodesFilePath := c.NodesFile
-		if nodesFilePath == "" {
-			nodesFilePath = filepath.Join(filepath.Dir(c.filePath), "nodes.txt")
+	// In forced-DB mode: persist nodes to SQLite and never write nodes.txt.
+	if c.Database.Enabled && strings.TrimSpace(c.Database.Path) != "" {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		db, err := database.Open(ctx, c.Database.Path)
+		if err != nil {
+			return fmt.Errorf("open database: %w", err)
 		}
-		if err := writeNodesToFile(nodesFilePath, fileNodes); err != nil {
-			return fmt.Errorf("write nodes file %q: %w", nodesFilePath, err)
+		defer db.Close()
+
+		// Persist both inline/file nodes into DB (best-effort per node).
+		all := make([]NodeConfig, 0, len(inlineNodes)+len(fileNodes))
+		all = append(all, inlineNodes...)
+		all = append(all, fileNodes...)
+		for _, n := range all {
+			if _, upErr := db.UpsertNodeByHostPort(ctx, database.UpsertNodeInput{
+				URI:  n.URI,
+				Name: n.Name,
+			}); upErr != nil {
+				return fmt.Errorf("upsert node to database: %w", upErr)
+			}
 		}
 	}
 

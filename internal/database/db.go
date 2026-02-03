@@ -448,6 +448,36 @@ WHERE host = ? AND port = ?
 	return isDamaged != 0, nil
 }
 
+func (d *DB) DeleteNodeByHostPort(ctx context.Context, host string, port int) error {
+	if d == nil || d.sql == nil {
+		return errors.New("db not initialized")
+	}
+	host = strings.TrimSpace(host)
+	if host == "" || port <= 0 {
+		return errors.New("host/port invalid")
+	}
+	_, err := d.sql.ExecContext(ctx, `
+DELETE FROM nodes
+WHERE host = ? AND port = ?
+`, host, port)
+	if err != nil {
+		return fmt.Errorf("delete node: %w", err)
+	}
+	return nil
+}
+
+func (d *DB) DeleteNodeByURI(ctx context.Context, uri string) error {
+	uri = strings.TrimSpace(uri)
+	if uri == "" {
+		return errors.New("uri is empty")
+	}
+	host, port, _, err := HostPortFromURI(uri)
+	if err != nil {
+		return err
+	}
+	return d.DeleteNodeByHostPort(ctx, host, port)
+}
+
 type rowScanner interface {
 	Scan(dest ...any) error
 }

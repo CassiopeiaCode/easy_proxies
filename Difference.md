@@ -129,6 +129,23 @@
 - internal/monitor/manager.go：新增 ResetRuntime（保留 DB/Config，仅重置运行态）。
 - internal/boxmgr/manager.go：Reload 中调用 ResetRuntime，重载后重启 periodic health check。
 
+### 9. nodes.txt 只读 + 强制启用数据库（已实现）
+
+目标：
+- `nodes.txt` 只作为“可读的数据源/导入来源”，进程不再写入该文件（避免 WebUI/订阅刷新覆盖人工内容）。
+- 强制启用 SQLite DB：节点的增删改/订阅合并等持久化全部走 DB。
+
+当前实现行为：
+- 启动脚本将 `nodes.txt` 设置为只读（`chmod 444`），不再尝试给 `nodes.txt` `chmod 666`。
+- 配置加载阶段强制 `database.enabled=true`（并保留默认 `database.path`）。
+- WebUI 的节点 CRUD 保存不再写 `nodes.txt`：`SaveNodes()` 会把节点 upsert 到 DB。
+- 订阅刷新不再写回 `nodes.txt`（不再作为 cache），仅通过 DB 合并/去重后触发 reload。
+
+涉及模块：
+- start.sh：调整文件权限策略（config.yaml 可写、nodes.txt 只读）。
+- internal/config/config.go：normalize 强制启用 DB；SaveNodes 写 DB 而不是写 nodes.txt。
+- internal/subscription/manager.go：订阅刷新流程移除写 nodes.txt 的步骤。
+
 ## 关键语义：damaged vs health
 
 - damaged：持久化状态（DB），用于“导入/重载阶段”剔除明显错误/不应被加载的节点；damaged 的变动应伴随 sing-box 重载/构建发生。

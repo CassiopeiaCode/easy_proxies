@@ -229,7 +229,7 @@ func (m *Manager) doRefresh() {
 	// If DB is enabled, treat DB as the primary node store:
 	// - upsert nodes by host:port (dedup)
 	// - reload from DB active nodes
-	// nodes.txt is still written as a cache/data source.
+	// In this repo, nodes.txt is read-only and must not be written.
 	var merged []config.NodeConfig
 
 	if m.baseCfg != nil && m.baseCfg.Database.Enabled && strings.TrimSpace(m.baseCfg.Database.Path) != "" {
@@ -275,27 +275,12 @@ func (m *Manager) doRefresh() {
 		merged = nodes
 	}
 
-	// Write merged nodes to nodes.txt (cache + also acts as a data source on next startup)
-	nodesFilePath := m.getNodesFilePath()
-	if err := m.writeNodesToFile(nodesFilePath, merged); err != nil {
-		m.logger.Errorf("failed to write nodes.txt: %v", err)
-		m.mu.Lock()
-		m.status.LastError = fmt.Sprintf("write nodes.txt: %v", err)
-		m.status.LastRefresh = time.Now()
-		m.mu.Unlock()
-		return
-	}
-	m.logger.Infof("written %d nodes to %s", len(merged), nodesFilePath)
-
-	// Update hash and mod time after writing
+	// nodes.txt is read-only in this repo. Do not write any cache file.
+	// Still update hash/mod time so UI can show a stable "not modified" state.
 	newHash := m.computeNodesHash(merged)
 	m.mu.Lock()
 	m.lastSubHash = newHash
-	if info, err := os.Stat(nodesFilePath); err == nil {
-		m.lastNodesModTime = info.ModTime()
-	} else {
-		m.lastNodesModTime = time.Now()
-	}
+	m.lastNodesModTime = time.Now()
 	m.status.NodesModified = false
 	m.mu.Unlock()
 
