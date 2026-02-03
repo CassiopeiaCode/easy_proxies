@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/rand"
 	"net"
 	"net/url"
 	"runtime"
@@ -279,6 +280,10 @@ func (m *Manager) probeAllNodes(timeout time.Duration) {
 		}
 		return
 	}
+
+	// Randomize probe order each round to avoid fixed-order bias.
+	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+	rng.Shuffle(len(entries), func(i, j int) { entries[i], entries[j] = entries[j], entries[i] })
 
 	if m.logger != nil {
 		m.logger.Info("starting health check for ", len(entries), " nodes")
