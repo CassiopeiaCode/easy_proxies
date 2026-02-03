@@ -659,6 +659,8 @@ func isProxyURI(s string) bool {
 		"socks5://",
 		"socks4://",
 		"socks4a://",
+		"http://",
+		"https://",
 	}
 	for _, scheme := range schemes {
 		if strings.HasPrefix(strings.ToLower(s), scheme) {

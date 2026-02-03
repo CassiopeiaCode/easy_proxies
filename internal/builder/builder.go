@@ -311,9 +311,50 @@ func buildNodeOutbound(tag, rawURI string, skipCertVerify bool) (option.Outbound
 			return option.Outbound{}, err
 		}
 		return option.Outbound{Type: C.TypeSOCKS, Tag: tag, Options: &opts}, nil
+	case "http", "https":
+		opts, err := buildHTTPProxyOptions(parsed, skipCertVerify)
+		if err != nil {
+			return option.Outbound{}, err
+		}
+		return option.Outbound{Type: C.TypeHTTP, Tag: tag, Options: &opts}, nil
 	default:
 		return option.Outbound{}, fmt.Errorf("unsupported scheme %q", parsed.Scheme)
 	}
+}
+
+func buildHTTPProxyOptions(u *url.URL, skipCertVerify bool) (option.HTTPOutboundOptions, error) {
+	if u == nil {
+		return option.HTTPOutboundOptions{}, errors.New("nil uri")
+	}
+
+	server, port, err := hostPort(u, 8080)
+	if err != nil {
+		return option.HTTPOutboundOptions{}, err
+	}
+
+	opts := option.HTTPOutboundOptions{
+		ServerOptions: option.ServerOptions{Server: server, ServerPort: uint16(port)},
+	}
+
+	if u.User != nil {
+		opts.Username = u.User.Username()
+		if pw, ok := u.User.Password(); ok {
+			opts.Password = pw
+		}
+	}
+
+	// If scheme is https, enable outbound TLS.
+	if strings.EqualFold(u.Scheme, "https") {
+		opts.OutboundTLSOptionsContainer = option.OutboundTLSOptionsContainer{
+			TLS: &option.OutboundTLSOptions{
+				Enabled:    true,
+				ServerName: server,
+				Insecure:   skipCertVerify,
+			},
+		}
+	}
+
+	return opts, nil
 }
 
 func buildSOCKSOptions(u *url.URL) (option.SOCKSOutboundOptions, error) {
