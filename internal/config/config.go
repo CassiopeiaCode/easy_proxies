@@ -601,10 +601,16 @@ func parseNodesFromContent(content string) ([]NodeConfig, error) {
 			continue
 		}
 
+		// Allow "URI [extra description...]" format by taking the first token as the URI.
+		uri := line
+		if fields := strings.Fields(line); len(fields) > 0 {
+			uri = fields[0]
+		}
+
 		// Check if it's a valid proxy URI
-		if isProxyURI(line) {
+		if isProxyURI(uri) {
 			nodes = append(nodes, NodeConfig{
-				URI: line,
+				URI: uri,
 			})
 		}
 	}
@@ -640,7 +646,20 @@ func isBase64(s string) bool {
 
 // isProxyURI checks if a string is a valid proxy URI
 func isProxyURI(s string) bool {
-	schemes := []string{"vmess://", "vless://", "trojan://", "ss://", "ssr://", "hysteria://", "hysteria2://", "hy2://"}
+	schemes := []string{
+		"vmess://",
+		"vless://",
+		"trojan://",
+		"ss://",
+		"ssr://",
+		"hysteria://",
+		"hysteria2://",
+		"hy2://",
+		"socks://",
+		"socks5://",
+		"socks4://",
+		"socks4a://",
+	}
 	for _, scheme := range schemes {
 		if strings.HasPrefix(strings.ToLower(s), scheme) {
 			return true

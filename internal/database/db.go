@@ -567,6 +567,11 @@ func HostPortFromURI(raw string) (host string, port int, protocol string, err er
 		return "", 0, "", errors.New("uri empty")
 	}
 
+	// Allow "URI [extra description...]" format by taking the first token as the URI.
+	if fields := strings.Fields(raw); len(fields) > 0 {
+		raw = fields[0]
+	}
+
 	// Special-case: vmess base64-json (vmess://<base64(json)>)
 	// builder already supports this; DB must be able to extract host:port for dedup/tracking.
 	if strings.HasPrefix(strings.ToLower(raw), "vmess://") {
@@ -613,6 +618,8 @@ func HostPortFromURI(raw string) (host string, port int, protocol string, err er
 		switch protocol {
 		case "http":
 			port = 80
+		case "socks", "socks5", "socks4", "socks4a":
+			port = 1080
 		default:
 			port = 443
 		}

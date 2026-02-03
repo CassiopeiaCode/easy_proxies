@@ -305,9 +305,51 @@ func buildNodeOutbound(tag, rawURI string, skipCertVerify bool) (option.Outbound
 			return option.Outbound{}, err
 		}
 		return option.Outbound{Type: C.TypeVMess, Tag: tag, Options: &opts}, nil
+	case "socks", "socks5", "socks4", "socks4a":
+		opts, err := buildSOCKSOptions(parsed)
+		if err != nil {
+			return option.Outbound{}, err
+		}
+		return option.Outbound{Type: C.TypeSOCKS, Tag: tag, Options: &opts}, nil
 	default:
 		return option.Outbound{}, fmt.Errorf("unsupported scheme %q", parsed.Scheme)
 	}
+}
+
+func buildSOCKSOptions(u *url.URL) (option.SOCKSOutboundOptions, error) {
+	if u == nil {
+		return option.SOCKSOutboundOptions{}, errors.New("nil uri")
+	}
+
+	server, port, err := hostPort(u, 1080)
+	if err != nil {
+		return option.SOCKSOutboundOptions{}, err
+	}
+
+	version := "5"
+	switch strings.ToLower(u.Scheme) {
+	case "socks4":
+		version = "4"
+	case "socks4a":
+		version = "4a"
+	case "socks", "socks5":
+		version = "5"
+	}
+
+	opts := option.SOCKSOutboundOptions{
+		ServerOptions: option.ServerOptions{Server: server, ServerPort: uint16(port)},
+		Version:       version,
+		Network:       option.NetworkList(""),
+	}
+
+	if u.User != nil {
+		opts.Username = u.User.Username()
+		if pw, ok := u.User.Password(); ok {
+			opts.Password = pw
+		}
+	}
+
+	return opts, nil
 }
 
 // ValidateNodeURI checks whether a node URI can be converted into sing-box outbound options.

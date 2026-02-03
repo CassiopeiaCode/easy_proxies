@@ -33,6 +33,8 @@
 
 当前实现行为：
 - `nodes.txt` 始终作为数据源：配置加载阶段总会读取 `nodes_file`（默认 `nodes.txt`）；即使存在订阅，也不会忽略本地 nodes.txt。
+  - 支持 `socks://` / `socks5://` / `socks4://` / `socks4a://` 节点 URI。
+  - 兼容 “`URI 备注...`” 行格式：会取每行第一个 token 作为 URI，其余内容忽略（便于保留地区/来源描述）。
 - 启动阶段 DB 导入 + DB 加载：
   - 若启用 database，则会 best-effort 将当前 `cfg.Nodes`（包含 inline + nodes.txt）按 host:port upsert 入库；
   - 随后从 DB `nodes` 表加载 `is_damaged=0` 的 active nodes 作为运行时节点列表（DB 成为主数据源）。
