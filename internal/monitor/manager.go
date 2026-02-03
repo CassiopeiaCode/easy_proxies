@@ -126,6 +126,15 @@ type Manager struct {
 	cancel context.CancelFunc
 	logger Logger
 
+	// Periodic health-check rounds:
+	// If a new round starts while the previous one is still running, we cancel the previous round
+	// and start the new one. Partial results already recorded are preserved (per-node updates happen
+	// as probes complete).
+	probeRoundMu       sync.Mutex
+	probeRoundCancel   context.CancelFunc
+	probeRoundActiveID int64
+	probeRoundID       atomic.Int64
+
 	// throttle health recompute triggered by real traffic.
 	lastHealthRecomputeUnix atomic.Int64
 
@@ -195,8 +204,8 @@ func (m *Manager) StartPeriodicHealthCheck(interval, timeout time.Duration) {
 	}
 
 	go func() {
-		// 启动后立即进行一次检查
-		m.probeAllNodes(timeout)
+		// 启动后立即进行一次检查（可抢占：新一轮会取消旧一轮）
+		m.startProbeAllNodes(timeout)
 
 		// 启动后做一次历史统计清理（仅清理健康检查 hourly 聚合表，保留最近 7 天）
 		m.cleanupOldHealthStats()
@@ -217,7 +226,8 @@ func (m *Manager) StartPeriodicHealthCheck(interval, timeout time.Duration) {
 			case <-m.ctx.Done():
 				return
 			case <-ticker.C:
-				m.probeAllNodes(timeout)
+				// Do not queue up; cancel the previous round and start a new one.
+				m.startProbeAllNodes(timeout)
 			case <-recomputeTicker.C:
 				if m.shouldPersistHealth() {
 					if err := m.applyHealthThresholdFromDB(); err != nil && m.logger != nil {
@@ -233,6 +243,36 @@ func (m *Manager) StartPeriodicHealthCheck(interval, timeout time.Duration) {
 	if m.logger != nil {
 		m.logger.Info("periodic health check started, interval: ", interval)
 	}
+}
+
+func (m *Manager) startProbeAllNodes(timeout time.Duration) {
+	if m == nil {
+		return
+	}
+
+	// Each call starts a new round; cancel the previous one (if still running).
+	roundID := m.probeRoundID.Add(1)
+
+	m.probeRoundMu.Lock()
+	if m.probeRoundCancel != nil {
+		m.probeRoundCancel()
+	}
+	roundCtx, cancel := context.WithCancel(m.ctx)
+	m.probeRoundCancel = cancel
+	m.probeRoundActiveID = roundID
+	m.probeRoundMu.Unlock()
+
+	go func(id int64) {
+		defer func() {
+			m.probeRoundMu.Lock()
+			if m.probeRoundActiveID == id {
+				m.probeRoundCancel = nil
+				m.probeRoundActiveID = 0
+			}
+			m.probeRoundMu.Unlock()
+		}()
+		m.probeAllNodes(roundCtx, timeout)
+	}(roundID)
 }
 
 func (m *Manager) cleanupOldHealthStats() {
@@ -266,7 +306,7 @@ func (m *Manager) cleanupOldHealthStats() {
 }
 
 // probeAllNodes checks all registered nodes concurrently.
-func (m *Manager) probeAllNodes(timeout time.Duration) {
+func (m *Manager) probeAllNodes(roundCtx context.Context, timeout time.Duration) {
 	m.mu.RLock()
 	entries := make([]*entry, 0, len(m.nodes))
 	for _, e := range m.nodes {
@@ -315,7 +355,7 @@ func (m *Manager) probeAllNodes(timeout time.Duration) {
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			ctx, cancel := context.WithTimeout(m.ctx, timeout)
+			ctx, cancel := context.WithTimeout(roundCtx, timeout)
 			latency, err := probe(ctx)
 			cancel()
 
@@ -337,7 +377,7 @@ func (m *Manager) probeAllNodes(timeout time.Duration) {
 						Success:   err == nil,
 						LatencyMs: latencyMs,
 					}
-					saveCtx, cancelSave := context.WithTimeout(m.ctx, 3*time.Second)
+					saveCtx, cancelSave := context.WithTimeout(roundCtx, 3*time.Second)
 					_ = m.recordHealthCheck(saveCtx, u)
 					cancelSave()
 				}
@@ -372,6 +412,15 @@ func (m *Manager) probeAllNodes(timeout time.Duration) {
 	}
 	wg.Wait()
 
+	// If the round was cancelled (superseded by a new round / shutdown), do not apply final recompute/log.
+	// Partial per-node updates and DB hourly rows already recorded are preserved.
+	if roundCtx.Err() != nil {
+		if m.logger != nil {
+			m.logger.Warn("health check round cancelled: ", roundCtx.Err())
+		}
+		return
+	}
+
 	// After recording all probes, recompute the 24h success-rate threshold (p95 - 5%)
 	// and mark nodes as schedulable based on hourly stats. If DB isn't enabled, keep
 	// existing "available" semantics.
@@ -398,6 +447,15 @@ func (m *Manager) ResetRuntime() {
 		m.cancel()
 	}
 
+	// Also cancel the current probe round (if any).
+	m.probeRoundMu.Lock()
+	if m.probeRoundCancel != nil {
+		m.probeRoundCancel()
+		m.probeRoundCancel = nil
+		m.probeRoundActiveID = 0
+	}
+	m.probeRoundMu.Unlock()
+
 	// Create a fresh context for subsequent periodic checks / DB ops.
 	ctx, cancel := context.WithCancel(context.Background())
 	m.ctx = ctx
@@ -414,6 +472,15 @@ func (m *Manager) Stop() {
 	if m.cancel != nil {
 		m.cancel()
 	}
+
+	m.probeRoundMu.Lock()
+	if m.probeRoundCancel != nil {
+		m.probeRoundCancel()
+		m.probeRoundCancel = nil
+		m.probeRoundActiveID = 0
+	}
+	m.probeRoundMu.Unlock()
+
 	m.dbMu.Lock()
 	if m.db != nil {
 		_ = m.db.Close()
