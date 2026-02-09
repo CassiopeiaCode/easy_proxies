@@ -32,6 +32,7 @@ type Config struct {
 	MultiPort           MultiPortConfig           `yaml:"multi_port"`
 	Pool                PoolConfig                `yaml:"pool"`
 	Management          ManagementConfig          `yaml:"management"`
+	Sticky              StickyConfig              `yaml:"sticky"`
 	Database            DatabaseConfig            `yaml:"database"`
 	SubscriptionRefresh SubscriptionRefreshConfig `yaml:"subscription_refresh"`
 	Nodes               []NodeConfig              `yaml:"nodes"`
@@ -65,6 +66,16 @@ type MultiPortConfig struct {
 	BasePort uint16 `yaml:"base_port"`
 	Username string `yaml:"username"`
 	Password string `yaml:"password"`
+}
+
+type StickyConfig struct {
+	Enabled        bool          `yaml:"enabled"`
+	Address        string        `yaml:"address"`
+	Port           uint16        `yaml:"port"`
+	Username       string        `yaml:"username"`
+	Password       string        `yaml:"password"`
+	SwitchInterval time.Duration `yaml:"switch_interval"`
+	HistorySize    int           `yaml:"history_size"`
 }
 
 // ManagementConfig controls the monitoring HTTP endpoint.
@@ -178,6 +189,22 @@ func (c *Config) normalize() error {
 	}
 	if c.Management.Listen == "" {
 		c.Management.Listen = "127.0.0.1:9090"
+	}
+	if c.Sticky.Address == "" {
+		c.Sticky.Address = c.Listener.Address
+	}
+	if c.Sticky.Port == 0 {
+		c.Sticky.Port = c.Listener.Port + 1
+	}
+	if c.Sticky.Username == "" {
+		c.Sticky.Username = c.Listener.Username
+		c.Sticky.Password = c.Listener.Password
+	}
+	if c.Sticky.SwitchInterval <= 0 {
+		c.Sticky.SwitchInterval = 10 * time.Minute
+	}
+	if c.Sticky.HistorySize <= 0 {
+		c.Sticky.HistorySize = 100
 	}
 	if c.Management.ProbeTarget == "" {
 		c.Management.ProbeTarget = "www.apple.com:80"
@@ -323,25 +350,36 @@ func (c *Config) normalize() error {
 		c.LogLevel = "info"
 	}
 
-	// Auto-fix port conflicts in hybrid mode (pool port vs multi-port)
+	usedPorts := make(map[uint16]bool)
+	usedPorts[c.Listener.Port] = true
+	if c.Sticky.Enabled {
+		if c.Sticky.Port == c.Listener.Port {
+			c.Sticky.Port++
+		}
+		for usedPorts[c.Sticky.Port] || !isPortAvailable(c.Sticky.Address, c.Sticky.Port) {
+			c.Sticky.Port++
+			if c.Sticky.Port > 65535 {
+				return fmt.Errorf("no available sticky port")
+			}
+		}
+		usedPorts[c.Sticky.Port] = true
+	}
+
+	// Auto-fix port conflicts in hybrid mode (pool/sticky port vs multi-port)
 	if c.Mode == "hybrid" {
-		poolPort := c.Listener.Port
-		usedPorts := make(map[uint16]bool)
-		usedPorts[poolPort] = true
 		for idx := range c.Nodes {
 			usedPorts[c.Nodes[idx].Port] = true
 		}
 		for idx := range c.Nodes {
-			if c.Nodes[idx].Port == poolPort {
-				// Find next available port
+			if usedPorts[c.Nodes[idx].Port] && (c.Nodes[idx].Port == c.Listener.Port || (c.Sticky.Enabled && c.Nodes[idx].Port == c.Sticky.Port)) {
 				newPort := c.Nodes[idx].Port + 1
 				for usedPorts[newPort] || !isPortAvailable(c.MultiPort.Address, newPort) {
 					newPort++
 					if newPort > 65535 {
-						return fmt.Errorf("no available port for node %q after conflict with pool port %d", c.Nodes[idx].Name, poolPort)
+						return fmt.Errorf("no available port for node %q after conflict", c.Nodes[idx].Name)
 					}
 				}
-				logx.Printf("⚠️  Node %q port %d conflicts with pool port, reassigned to %d", c.Nodes[idx].Name, poolPort, newPort)
+				logx.Printf("⚠️  Node %q port %d conflicts, reassigned to %d", c.Nodes[idx].Name, c.Nodes[idx].Port, newPort)
 				usedPorts[newPort] = true
 				c.Nodes[idx].Port = newPort
 			}
@@ -400,6 +438,22 @@ func (c *Config) NormalizeWithPortMap(portMap map[string]uint16) error {
 	}
 	if c.Management.Listen == "" {
 		c.Management.Listen = "127.0.0.1:9090"
+	}
+	if c.Sticky.Address == "" {
+		c.Sticky.Address = c.Listener.Address
+	}
+	if c.Sticky.Port == 0 {
+		c.Sticky.Port = c.Listener.Port + 1
+	}
+	if c.Sticky.Username == "" {
+		c.Sticky.Username = c.Listener.Username
+		c.Sticky.Password = c.Listener.Password
+	}
+	if c.Sticky.SwitchInterval <= 0 {
+		c.Sticky.SwitchInterval = 10 * time.Minute
+	}
+	if c.Sticky.HistorySize <= 0 {
+		c.Sticky.HistorySize = 100
 	}
 	if c.Management.ProbeTarget == "" {
 		c.Management.ProbeTarget = "www.apple.com:80"

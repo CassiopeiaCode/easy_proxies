@@ -34,16 +34,19 @@ const (
 	modeSequential = "sequential"
 	modeRandom     = "random"
 	modeBalance    = "balance"
+	modeSticky     = "sticky"
 )
 
 // Options controls pool outbound behaviour.
 type Options struct {
-	Mode              string
-	Members           []string
-	FailureThreshold  int
-	BlacklistDuration time.Duration
-	Metadata          map[string]MemberMeta
-	ExpectedStatuses  []int
+	Mode                 string
+	Members              []string
+	FailureThreshold     int
+	BlacklistDuration    time.Duration
+	Metadata             map[string]MemberMeta
+	ExpectedStatuses     []int
+	StickySwitchInterval time.Duration
+	StickyHistorySize    int
 }
 
 // MemberMeta carries optional descriptive information for monitoring UI.
@@ -93,6 +96,11 @@ type poolOutbound struct {
 	rngMu          sync.Mutex // protects rng for random mode
 	monitor        *monitor.Manager
 	candidatesPool sync.Pool
+
+	stickyMu         sync.Mutex
+	stickyCurrent    *memberState
+	stickyLastSwitch time.Time
+	stickyHistory    []string
 }
 
 func newPool(ctx context.Context, _ adapter.Router, logger log.ContextLogger, tag string, options Options) (adapter.Outbound, error) {
@@ -188,8 +196,16 @@ func normalizeOptions(options Options) Options {
 		options.Mode = modeRandom
 	case modeBalance:
 		options.Mode = modeBalance
+	case modeSticky:
+		options.Mode = modeSticky
 	default:
 		options.Mode = modeSequential
+	}
+	if options.StickySwitchInterval <= 0 {
+		options.StickySwitchInterval = 5 * time.Minute
+	}
+	if options.StickyHistorySize <= 0 {
+		options.StickyHistorySize = 100
 	}
 	return options
 }
@@ -411,7 +427,12 @@ func (p *poolOutbound) pickMember(network string) (*memberState, error) {
 		return nil, E.New("no healthy proxy available")
 	}
 
-	member := p.selectMember(candidates)
+	var member *memberState
+	if p.mode == modeSticky {
+		member = p.selectStickyMember(candidates, now)
+	} else {
+		member = p.selectMember(candidates)
+	}
 	p.putCandidateBuffer(candidates)
 	return member, nil
 }
@@ -484,6 +505,77 @@ func (p *poolOutbound) selectMember(candidates []*memberState) *memberState {
 		idx := int(p.rrCounter.Add(1)-1) % len(candidates)
 		return candidates[idx]
 	}
+}
+
+func (p *poolOutbound) selectStickyMember(candidates []*memberState, now time.Time) *memberState {
+	p.stickyMu.Lock()
+	defer p.stickyMu.Unlock()
+
+	if p.stickyCurrent != nil {
+		for _, m := range candidates {
+			if m == p.stickyCurrent {
+				if now.Sub(p.stickyLastSwitch) < p.options.StickySwitchInterval {
+					return m
+				}
+				break
+			}
+		}
+	}
+
+	selected := p.pickStickyCandidateLocked(candidates)
+	p.stickyCurrent = selected
+	p.stickyLastSwitch = now
+	p.touchStickyHistoryLocked(selected.tag)
+	return selected
+}
+
+func (p *poolOutbound) pickStickyCandidateLocked(candidates []*memberState) *memberState {
+	inHistory := make(map[string]struct{}, len(p.stickyHistory))
+	for _, tag := range p.stickyHistory {
+		inHistory[tag] = struct{}{}
+	}
+
+	for _, member := range candidates {
+		if _, seen := inHistory[member.tag]; !seen {
+			return member
+		}
+	}
+
+	oldest := p.pickOldestHealthyFromHistoryLocked(candidates)
+	if oldest != nil {
+		return oldest
+	}
+	return candidates[0]
+}
+
+func (p *poolOutbound) pickOldestHealthyFromHistoryLocked(candidates []*memberState) *memberState {
+	candidateMap := make(map[string]*memberState, len(candidates))
+	for _, member := range candidates {
+		candidateMap[member.tag] = member
+	}
+	for _, tag := range p.stickyHistory {
+		if member, ok := candidateMap[tag]; ok {
+			return member
+		}
+	}
+	return nil
+}
+
+func (p *poolOutbound) touchStickyHistoryLocked(tag string) {
+	if tag == "" {
+		return
+	}
+	h := p.stickyHistory[:0]
+	for _, existing := range p.stickyHistory {
+		if existing != tag {
+			h = append(h, existing)
+		}
+	}
+	h = append(h, tag)
+	if len(h) > p.options.StickyHistorySize {
+		h = h[len(h)-p.options.StickyHistorySize:]
+	}
+	p.stickyHistory = h
 }
 
 func (p *poolOutbound) recordFailure(member *memberState, cause error) {

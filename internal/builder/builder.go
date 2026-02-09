@@ -141,8 +141,9 @@ func Build(cfg *config.Config) (option.Options, error) {
 	// Determine which components to enable based on mode
 	enablePoolInbound := cfg.Mode == "pool" || cfg.Mode == "hybrid"
 	enableMultiPort := cfg.Mode == "multi-port" || cfg.Mode == "hybrid"
+	enableSticky := cfg.Sticky.Enabled
 
-	if !enablePoolInbound && !enableMultiPort {
+	if !enablePoolInbound && !enableMultiPort && !enableSticky {
 		return option.Options{}, fmt.Errorf("unsupported mode %s", cfg.Mode)
 	}
 
@@ -171,6 +172,48 @@ func Build(cfg *config.Config) (option.Options, error) {
 			Options: &poolOptions,
 		})
 		route.Final = poolout.Tag
+	}
+
+	if enableSticky {
+		inbound, err := buildStickyInbound(cfg)
+		if err != nil {
+			return option.Options{}, err
+		}
+		inbounds = append(inbounds, inbound)
+		expected := cfg.Management.ProbeExpectedStatuses
+		if len(expected) == 0 && cfg.Management.ProbeExpectedStatus != 0 {
+			expected = []int{cfg.Management.ProbeExpectedStatus}
+		}
+		stickyOptions := poolout.Options{
+			Mode:                 "sticky",
+			Members:              memberTags,
+			FailureThreshold:     cfg.Pool.FailureThreshold,
+			BlacklistDuration:    cfg.Pool.BlacklistDuration,
+			Metadata:             metadata,
+			ExpectedStatuses:     expected,
+			StickySwitchInterval: cfg.Sticky.SwitchInterval,
+			StickyHistorySize:    cfg.Sticky.HistorySize,
+		}
+		stickyTag := "proxy-sticky"
+		outbounds = append(outbounds, option.Outbound{
+			Type:    poolout.Type,
+			Tag:     stickyTag,
+			Options: &stickyOptions,
+		})
+		route.Rules = append(route.Rules, option.Rule{
+			Type: C.RuleTypeDefault,
+			DefaultOptions: option.DefaultRule{
+				RawDefaultRule: option.RawDefaultRule{
+					Inbound: badoption.Listable[string]{"http-sticky-in"},
+				},
+				RuleAction: option.RuleAction{
+					Action: C.RuleActionTypeRoute,
+					RouteOptions: option.RouteActionOptions{
+						Outbound: stickyTag,
+					},
+				},
+			},
+		})
 	}
 
 	// Build multi-port inbounds (one port per node)
@@ -264,6 +307,31 @@ func buildPoolInbound(cfg *config.Config) (option.Inbound, error) {
 	inbound := option.Inbound{
 		Type:    C.TypeHTTP,
 		Tag:     "http-in",
+		Options: inboundOptions,
+	}
+	return inbound, nil
+}
+
+func buildStickyInbound(cfg *config.Config) (option.Inbound, error) {
+	listenAddr, err := parseAddr(cfg.Sticky.Address)
+	if err != nil {
+		return option.Inbound{}, fmt.Errorf("parse sticky listener address: %w", err)
+	}
+	inboundOptions := &option.HTTPMixedInboundOptions{
+		ListenOptions: option.ListenOptions{
+			Listen:     listenAddr,
+			ListenPort: cfg.Sticky.Port,
+		},
+	}
+	if cfg.Sticky.Username != "" {
+		inboundOptions.Users = []auth.User{{
+			Username: cfg.Sticky.Username,
+			Password: cfg.Sticky.Password,
+		}}
+	}
+	inbound := option.Inbound{
+		Type:    C.TypeHTTP,
+		Tag:     "http-sticky-in",
 		Options: inboundOptions,
 	}
 	return inbound, nil
@@ -1006,6 +1074,18 @@ func printProxyLinks(cfg *config.Config, metadata map[string]poolout.MemberMeta)
 		if showMultiPort {
 			logx.Println("")
 		}
+	}
+
+	if cfg.Sticky.Enabled {
+		var auth string
+		if cfg.Sticky.Username != "" {
+			auth = fmt.Sprintf("%s:%s@", cfg.Sticky.Username, cfg.Sticky.Password)
+		}
+		stickyURL := fmt.Sprintf("http://%s%s:%d", auth, cfg.Sticky.Address, cfg.Sticky.Port)
+		logx.Printf("🧷 Sticky Entry Point:")
+		logx.Printf("   %s", stickyURL)
+		logx.Printf("   rotate interval: %s, history size: %d", cfg.Sticky.SwitchInterval, cfg.Sticky.HistorySize)
+		logx.Println("")
 	}
 
 	if showMultiPort {

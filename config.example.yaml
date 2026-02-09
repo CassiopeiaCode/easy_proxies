@@ -1,4 +1,4 @@
-mode: pool  # pool 或 multi-port（也支持 multi_port）
+mode: pool  # pool 或 multi-port（也支持 multi_port）；sticky 通过 sticky.enabled 额外开启
 log_level: info
 skip_cert_verify: false  # 全局跳过 SSL 证书验证（默认 false）
 database:
@@ -25,6 +25,15 @@ multi_port:
   base_port: 24000
   username: mpuser
   password: mppass
+
+sticky:
+  enabled: true
+  address: 0.0.0.0
+  port: 2324
+  username: stickyuser
+  password: stickypass
+  switch_interval: 10m
+  history_size: 100
 
 # ═══════════════════════════════════════════════════════════════
 # 节点配置方式（三选一或混合使用）

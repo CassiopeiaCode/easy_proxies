@@ -151,6 +151,34 @@
 - internal/config/config.go：normalize 强制启用 DB；SaveNodes 写 DB 而不是写 nodes.txt。
 - internal/subscription/manager.go：订阅刷新流程移除写 nodes.txt 的步骤。
 
+### 10. 新增 Sticky 粘性代理入口（已实现）
+
+目标：
+- 新增一个独立端口的粘性代理入口（可配置地址/端口/认证）。
+- 同一时间窗口内固定使用一个出口节点，到达 `sticky.switch_interval` 后再轮换。
+- 若当前出口在窗口内提前变为不健康，则立即切换，不等待窗口到期。
+- 节点健康判断继续沿用现有规则，并且真实连接事件（成功/失败）继续计入 health 统计。
+- 切换策略使用长度为 100（可配置）的 deque：
+  - 优先选择“健康且不在 deque 中”的节点；
+  - 若健康节点都已在 deque 中，则选择 deque 中“最久未使用”的健康节点；
+  - 每次选中节点都会记录到 deque（去重后追加到队尾）。
+
+当前实现行为：
+- 配置新增 `sticky` 段（`enabled/address/port/username/password/switch_interval/history_size`），默认 `history_size=100`。
+- 在 `builder` 中新增独立入站 `http-sticky-in`，绑定 `sticky.port`，路由到独立的 `pool` outbound（`Mode=sticky`）。
+- `pool` outbound 新增 `sticky` 调度模式与历史 deque 策略：
+  - 窗口内优先复用当前 sticky 出口；
+  - 当前出口不健康或窗口到期时，按 deque 规则重选；
+  - 仍受现有健康过滤约束（`InitialCheckDone && Available`）。
+- Docker 相关暴露与 compose 注释同步补充 sticky 端口（默认 2324）。
+
+涉及模块：
+- internal/config/config.go：sticky 配置结构、默认值、端口冲突规避。
+- internal/builder/builder.go：sticky inbound/outbound 构建与路由、启动日志输出 sticky 入口。
+- internal/outbound/pool/pool.go：sticky 调度实现、deque 选择逻辑。
+- config.example.yaml：sticky 示例配置。
+- docker-compose.yml、Dockerfile：sticky 端口说明与暴露。
+
 ## 关键语义：damaged vs health
 
 - damaged：持久化状态（DB），用于“导入/重载阶段”剔除明显错误/不应被加载的节点；damaged 的变动应伴随 sing-box 重载/构建发生。
