@@ -5,6 +5,7 @@ easy_proxies
 easy_proxies-*
 *.exe
 
+.cache
 # Configuration (contains sensitive data)
 config.yaml
 nodes.txt

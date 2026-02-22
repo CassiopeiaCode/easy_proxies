@@ -14,15 +14,30 @@ import (
 	"strings"
 	"time"
 
-	"easy_proxies/internal/database"
 	"easy_proxies/internal/logx"
+	"easy_proxies/internal/store"
+	pebblestore "easy_proxies/internal/store/pebble"
 
 	"gopkg.in/yaml.v3"
 )
 
+// DatabaseConfig is kept for backward compatibility.
+// Historically this project used SQLite; during Pebble migration, we interpret
+// database.path as a store directory (or derive one from a legacy *.db path).
 type DatabaseConfig struct {
 	Enabled bool   `yaml:"enabled"`
 	Path    string `yaml:"path"`
+}
+
+// StoreConfig is the new persistence configuration.
+//
+// For backward compatibility:
+// - if store.dir is empty, database.path will be used.
+// - if database.path looks like a legacy SQLite file path (e.g. ends with .db),
+//   we will derive a Pebble directory next to it.
+type StoreConfig struct {
+	Type string `yaml:"type"` // currently only "pebble"
+	Dir  string `yaml:"dir"`
 }
 
 // Config describes the high level settings for the proxy pool server.
@@ -33,6 +48,12 @@ type Config struct {
 	Pool                PoolConfig                `yaml:"pool"`
 	Management          ManagementConfig          `yaml:"management"`
 	Sticky              StickyConfig              `yaml:"sticky"`
+
+	// Store is the primary persistence configuration (Pebble).
+	Store StoreConfig `yaml:"store"`
+
+	// Database is kept only for backward compatibility.
+	// During Pebble migration, database.path is used as a fallback to derive store.dir.
 	Database            DatabaseConfig            `yaml:"database"`
 	SubscriptionRefresh SubscriptionRefreshConfig `yaml:"subscription_refresh"`
 	Nodes               []NodeConfig              `yaml:"nodes"`
@@ -141,7 +162,13 @@ func Load(path string) (*Config, error) {
 		cfg.NodesFile = filepath.Join(configDir, cfg.NodesFile)
 	}
 
-	// Resolve database path relative to config file directory
+	// Resolve store dir relative to config file directory
+	if cfg.Store.Dir != "" && !filepath.IsAbs(cfg.Store.Dir) {
+		configDir := filepath.Dir(path)
+		cfg.Store.Dir = filepath.Join(configDir, cfg.Store.Dir)
+	}
+
+	// Resolve legacy database.path relative to config file directory (backward compatibility)
 	if cfg.Database.Path != "" && !filepath.IsAbs(cfg.Database.Path) {
 		configDir := filepath.Dir(path)
 		cfg.Database.Path = filepath.Join(configDir, cfg.Database.Path)
@@ -213,13 +240,38 @@ func (c *Config) normalize() error {
 		defaultEnabled := true
 		c.Management.Enabled = &defaultEnabled
 	}
-	if c.Database.Path == "" {
-		// Default db path next to config.yaml
-		c.Database.Path = filepath.Join(filepath.Dir(c.filePath), "easy_proxies.db")
+	// Default store type
+	if strings.TrimSpace(c.Store.Type) == "" {
+		c.Store.Type = "pebble"
+	}
+	c.Store.Type = strings.ToLower(strings.TrimSpace(c.Store.Type))
+	if c.Store.Type != "pebble" {
+		return fmt.Errorf("unsupported store.type %q (only 'pebble' is supported)", c.Store.Type)
 	}
 
-	// Force-enable database mode.
-	// This repo treats SQLite as the primary persistence layer; nodes.txt is read-only and must not be written.
+	// Backward compatibility: derive store dir.
+	// Priority:
+	// 1) store.dir
+	// 2) database.path (legacy)
+	// 3) default next to config.yaml
+	if strings.TrimSpace(c.Store.Dir) == "" {
+		legacy := strings.TrimSpace(c.Database.Path)
+		if legacy != "" {
+			// If legacy looks like a SQLite file path, derive a directory next to it.
+			lower := strings.ToLower(legacy)
+			if strings.HasSuffix(lower, ".db") {
+				base := strings.TrimSuffix(legacy, filepath.Ext(legacy))
+				c.Store.Dir = base + ".pebble"
+			} else {
+				c.Store.Dir = legacy
+			}
+		} else {
+			c.Store.Dir = filepath.Join(filepath.Dir(c.filePath), "easy_proxies.pebble")
+		}
+	}
+
+	// Force-enable persistence.
+	// After Pebble migration, store is always on and acts as the primary persistence layer.
 	c.Database.Enabled = true
 
 	// Subscription refresh defaults
@@ -1010,27 +1062,27 @@ func (c *Config) SaveNodes() error {
 		}
 	}
 
-	// In forced-DB mode: persist nodes to SQLite and never write nodes.txt.
-	if c.Database.Enabled && strings.TrimSpace(c.Database.Path) != "" {
+	// In forced-persistence mode: persist nodes into the Pebble store and never write nodes.txt.
+	if strings.TrimSpace(c.Store.Dir) != "" {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 
-		db, err := database.Open(ctx, c.Database.Path)
+		st, err := pebblestore.Open(ctx, pebblestore.Options{Dir: c.Store.Dir})
 		if err != nil {
-			return fmt.Errorf("open database: %w", err)
+			return fmt.Errorf("open store: %w", err)
 		}
-		defer db.Close()
+		defer st.Close()
 
-		// Persist both inline/file nodes into DB (best-effort per node).
+		// Persist both inline/file nodes into store (best-effort per node).
 		all := make([]NodeConfig, 0, len(inlineNodes)+len(fileNodes))
 		all = append(all, inlineNodes...)
 		all = append(all, fileNodes...)
 		for _, n := range all {
-			if _, upErr := db.UpsertNodeByHostPort(ctx, database.UpsertNodeInput{
+			if _, upErr := st.UpsertNodeByHostPort(ctx, store.UpsertNodeInput{
 				URI:  n.URI,
 				Name: n.Name,
 			}); upErr != nil {
-				return fmt.Errorf("upsert node to database: %w", upErr)
+				return fmt.Errorf("upsert node to store: %w", upErr)
 			}
 		}
 	}

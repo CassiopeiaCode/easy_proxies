@@ -15,9 +15,10 @@ import (
 
 	"easy_proxies/internal/builder"
 	"easy_proxies/internal/config"
-	"easy_proxies/internal/database"
 	"easy_proxies/internal/logx"
 	"easy_proxies/internal/monitor"
+	"easy_proxies/internal/store"
+	pebblestore "easy_proxies/internal/store/pebble"
 	"easy_proxies/internal/outbound/pool"
 
 	"github.com/sagernet/sing-box"
@@ -631,20 +632,20 @@ func (m *Manager) CreateNode(ctx context.Context, node config.NodeConfig) (confi
 		normalized.Source = config.NodeSourceInline
 	}
 
-	// Forced DB mode: persist node to DB as the primary store.
-	if m.cfg.Database.Enabled && strings.TrimSpace(m.cfg.Database.Path) != "" {
+	// Persist node into store (Pebble).
+	if strings.TrimSpace(m.cfg.Store.Dir) != "" {
 		dbCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		db, err := database.Open(dbCtx, m.cfg.Database.Path)
+		st, err := pebblestore.Open(dbCtx, pebblestore.Options{Dir: m.cfg.Store.Dir})
 		cancel()
 		if err != nil {
-			return config.NodeConfig{}, fmt.Errorf("open database: %w", err)
+			return config.NodeConfig{}, fmt.Errorf("open store: %w", err)
 		}
 		upCtx, cancelUp := context.WithTimeout(context.Background(), 5*time.Second)
-		_, upErr := db.UpsertNodeByHostPort(upCtx, database.UpsertNodeInput{URI: normalized.URI, Name: normalized.Name})
+		_, upErr := st.UpsertNodeByHostPort(upCtx, store.UpsertNodeInput{URI: normalized.URI, Name: normalized.Name})
 		cancelUp()
-		_ = db.Close()
+		_ = st.Close()
 		if upErr != nil {
-			return config.NodeConfig{}, fmt.Errorf("upsert node to database: %w", upErr)
+			return config.NodeConfig{}, fmt.Errorf("upsert node to store: %w", upErr)
 		}
 	}
 
@@ -687,29 +688,29 @@ func (m *Manager) UpdateNode(ctx context.Context, name string, node config.NodeC
 
 	prev := m.cfg.Nodes[idx]
 
-	// Forced DB mode: update DB primary store first.
+	// Persist updates into store (Pebble).
 	// If host:port changed, delete the old record and upsert the new one.
-	if m.cfg.Database.Enabled && strings.TrimSpace(m.cfg.Database.Path) != "" {
+	if strings.TrimSpace(m.cfg.Store.Dir) != "" {
 		dbCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		db, err := database.Open(dbCtx, m.cfg.Database.Path)
+		st, err := pebblestore.Open(dbCtx, pebblestore.Options{Dir: m.cfg.Store.Dir})
 		cancel()
 		if err != nil {
-			return config.NodeConfig{}, fmt.Errorf("open database: %w", err)
+			return config.NodeConfig{}, fmt.Errorf("open store: %w", err)
 		}
 
 		// Best-effort delete old key if URI changed.
 		if strings.TrimSpace(prev.URI) != "" && strings.TrimSpace(prev.URI) != strings.TrimSpace(normalized.URI) {
 			delCtx, cancelDel := context.WithTimeout(context.Background(), 5*time.Second)
-			_ = db.DeleteNodeByURI(delCtx, prev.URI)
+			_ = st.DeleteNodeByURI(delCtx, prev.URI)
 			cancelDel()
 		}
 
 		upCtx, cancelUp := context.WithTimeout(context.Background(), 5*time.Second)
-		_, upErr := db.UpsertNodeByHostPort(upCtx, database.UpsertNodeInput{URI: normalized.URI, Name: normalized.Name})
+		_, upErr := st.UpsertNodeByHostPort(upCtx, store.UpsertNodeInput{URI: normalized.URI, Name: normalized.Name})
 		cancelUp()
-		_ = db.Close()
+		_ = st.Close()
 		if upErr != nil {
-			return config.NodeConfig{}, fmt.Errorf("upsert node to database: %w", upErr)
+			return config.NodeConfig{}, fmt.Errorf("upsert node to store: %w", upErr)
 		}
 	}
 
@@ -744,20 +745,20 @@ func (m *Manager) DeleteNode(ctx context.Context, name string) error {
 
 	uriToDelete := m.cfg.Nodes[idx].URI
 
-	// Forced DB mode: delete from DB primary store.
-	if m.cfg.Database.Enabled && strings.TrimSpace(m.cfg.Database.Path) != "" && strings.TrimSpace(uriToDelete) != "" {
+	// Delete from store (Pebble).
+	if strings.TrimSpace(m.cfg.Store.Dir) != "" && strings.TrimSpace(uriToDelete) != "" {
 		dbCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		db, err := database.Open(dbCtx, m.cfg.Database.Path)
+		st, err := pebblestore.Open(dbCtx, pebblestore.Options{Dir: m.cfg.Store.Dir})
 		cancel()
 		if err != nil {
-			return fmt.Errorf("open database: %w", err)
+			return fmt.Errorf("open store: %w", err)
 		}
 		delCtx, cancelDel := context.WithTimeout(context.Background(), 5*time.Second)
-		delErr := db.DeleteNodeByURI(delCtx, uriToDelete)
+		delErr := st.DeleteNodeByURI(delCtx, uriToDelete)
 		cancelDel()
-		_ = db.Close()
+		_ = st.Close()
 		if delErr != nil {
-			return fmt.Errorf("delete node from database: %w", delErr)
+			return fmt.Errorf("delete node from store: %w", delErr)
 		}
 	}
 
@@ -991,7 +992,7 @@ func (m *Manager) tryMarkDamagedFromSingBoxInitError(cfg *config.Config, opts an
 	if cfg == nil || cause == nil {
 		return
 	}
-	if !cfg.Database.Enabled || strings.TrimSpace(cfg.Database.Path) == "" {
+	if strings.TrimSpace(cfg.Store.Dir) == "" {
 		return
 	}
 
@@ -1012,7 +1013,7 @@ func (m *Manager) tryMarkDamagedFromSingBoxInitError(cfg *config.Config, opts an
 		return
 	}
 
-	host, port, _, err := database.HostPortFromURI(rawURI)
+	host, port, _, err := store.HostPortFromURI(rawURI)
 	if err != nil || host == "" || port <= 0 {
 		return
 	}
@@ -1020,7 +1021,7 @@ func (m *Manager) tryMarkDamagedFromSingBoxInitError(cfg *config.Config, opts an
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
-	db, err := database.Open(ctx, cfg.Database.Path)
+	db, err := pebblestore.Open(ctx, pebblestore.Options{Dir: cfg.Store.Dir})
 	if err != nil {
 		return
 	}

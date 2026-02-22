@@ -5,6 +5,7 @@ go 1.24.1
 toolchain go1.24.4
 
 require (
+	github.com/cockroachdb/pebble v1.1.5
 	github.com/sagernet/sing v0.7.13
 	github.com/sagernet/sing-box v1.12.12
 	gopkg.in/yaml.v3 v3.0.1
@@ -12,23 +13,31 @@ require (
 
 require (
 	filippo.io/edwards25519 v1.1.0 // indirect
+	github.com/DataDog/zstd v1.4.5 // indirect
 	github.com/ajg/form v1.5.1 // indirect
 	github.com/akutz/memconn v0.1.0 // indirect
 	github.com/alexbrainman/sspi v0.0.0-20231016080023-1a75b4708caa // indirect
 	github.com/andybalholm/brotli v1.2.0 // indirect
 	github.com/anytls/sing-anytls v0.0.11 // indirect
+	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/bits-and-blooms/bitset v1.13.0 // indirect
 	github.com/caddyserver/certmagic v0.25.0 // indirect
 	github.com/caddyserver/zerossl v0.1.3 // indirect
+	github.com/cespare/xxhash/v2 v2.3.0 // indirect
+	github.com/cockroachdb/errors v1.11.3 // indirect
+	github.com/cockroachdb/fifo v0.0.0-20240606204812-0bbfbd93a7ce // indirect
+	github.com/cockroachdb/logtags v0.0.0-20230118201751-21c54148d20b // indirect
+	github.com/cockroachdb/redact v1.1.5 // indirect
+	github.com/cockroachdb/tokenbucket v0.0.0-20230807174530-cc333fc44b06 // indirect
 	github.com/coder/websocket v1.8.13 // indirect
 	github.com/coreos/go-iptables v0.7.1-0.20240112124308-65c67c9f46e6 // indirect
 	github.com/cretz/bine v0.2.0 // indirect
 	github.com/dblohm7/wingoes v0.0.0-20240119213807-a09d6be7affa // indirect
 	github.com/digitalocean/go-smbios v0.0.0-20180907143718-390a4f403a8e // indirect
-	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/fsnotify/fsnotify v1.9.0 // indirect
 	github.com/fxamacker/cbor/v2 v2.7.0 // indirect
 	github.com/gaissmai/bart v0.11.1 // indirect
+	github.com/getsentry/sentry-go v0.27.0 // indirect
 	github.com/go-chi/chi/v5 v5.2.3 // indirect
 	github.com/go-chi/render v1.0.3 // indirect
 	github.com/go-json-experiment/json v0.0.0-20250103232110-6a9a0fde9288 // indirect
@@ -37,7 +46,9 @@ require (
 	github.com/gobwas/pool v0.2.1 // indirect
 	github.com/godbus/dbus/v5 v5.1.1-0.20230522191255-76236955d466 // indirect
 	github.com/gofrs/uuid/v5 v5.4.0 // indirect
+	github.com/gogo/protobuf v1.3.2 // indirect
 	github.com/golang/groupcache v0.0.0-20210331224755-41bb18bfe9da // indirect
+	github.com/golang/snappy v0.0.4 // indirect
 	github.com/google/btree v1.1.3 // indirect
 	github.com/google/go-cmp v0.7.0 // indirect
 	github.com/google/nftables v0.2.1-0.20240414091927-5e242ec57806 // indirect
@@ -52,11 +63,12 @@ require (
 	github.com/klauspost/compress v1.18.1 // indirect
 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
 	github.com/kortschak/wol v0.0.0-20200729010619-da482cc4850a // indirect
+	github.com/kr/pretty v0.3.1 // indirect
+	github.com/kr/text v0.2.0 // indirect
 	github.com/libdns/alidns v1.0.5-libdns.v1.beta1 // indirect
 	github.com/libdns/cloudflare v0.2.2 // indirect
 	github.com/libdns/libdns v1.1.1 // indirect
 	github.com/logrusorgru/aurora v2.0.3+incompatible // indirect
-	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/mdlayher/genetlink v1.3.2 // indirect
 	github.com/mdlayher/netlink v1.8.0 // indirect
 	github.com/mdlayher/sdnotify v1.0.0 // indirect
@@ -66,11 +78,16 @@ require (
 	github.com/mholt/acmez/v3 v3.1.4 // indirect
 	github.com/miekg/dns v1.1.68 // indirect
 	github.com/mitchellh/go-ps v1.0.0 // indirect
-	github.com/ncruces/go-strftime v1.0.0 // indirect
+	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
 	github.com/pierrec/lz4/v4 v4.1.21 // indirect
+	github.com/pkg/errors v0.9.1 // indirect
 	github.com/prometheus-community/pro-bing v0.4.0 // indirect
+	github.com/prometheus/client_golang v1.19.1 // indirect
+	github.com/prometheus/client_model v0.6.1 // indirect
+	github.com/prometheus/common v0.55.0 // indirect
+	github.com/prometheus/procfs v0.15.1 // indirect
 	github.com/quic-go/qpack v0.5.1 // indirect
-	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
+	github.com/rogpeppe/go-internal v1.12.0 // indirect
 	github.com/safchain/ethtool v0.3.0 // indirect
 	github.com/sagernet/bbolt v0.0.0-20231014093535-ea5cb2fe9f0a // indirect
 	github.com/sagernet/cors v1.2.1 // indirect
@@ -123,8 +140,4 @@ require (
 	google.golang.org/grpc v1.73.0 // indirect
 	google.golang.org/protobuf v1.36.6 // indirect
 	lukechampine.com/blake3 v1.3.0 // indirect
-	modernc.org/libc v1.67.6 // indirect
-	modernc.org/mathutil v1.7.1 // indirect
-	modernc.org/memory v1.11.0 // indirect
-	modernc.org/sqlite v1.44.3 // indirect
 )

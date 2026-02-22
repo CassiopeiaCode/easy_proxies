@@ -16,7 +16,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"easy_proxies/internal/database"
+	"easy_proxies/internal/store"
+	pebblestore "easy_proxies/internal/store/pebble"
 
 	M "github.com/sagernet/sing/common/metadata"
 )
@@ -138,7 +139,7 @@ type Manager struct {
 	// throttle health recompute triggered by real traffic.
 	lastHealthRecomputeUnix atomic.Int64
 
-	db   *database.DB
+	db   store.Store
 	dbMu sync.Mutex
 }
 
@@ -173,12 +174,12 @@ func NewManager(cfg Config) (*Manager, error) {
 
 	if cfg.Database.Enabled && strings.TrimSpace(cfg.Database.Path) != "" {
 		openCtx, cancelOpen := context.WithTimeout(ctx, 5*time.Second)
-		db, err := database.Open(openCtx, cfg.Database.Path)
+		db, err := pebblestore.Open(openCtx, pebblestore.Options{Dir: cfg.Database.Path})
 		cancelOpen()
 		if err != nil {
 			// Best-effort: monitoring can still work without DB.
 			if m.logger != nil {
-				m.logger.Warn("open database failed, health persistence disabled: ", err)
+				m.logger.Warn("open store failed, health persistence disabled: ", err)
 			}
 		} else {
 			m.db = db
@@ -361,7 +362,7 @@ func (m *Manager) probeAllNodes(roundCtx context.Context, timeout time.Duration)
 
 			// Persist health check into DB (hourly aggregation) if enabled.
 			if m.shouldPersistHealth() {
-				host, port, _, hpErr := database.HostPortFromURI(info.URI)
+				host, port, _, hpErr := store.HostPortFromURI(info.URI)
 				if hpErr == nil && host != "" && port > 0 {
 					var latencyMs *int64
 					if err == nil {
@@ -371,7 +372,7 @@ func (m *Manager) probeAllNodes(roundCtx context.Context, timeout time.Duration)
 						}
 						latencyMs = &ms
 					}
-					u := database.HealthCheckUpdate{
+					u := store.HealthCheckUpdate{
 						Host:      host,
 						Port:      port,
 						Success:   err == nil,
@@ -767,9 +768,9 @@ func (e *entry) recordFailure(err error) {
 	e.mu.Unlock()
 
 	if mgr != nil && mgr.shouldPersistHealth() && mgr.throttleDBEvent(e) {
-		host, port, _, hpErr := database.HostPortFromURI(uri)
+		host, port, _, hpErr := store.HostPortFromURI(uri)
 		if hpErr == nil && host != "" && port > 0 {
-			u := database.HealthCheckUpdate{
+			u := store.HealthCheckUpdate{
 				Host:      host,
 				Port:      port,
 				Success:   false,
@@ -795,9 +796,9 @@ func (e *entry) recordSuccess() {
 	e.mu.Unlock()
 
 	if mgr != nil && mgr.shouldPersistHealth() && mgr.throttleDBEvent(e) {
-		host, port, _, hpErr := database.HostPortFromURI(uri)
+		host, port, _, hpErr := store.HostPortFromURI(uri)
 		if hpErr == nil && host != "" && port > 0 {
-			u := database.HealthCheckUpdate{
+			u := store.HealthCheckUpdate{
 				Host:      host,
 				Port:      port,
 				Success:   true,
@@ -828,10 +829,10 @@ func (e *entry) recordSuccessWithLatency(latency time.Duration) {
 	e.mu.Unlock()
 
 	if mgr != nil && mgr.shouldPersistHealth() && mgr.throttleDBEvent(e) {
-		host, port, _, hpErr := database.HostPortFromURI(uri)
+		host, port, _, hpErr := store.HostPortFromURI(uri)
 		if hpErr == nil && host != "" && port > 0 {
 			ms := latencyMs
-			u := database.HealthCheckUpdate{
+			u := store.HealthCheckUpdate{
 				Host:      host,
 				Port:      port,
 				Success:   true,
@@ -1064,7 +1065,7 @@ func (m *Manager) RefreshHealthFromDB() {
 	_ = m.applyHealthThresholdFromDB()
 }
 
-func (m *Manager) recordHealthCheck(ctx context.Context, u database.HealthCheckUpdate) error {
+func (m *Manager) recordHealthCheck(ctx context.Context, u store.HealthCheckUpdate) error {
 	m.dbMu.Lock()
 	db := m.db
 	m.dbMu.Unlock()
@@ -1138,7 +1139,7 @@ func (m *Manager) applyHealthThresholdFromDB() error {
 
 	for _, e := range entries {
 		e.mu.Lock()
-		host, port, _, hpErr := database.HostPortFromURI(e.info.URI)
+		host, port, _, hpErr := store.HostPortFromURI(e.info.URI)
 		if hpErr != nil || host == "" || port <= 0 {
 			// No host:port mapping => cannot join 24h stats => not schedulable.
 			e.available = false
@@ -1172,7 +1173,7 @@ func lookupRate(rows []nodeRate, host string, port int) float64 {
 	return -1
 }
 
-func dbInternalQueryRates(ctx context.Context, db *database.DB, cutoff time.Time) ([]nodeRate, error) {
+func dbInternalQueryRates(ctx context.Context, db store.Store, cutoff time.Time) ([]nodeRate, error) {
 	rates, err := db.QueryNodeRatesSince(ctx, cutoff)
 	if err != nil {
 		return nil, err

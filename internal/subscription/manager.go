@@ -16,9 +16,10 @@ import (
 
 	"easy_proxies/internal/boxmgr"
 	"easy_proxies/internal/config"
-	"easy_proxies/internal/database"
 	"easy_proxies/internal/logx"
 	"easy_proxies/internal/monitor"
+	"easy_proxies/internal/store"
+	pebblestore "easy_proxies/internal/store/pebble"
 )
 
 // Logger defines logging interface.
@@ -231,16 +232,16 @@ func (m *Manager) doRefresh() {
 	// In this repo, nodes.txt is read-only and must not be written.
 	var merged []config.NodeConfig
 
-	if m.baseCfg != nil && m.baseCfg.Database.Enabled && strings.TrimSpace(m.baseCfg.Database.Path) != "" {
+	if m.baseCfg != nil && strings.TrimSpace(m.baseCfg.Store.Dir) != "" {
 		openCtx, cancelOpen := context.WithTimeout(m.ctx, 5*time.Second)
-		db, dbErr := database.Open(openCtx, m.baseCfg.Database.Path)
+		st, stErr := pebblestore.Open(openCtx, pebblestore.Options{Dir: m.baseCfg.Store.Dir})
 		cancelOpen()
-		if dbErr != nil {
-			m.logger.Warnf("open database failed, fallback to nodes.txt only: %v", dbErr)
+		if stErr != nil {
+			m.logger.Warnf("open store failed, fallback to nodes.txt only: %v", stErr)
 		} else {
 			upCtx, cancelUp := context.WithTimeout(m.ctx, 15*time.Second)
 			for _, n := range nodes {
-				if _, upErr := db.UpsertNodeByHostPort(upCtx, database.UpsertNodeInput{
+				if _, upErr := st.UpsertNodeByHostPort(upCtx, store.UpsertNodeInput{
 					URI:  n.URI,
 					Name: n.Name,
 				}); upErr != nil {
@@ -251,12 +252,12 @@ func (m *Manager) doRefresh() {
 			cancelUp()
 
 			loadCtx, cancelLoad := context.WithTimeout(m.ctx, 5*time.Second)
-			active, listErr := db.ListActiveNodes(loadCtx)
+			active, listErr := st.ListActiveNodes(loadCtx)
 			cancelLoad()
-			_ = db.Close()
+			_ = st.Close()
 
 			if listErr != nil {
-				m.logger.Warnf("list active nodes from database failed, fallback to nodes.txt only: %v", listErr)
+				m.logger.Warnf("list active nodes from store failed, fallback to nodes.txt only: %v", listErr)
 			} else if len(active) > 0 {
 				merged = make([]config.NodeConfig, 0, len(active))
 				for _, n := range active {

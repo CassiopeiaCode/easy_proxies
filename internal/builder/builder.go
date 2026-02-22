@@ -13,8 +13,9 @@ import (
 	"time"
 
 	"easy_proxies/internal/config"
-	"easy_proxies/internal/database"
 	"easy_proxies/internal/logx"
+	"easy_proxies/internal/store"
+	pebblestore "easy_proxies/internal/store/pebble"
 	poolout "easy_proxies/internal/outbound/pool"
 
 	C "github.com/sagernet/sing-box/constant"
@@ -31,22 +32,22 @@ func Build(cfg *config.Config) (option.Options, error) {
 	var failedNodes []string
 	usedTags := make(map[string]int) // Track tag usage for uniqueness
 
-	// Best-effort: when database is enabled:
+	// Best-effort: when store is enabled:
 	// - skip nodes already marked as damaged (so they will not be built into sing-box)
 	// - mark "build-time" invalid nodes as damaged
-	var db *database.DB
-	if cfg != nil && cfg.Database.Enabled && strings.TrimSpace(cfg.Database.Path) != "" {
+	var st store.Store
+	if cfg != nil && strings.TrimSpace(cfg.Store.Dir) != "" {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		var err error
-		db, err = database.Open(ctx, cfg.Database.Path)
+		st, err = pebblestore.Open(ctx, pebblestore.Options{Dir: cfg.Store.Dir})
 		cancel()
 		if err != nil {
-			logx.Printf("⚠️  database open failed, damaged tracking disabled: %v", err)
-			db = nil
+			logx.Printf("⚠️  store open failed, damaged tracking disabled: %v", err)
+			st = nil
 		}
 	}
-	if db != nil {
-		defer db.Close()
+	if st != nil {
+		defer st.Close()
 	}
 
 	for _, node := range cfg.Nodes {
@@ -65,15 +66,15 @@ func Build(cfg *config.Config) (option.Options, error) {
 		}
 
 		// If already damaged, do not build into sing-box (damaged changes should accompany reload/import flows).
-		if db != nil {
-			if host, port, _, hpErr := database.HostPortFromURI(node.URI); hpErr == nil && host != "" && port > 0 {
+		if st != nil {
+			if host, port, _, hpErr := store.HostPortFromURI(node.URI); hpErr == nil && host != "" && port > 0 {
 				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-				damaged, dErr := db.IsNodeDamaged(ctx, host, port)
+				damaged, dErr := st.IsNodeDamaged(ctx, host, port)
 				cancel()
 				if dErr != nil {
 					logx.Printf("⚠️  query damaged failed for %s:%d: %v (continue building)", host, port, dErr)
 				} else if damaged {
-					logx.Printf("⚠️  node '%s' is marked damaged in DB, skipping build", node.Name)
+					logx.Printf("⚠️  node '%s' is marked damaged in store, skipping build", node.Name)
 					failedNodes = append(failedNodes, node.Name)
 					continue
 				}
@@ -86,10 +87,10 @@ func Build(cfg *config.Config) (option.Options, error) {
 			failedNodes = append(failedNodes, node.Name)
 
 			// Build-time invalid: mark damaged (only when we can extract host:port).
-			if db != nil {
-				if host, port, _, hpErr := database.HostPortFromURI(node.URI); hpErr == nil && host != "" && port > 0 {
+			if st != nil {
+				if host, port, _, hpErr := store.HostPortFromURI(node.URI); hpErr == nil && host != "" && port > 0 {
 					ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-					if markErr := db.MarkNodeDamaged(ctx, host, port, err.Error()); markErr != nil {
+					if markErr := st.MarkNodeDamaged(ctx, host, port, err.Error()); markErr != nil {
 						logx.Printf("⚠️  mark damaged failed for %s:%d: %v", host, port, markErr)
 					}
 					cancel()
