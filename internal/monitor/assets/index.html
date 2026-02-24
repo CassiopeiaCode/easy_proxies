@@ -909,6 +909,7 @@
       <button class="tab active" onclick="switchTab('monitor')">📊 节点监控</button>
       <button class="tab" onclick="switchTab('manage')">⚙️ 节点管理</button>
       <button class="tab" onclick="switchTab('debug')">🐞 调试面板</button>
+      <button class="tab" onclick="switchTab('pebble')">🪨 Pebble 节点</button>
     </div>
 
     <!-- 监控页面 -->
@@ -1051,6 +1052,29 @@
         <p>节点使用后将显示统计信息</p>
       </div>
     </div><!-- end debugTab -->
+
+    <!-- Pebble 全量节点 -->
+    <div id="pebbleTab" class="tab-content">
+      <div class="manage-header">
+        <h2>Pebble 全量节点</h2>
+        <p class="manage-desc">显示数据库中的全部节点（包含 damaged 节点）</p>
+      </div>
+
+      <div class="manage-actions">
+        <button class="btn btn-primary" onclick="loadPebbleNodes()">
+          刷新 Pebble 列表
+        </button>
+      </div>
+
+      <div class="stat-card" style="margin-bottom: 16px;">
+        <div class="stat-label">总节点数</div>
+        <div class="stat-value" id="pebbleTotalNodes" style="font-size: 32px;">0</div>
+      </div>
+
+      <div class="stat-card">
+        <pre id="pebbleNodesText" style="white-space: pre-wrap; word-break: break-word; font-size: 13px; line-height: 1.6; font-family: \"SF Mono\", Menlo, Monaco, monospace;">正在加载...</pre>
+      </div>
+    </div><!-- end pebbleTab -->
   </div>
 
   <div id="toast" class="toast">
@@ -1748,6 +1772,67 @@
       }).join('');
     }
 
+    // ========== Pebble 节点面板 ==========
+
+    async function loadPebbleNodes() {
+      const textEl = document.getElementById('pebbleNodesText');
+      const totalEl = document.getElementById('pebbleTotalNodes');
+      if (!textEl || !totalEl) return;
+
+      textEl.textContent = '加载中...';
+      try {
+        const res = await fetch('/api/store/nodes');
+        if (res.status === 401) {
+          showToast('请先登录', 'error');
+          document.getElementById('loginOverlay').classList.add('show');
+          return;
+        }
+        const data = await res.json();
+        if (!res.ok) {
+          throw new Error(data.error || '加载失败');
+        }
+        const nodes = data.nodes || [];
+        totalEl.textContent = String(nodes.length);
+        renderPebbleNodes(nodes);
+      } catch (err) {
+        textEl.textContent = '加载失败: ' + err.message;
+      }
+    }
+
+    function renderPebbleNodes(nodes) {
+      const textEl = document.getElementById('pebbleNodesText');
+      if (!textEl) return;
+      if (!nodes || nodes.length === 0) {
+        textEl.textContent = 'Pebble 中暂无节点。';
+        return;
+      }
+
+      const lines = nodes.map((n, idx) => {
+        return [
+          `#${idx + 1}`,
+          `name=${n.name || '-'}`,
+          `host=${n.host || '-'}`,
+          `port=${n.port ?? '-'}`,
+          `protocol=${n.protocol || '-'}`,
+          `is_damaged=${n.is_damaged ? 'true' : 'false'}`,
+          `damage_reason=${n.damage_reason || '-'}`,
+          `health_check_count=${n.health_check_count ?? 0}`,
+          `health_check_success_count=${n.health_check_success_count ?? 0}`,
+          `failure_count=${n.failure_count ?? 0}`,
+          `last_latency_ms=${n.last_latency_ms ?? '-'}`,
+          `last_check_at=${n.last_check_at || '-'}`,
+          `last_success_at=${n.last_success_at || '-'}`,
+          `blacklisted_until=${n.blacklisted_until || '-'}`,
+          `updated_at=${n.updated_at || '-'}`,
+          `created_at=${n.created_at || '-'}`,
+          `uri=${n.uri || '-'}`,
+          ''
+        ].join('\n');
+      });
+
+      textEl.textContent = lines.join('\n');
+    }
+
     // ========== 系统设置功能 ==========
 
     function showSettingsModal() {
@@ -1823,6 +1908,8 @@
         loadConfigNodes();
       } else if (tabName === 'debug') {
         loadDebugData();
+      } else if (tabName === 'pebble') {
+        loadPebbleNodes();
       }
     }
 

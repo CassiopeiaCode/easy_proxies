@@ -87,6 +87,7 @@ func NewServer(cfg Config, mgr *Manager, logger *log.Logger) *Server {
 	mux.HandleFunc("/api/auth", s.handleAuth)
 	mux.HandleFunc("/api/settings", s.withAuth(s.handleSettings))
 	mux.HandleFunc("/api/nodes", s.withAuth(s.handleNodes))
+	mux.HandleFunc("/api/store/nodes", s.withAuth(s.handleStoreNodes))
 	mux.HandleFunc("/api/nodes/config", s.withAuth(s.handleConfigNodes))
 	mux.HandleFunc("/api/nodes/config/", s.withAuth(s.handleConfigNodeItem))
 	mux.HandleFunc("/api/nodes/probe-all", s.withAuth(s.handleProbeAll))
@@ -217,6 +218,57 @@ func (s *Server) handleNodes(w http.ResponseWriter, r *http.Request) {
 
 	payload := map[string]any{"nodes": nodes}
 	writeJSON(w, payload)
+}
+
+func (s *Server) handleStoreNodes(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	nodes, err := s.mgr.ListStoreNodes(r.Context())
+	if err != nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		writeJSON(w, map[string]any{"error": err.Error()})
+		return
+	}
+
+	result := make([]map[string]any, 0, len(nodes))
+	for _, n := range nodes {
+		row := map[string]any{
+			"id":                         n.ID,
+			"host":                       n.Host,
+			"port":                       n.Port,
+			"uri":                        n.URI,
+			"name":                       n.Name,
+			"protocol":                   n.Protocol,
+			"is_damaged":                 n.IsDamaged,
+			"damage_reason":              n.DamageReason,
+			"health_check_count":         n.HealthCheckCount,
+			"health_check_success_count": n.HealthCheckSuccessCount,
+			"failure_count":              n.FailureCount,
+			"created_at":                 n.CreatedAt,
+			"updated_at":                 n.UpdatedAt,
+		}
+		if n.LastCheckAt != nil {
+			row["last_check_at"] = *n.LastCheckAt
+		}
+		if n.LastSuccessAt != nil {
+			row["last_success_at"] = *n.LastSuccessAt
+		}
+		if n.LastLatencyMs != nil {
+			row["last_latency_ms"] = *n.LastLatencyMs
+		}
+		if n.BlacklistedUntil != nil {
+			row["blacklisted_until"] = *n.BlacklistedUntil
+		}
+		result = append(result, row)
+	}
+
+	writeJSON(w, map[string]any{
+		"count": len(result),
+		"nodes": result,
+	})
 }
 
 func (s *Server) handleDebug(w http.ResponseWriter, r *http.Request) {

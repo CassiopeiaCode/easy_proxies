@@ -1015,9 +1015,19 @@ func (m *Manager) shouldPersistHealth() bool {
 	return m.db != nil
 }
 
+func (m *Manager) ListStoreNodes(ctx context.Context) ([]store.Node, error) {
+	m.dbMu.Lock()
+	db := m.db
+	m.dbMu.Unlock()
+	if db == nil {
+		return nil, errors.New("store not available")
+	}
+	return db.ListNodes(ctx)
+}
+
 const (
-	dbEventMinInterval          = 5 * time.Second
-	healthRecomputeMinInterval  = 5 * time.Second
+	dbEventMinInterval         = 5 * time.Second
+	healthRecomputeMinInterval = 5 * time.Second
 )
 
 func (m *Manager) throttleDBEvent(e *entry) bool {

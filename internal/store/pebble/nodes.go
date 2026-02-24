@@ -158,6 +158,47 @@ func (d *DB) ListActiveNodes(ctx context.Context) ([]store.Node, error) {
 	return out, nil
 }
 
+func (d *DB) ListNodes(ctx context.Context) ([]store.Node, error) {
+	if d == nil || d.db == nil {
+		return nil, errors.New("pebble: db not initialized")
+	}
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+	}
+
+	iter, err := d.db.NewIter(&pebblepkg.IterOptions{
+		LowerBound: keyNodePrefixBytes(),
+		UpperBound: append([]byte(keyNodePrefix), 0xFF),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("pebble iter: %w", err)
+	}
+	defer iter.Close()
+
+	out := make([]store.Node, 0)
+	for iter.First(); iter.Valid(); iter.Next() {
+		if ctx != nil {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
+		n, uerr := unmarshalNode(iter.Value())
+		if uerr != nil {
+			continue
+		}
+		out = append(out, n)
+	}
+	if err := iter.Error(); err != nil {
+		return nil, fmt.Errorf("pebble iter nodes: %w", err)
+	}
+
+	// Stable output: most recently updated first.
+	sort.Slice(out, func(i, j int) bool { return out[i].UpdatedAt.After(out[j].UpdatedAt) })
+	return out, nil
+}
+
 func (d *DB) IsNodeDamaged(ctx context.Context, host string, port int) (bool, error) {
 	if d == nil || d.db == nil {
 		return false, errors.New("pebble: db not initialized")
@@ -211,12 +252,12 @@ func (d *DB) MarkNodeDamaged(ctx context.Context, host string, port int, reason 
 			// If the node wasn't inserted yet, create a minimal record.
 			now := time.Now().UTC()
 			n := store.Node{
-				Host:        host,
-				Port:        port,
-				IsDamaged:   true,
+				Host:         host,
+				Port:         port,
+				IsDamaged:    true,
 				DamageReason: reason,
-				CreatedAt:   now,
-				UpdatedAt:   now,
+				CreatedAt:    now,
+				UpdatedAt:    now,
 			}
 			b, merr := marshalNode(n)
 			if merr != nil {
