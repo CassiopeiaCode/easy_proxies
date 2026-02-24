@@ -1018,11 +1018,25 @@ func (m *Manager) shouldPersistHealth() bool {
 func (m *Manager) ListStoreNodes(ctx context.Context) ([]store.Node, error) {
 	m.dbMu.Lock()
 	db := m.db
+	dbPath := strings.TrimSpace(m.cfg.Database.Path)
 	m.dbMu.Unlock()
-	if db == nil {
+	if db != nil {
+		return db.ListNodes(ctx)
+	}
+	if dbPath == "" {
 		return nil, errors.New("store not available")
 	}
-	return db.ListNodes(ctx)
+
+	openCtx := ctx
+	if openCtx == nil {
+		openCtx = m.ctx
+	}
+	tmp, err := pebblestore.Open(openCtx, pebblestore.Options{Dir: dbPath})
+	if err != nil {
+		return nil, fmt.Errorf("open store: %w", err)
+	}
+	defer tmp.Close()
+	return tmp.ListNodes(ctx)
 }
 
 const (

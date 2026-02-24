@@ -25,7 +25,6 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	if err != nil {
 		return fmt.Errorf("open store: %w", err)
 	}
-	defer st.Close()
 
 	// Import nodes from config into store, then load active nodes as runtime node list.
 	importCtx, cancelImport := context.WithTimeout(ctx, 10*time.Second)
@@ -49,6 +48,9 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		cfg.Nodes = nodes
 		logx.Printf("✅ loaded %d active nodes from store", len(active))
 	}
+
+	// Release startup store handle before monitor manager opens the same Pebble dir.
+	_ = st.Close()
 
 	// Build monitor config
 	proxyUsername := cfg.Listener.Username
