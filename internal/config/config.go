@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -733,14 +734,8 @@ func parseNodesFromContentWithStats(content string) ([]NodeConfig, SubscriptionP
 			continue
 		}
 
-		// Allow "URI [extra description...]" format by taking the first token as the URI.
-		uri := line
-		if fields := strings.Fields(line); len(fields) > 0 {
-			uri = fields[0]
-		}
-
-		// Check if it's a valid proxy URI
-		if isProxyURI(uri) {
+		uri, ok := extractProxyURIFromLine(line)
+		if ok {
 			nodes = append(nodes, NodeConfig{
 				URI: uri,
 			})
@@ -751,6 +746,65 @@ func parseNodesFromContentWithStats(content string) ([]NodeConfig, SubscriptionP
 	}
 
 	return nodes, stats, nil
+}
+
+// extractProxyURIFromLine extracts a proxy URI from a free-form line.
+// Supports:
+// - plain "scheme://..."
+// - "scheme://... extra text"
+// - "Link: scheme://..."
+func extractProxyURIFromLine(line string) (string, bool) {
+	s := strings.TrimSpace(line)
+	if s == "" || strings.HasPrefix(s, "#") {
+		return "", false
+	}
+
+	// Fast path: URI is the first token.
+	if fields := strings.Fields(s); len(fields) > 0 {
+		if isProxyURI(fields[0]) {
+			return fields[0], true
+		}
+	}
+
+	// Fallback: find URI embedded inside the line (e.g. "Link: ss://...").
+	lower := strings.ToLower(s)
+	schemes := []string{
+		"vmess://",
+		"vless://",
+		"trojan://",
+		"ss://",
+		"ssr://",
+		"hysteria://",
+		"hysteria2://",
+		"hy2://",
+		"socks://",
+		"socks5://",
+		"socks4://",
+		"socks4a://",
+		"http://",
+		"https://",
+	}
+	start := -1
+	for _, scheme := range schemes {
+		if idx := strings.Index(lower, scheme); idx >= 0 && (start < 0 || idx < start) {
+			start = idx
+		}
+	}
+	if start < 0 {
+		return "", false
+	}
+
+	uri := s[start:]
+	if fields := strings.Fields(uri); len(fields) > 0 {
+		uri = fields[0]
+	}
+	uri = strings.Trim(uri, "\"'`>,.;，。")
+	uri = strings.TrimPrefix(uri, "(")
+	uri = strings.TrimSuffix(uri, ")")
+	if !isProxyURI(uri) {
+		return "", false
+	}
+	return uri, true
 }
 
 // isBase64 checks if a string looks like base64 encoded content
@@ -814,11 +868,11 @@ type clashProxy struct {
 	Name              string                 `yaml:"name"`
 	Type              string                 `yaml:"type"`
 	Server            string                 `yaml:"server"`
-	Port              int                    `yaml:"port"`
+	Port              intOrString            `yaml:"port"`
 	UUID              string                 `yaml:"uuid"`
 	Password          string                 `yaml:"password"`
 	Cipher            string                 `yaml:"cipher"`
-	AlterId           int                    `yaml:"alterId"`
+	AlterId           intOrString            `yaml:"alterId"`
 	Network           string                 `yaml:"network"`
 	TLS               bool                   `yaml:"tls"`
 	SkipCertVerify    bool                   `yaml:"skip-cert-verify"`
@@ -846,6 +900,31 @@ type clashGrpcOptions struct {
 type clashRealityOptions struct {
 	PublicKey string `yaml:"public-key"`
 	ShortID   string `yaml:"short-id"`
+}
+
+// intOrString accepts both YAML int and numeric string values (e.g. "443").
+type intOrString int
+
+func (i *intOrString) UnmarshalYAML(value *yaml.Node) error {
+	if value == nil {
+		*i = 0
+		return nil
+	}
+	raw := strings.TrimSpace(value.Value)
+	if raw == "" {
+		*i = 0
+		return nil
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		return fmt.Errorf("invalid numeric value %q: %w", raw, err)
+	}
+	*i = intOrString(n)
+	return nil
+}
+
+func (i intOrString) Int() int {
+	return int(i)
 }
 
 // parseClashYAML parses Clash YAML format and converts to NodeConfig
@@ -926,7 +1005,7 @@ func buildVMessURI(p clashProxy) string {
 		query = "?" + params.Encode()
 	}
 
-	return fmt.Sprintf("vmess://%s@%s:%d%s#%s", p.UUID, p.Server, p.Port, query, url.QueryEscape(p.Name))
+	return fmt.Sprintf("vmess://%s@%s:%d%s#%s", p.UUID, p.Server, p.Port.Int(), query, url.QueryEscape(p.Name))
 }
 
 func buildVLESSURI(p clashProxy) string {
@@ -974,7 +1053,7 @@ func buildVLESSURI(p clashProxy) string {
 		params.Set("fp", p.ClientFingerprint)
 	}
 
-	return fmt.Sprintf("vless://%s@%s:%d?%s#%s", p.UUID, p.Server, p.Port, params.Encode(), url.QueryEscape(p.Name))
+	return fmt.Sprintf("vless://%s@%s:%d?%s#%s", p.UUID, p.Server, p.Port.Int(), params.Encode(), url.QueryEscape(p.Name))
 }
 
 func buildTrojanURI(p clashProxy) string {
@@ -1007,13 +1086,13 @@ func buildTrojanURI(p clashProxy) string {
 		query = "?" + params.Encode()
 	}
 
-	return fmt.Sprintf("trojan://%s@%s:%d%s#%s", p.Password, p.Server, p.Port, query, url.QueryEscape(p.Name))
+	return fmt.Sprintf("trojan://%s@%s:%d%s#%s", p.Password, p.Server, p.Port.Int(), query, url.QueryEscape(p.Name))
 }
 
 func buildShadowsocksURI(p clashProxy) string {
 	// Encode method:password in base64
 	userInfo := base64.StdEncoding.EncodeToString([]byte(p.Cipher + ":" + p.Password))
-	return fmt.Sprintf("ss://%s@%s:%d#%s", userInfo, p.Server, p.Port, url.QueryEscape(p.Name))
+	return fmt.Sprintf("ss://%s@%s:%d#%s", userInfo, p.Server, p.Port.Int(), url.QueryEscape(p.Name))
 }
 
 func buildHysteria2URI(p clashProxy) string {
@@ -1032,7 +1111,7 @@ func buildHysteria2URI(p clashProxy) string {
 		query = "?" + params.Encode()
 	}
 
-	return fmt.Sprintf("hysteria2://%s@%s:%d%s#%s", p.Password, p.Server, p.Port, query, url.QueryEscape(p.Name))
+	return fmt.Sprintf("hysteria2://%s@%s:%d%s#%s", p.Password, p.Server, p.Port.Int(), query, url.QueryEscape(p.Name))
 }
 
 // FilePath returns the config file path.

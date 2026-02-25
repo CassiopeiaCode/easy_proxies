@@ -37,3 +37,6 @@ coverage.html
 
 # Qodo
 .qodo/
+
+# Local analysis scratch
+.tmp/
