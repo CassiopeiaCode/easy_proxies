@@ -413,12 +413,14 @@ func (m *Manager) fetchAllSubscriptions() ([]config.NodeConfig, error) {
 	}
 
 	for _, subURL := range m.baseCfg.Subscriptions {
-		nodes, err := m.fetchSubscription(subURL, timeout)
+		nodes, sizeBytes, errorNodes, err := m.fetchSubscription(subURL, timeout)
 		if err != nil {
+			m.logger.Warnf("sub_refresh_result url=%q size_bytes=%d parsed_nodes=%d error_nodes=%d err=%q", subURL, sizeBytes, 0, 0, err.Error())
 			m.logger.Warnf("failed to fetch %s: %v", subURL, err)
 			lastErr = err
 			continue
 		}
+		m.logger.Infof("sub_refresh_result url=%q size_bytes=%d parsed_nodes=%d error_nodes=%d", subURL, sizeBytes, len(nodes), errorNodes)
 		m.logger.Infof("fetched %d nodes from subscription", len(nodes))
 		allNodes = append(allNodes, nodes...)
 	}
@@ -431,13 +433,13 @@ func (m *Manager) fetchAllSubscriptions() ([]config.NodeConfig, error) {
 }
 
 // fetchSubscription fetches and parses a single subscription URL.
-func (m *Manager) fetchSubscription(subURL string, timeout time.Duration) ([]config.NodeConfig, error) {
+func (m *Manager) fetchSubscription(subURL string, timeout time.Duration) ([]config.NodeConfig, int, int, error) {
 	ctx, cancel := context.WithTimeout(m.ctx, timeout)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, "GET", subURL, nil)
 	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
+		return nil, 0, 0, fmt.Errorf("create request: %w", err)
 	}
 
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
@@ -445,20 +447,24 @@ func (m *Manager) fetchSubscription(subURL string, timeout time.Duration) ([]con
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("fetch: %w", err)
+		return nil, 0, 0, fmt.Errorf("fetch: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("status %d", resp.StatusCode)
+		return nil, 0, 0, fmt.Errorf("status %d", resp.StatusCode)
 	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("read body: %w", err)
+		return nil, 0, 0, fmt.Errorf("read body: %w", err)
 	}
 
-	return config.ParseSubscriptionContent(string(body))
+	nodes, stats, err := config.ParseSubscriptionContentWithStats(string(body))
+	if err != nil {
+		return nil, len(body), 0, err
+	}
+	return nodes, len(body), stats.ErrorNodes, nil
 }
 
 // createNewConfig creates a new config with updated nodes while preserving other settings.

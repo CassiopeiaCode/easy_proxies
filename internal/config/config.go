@@ -32,9 +32,9 @@ type DatabaseConfig struct {
 // StoreConfig is the new persistence configuration.
 //
 // For backward compatibility:
-// - if store.dir is empty, database.path will be used.
-// - if database.path looks like a legacy SQLite file path (e.g. ends with .db),
-//   we will derive a Pebble directory next to it.
+//   - if store.dir is empty, database.path will be used.
+//   - if database.path looks like a legacy SQLite file path (e.g. ends with .db),
+//     we will derive a Pebble directory next to it.
 type StoreConfig struct {
 	Type string `yaml:"type"` // currently only "pebble"
 	Dir  string `yaml:"dir"`
@@ -42,12 +42,12 @@ type StoreConfig struct {
 
 // Config describes the high level settings for the proxy pool server.
 type Config struct {
-	Mode                string                    `yaml:"mode"`
-	Listener            ListenerConfig            `yaml:"listener"`
-	MultiPort           MultiPortConfig           `yaml:"multi_port"`
-	Pool                PoolConfig                `yaml:"pool"`
-	Management          ManagementConfig          `yaml:"management"`
-	Sticky              StickyConfig              `yaml:"sticky"`
+	Mode       string           `yaml:"mode"`
+	Listener   ListenerConfig   `yaml:"listener"`
+	MultiPort  MultiPortConfig  `yaml:"multi_port"`
+	Pool       PoolConfig       `yaml:"pool"`
+	Management ManagementConfig `yaml:"management"`
+	Sticky     StickyConfig     `yaml:"sticky"`
 
 	// Store is the primary persistence configuration (Pebble).
 	Store StoreConfig `yaml:"store"`
@@ -59,7 +59,7 @@ type Config struct {
 	Nodes               []NodeConfig              `yaml:"nodes"`
 	NodesFile           string                    `yaml:"nodes_file"`    // 节点文件路径，每行一个 URI
 	Subscriptions       []string                  `yaml:"subscriptions"` // 订阅链接列表
-	ExternalIP          string                    `yaml:"external_ip"`      // 外部 IP 地址，用于导出时替换 0.0.0.0
+	ExternalIP          string                    `yaml:"external_ip"`   // 外部 IP 地址，用于导出时替换 0.0.0.0
 	LogLevel            string                    `yaml:"log_level"`
 	SkipCertVerify      bool                      `yaml:"skip_cert_verify"` // 全局跳过 SSL 证书验证
 
@@ -103,9 +103,9 @@ type StickyConfig struct {
 type ManagementConfig struct {
 	Enabled               *bool  `yaml:"enabled"`
 	Listen                string `yaml:"listen"`
-	ProbeTarget            string `yaml:"probe_target"`
-	ProbeExpectedStatus    int    `yaml:"probe_expected_status"`
-	ProbeExpectedStatuses  []int  `yaml:"probe_expected_statuses"`
+	ProbeTarget           string `yaml:"probe_target"`
+	ProbeExpectedStatus   int    `yaml:"probe_expected_status"`
+	ProbeExpectedStatuses []int  `yaml:"probe_expected_statuses"`
 	Password              string `yaml:"password"` // WebUI 访问密码，为空则不需要密码
 }
 
@@ -670,6 +670,21 @@ func loadNodesFromSubscription(subURL string, timeout time.Duration) ([]NodeConf
 // ParseSubscriptionContent tries to parse subscription content in various formats.
 // It is the shared implementation used by both startup-load and runtime subscription refresh.
 func ParseSubscriptionContent(content string) ([]NodeConfig, error) {
+	nodes, _, err := ParseSubscriptionContentWithStats(content)
+	return nodes, err
+}
+
+// SubscriptionParseStats describes parser-level counts for subscription content.
+type SubscriptionParseStats struct {
+	ParsedNodes int
+	ErrorNodes  int
+}
+
+// ParseSubscriptionContentWithStats parses subscription content and returns parser stats.
+// ParsedNodes is the number of accepted proxy nodes.
+// ErrorNodes is the number of candidate entries that were skipped as invalid/unsupported.
+func ParseSubscriptionContentWithStats(content string) ([]NodeConfig, SubscriptionParseStats, error) {
+	stats := SubscriptionParseStats{}
 	content = strings.TrimSpace(content)
 
 	// Check if it's base64 encoded (common for v2ray subscriptions)
@@ -680,7 +695,7 @@ func ParseSubscriptionContent(content string) ([]NodeConfig, error) {
 			decoded, err = base64.RawStdEncoding.DecodeString(content)
 			if err != nil {
 				// Not base64, try as plain text
-				return parseNodesFromContent(content)
+				return parseNodesFromContentWithStats(content)
 			}
 		}
 		content = string(decoded)
@@ -688,15 +703,25 @@ func ParseSubscriptionContent(content string) ([]NodeConfig, error) {
 
 	// Check if it's YAML (Clash format)
 	if strings.Contains(content, "proxies:") {
-		return parseClashYAML(content)
+		return parseClashYAMLWithStats(content)
 	}
 
 	// Parse as plain text (one URI per line)
-	return parseNodesFromContent(content)
+	nodes, s, err := parseNodesFromContentWithStats(content)
+	if err != nil {
+		return nil, stats, err
+	}
+	return nodes, s, nil
 }
 
 // parseNodesFromContent parses nodes from plain text content (one URI per line)
 func parseNodesFromContent(content string) ([]NodeConfig, error) {
+	nodes, _, err := parseNodesFromContentWithStats(content)
+	return nodes, err
+}
+
+func parseNodesFromContentWithStats(content string) ([]NodeConfig, SubscriptionParseStats, error) {
+	stats := SubscriptionParseStats{}
 	var nodes []NodeConfig
 	lines := strings.Split(content, "\n")
 
@@ -719,10 +744,13 @@ func parseNodesFromContent(content string) ([]NodeConfig, error) {
 			nodes = append(nodes, NodeConfig{
 				URI: uri,
 			})
+			stats.ParsedNodes++
+		} else {
+			stats.ErrorNodes++
 		}
 	}
 
-	return nodes, nil
+	return nodes, stats, nil
 }
 
 // isBase64 checks if a string looks like base64 encoded content
@@ -783,27 +811,27 @@ type clashConfig struct {
 }
 
 type clashProxy struct {
-	Name           string                 `yaml:"name"`
-	Type           string                 `yaml:"type"`
-	Server         string                 `yaml:"server"`
-	Port           int                    `yaml:"port"`
-	UUID           string                 `yaml:"uuid"`
-	Password       string                 `yaml:"password"`
-	Cipher         string                 `yaml:"cipher"`
-	AlterId        int                    `yaml:"alterId"`
-	Network        string                 `yaml:"network"`
-	TLS            bool                   `yaml:"tls"`
-	SkipCertVerify bool                   `yaml:"skip-cert-verify"`
-	ServerName     string                 `yaml:"servername"`
-	SNI            string                 `yaml:"sni"`
-	Flow           string                 `yaml:"flow"`
-	UDP            bool                   `yaml:"udp"`
-	WSOpts         *clashWSOptions        `yaml:"ws-opts"`
-	GrpcOpts       *clashGrpcOptions      `yaml:"grpc-opts"`
-	RealityOpts    *clashRealityOptions   `yaml:"reality-opts"`
-	ClientFingerprint string              `yaml:"client-fingerprint"`
-	Plugin         string                 `yaml:"plugin"`
-	PluginOpts     map[string]interface{} `yaml:"plugin-opts"`
+	Name              string                 `yaml:"name"`
+	Type              string                 `yaml:"type"`
+	Server            string                 `yaml:"server"`
+	Port              int                    `yaml:"port"`
+	UUID              string                 `yaml:"uuid"`
+	Password          string                 `yaml:"password"`
+	Cipher            string                 `yaml:"cipher"`
+	AlterId           int                    `yaml:"alterId"`
+	Network           string                 `yaml:"network"`
+	TLS               bool                   `yaml:"tls"`
+	SkipCertVerify    bool                   `yaml:"skip-cert-verify"`
+	ServerName        string                 `yaml:"servername"`
+	SNI               string                 `yaml:"sni"`
+	Flow              string                 `yaml:"flow"`
+	UDP               bool                   `yaml:"udp"`
+	WSOpts            *clashWSOptions        `yaml:"ws-opts"`
+	GrpcOpts          *clashGrpcOptions      `yaml:"grpc-opts"`
+	RealityOpts       *clashRealityOptions   `yaml:"reality-opts"`
+	ClientFingerprint string                 `yaml:"client-fingerprint"`
+	Plugin            string                 `yaml:"plugin"`
+	PluginOpts        map[string]interface{} `yaml:"plugin-opts"`
 }
 
 type clashWSOptions struct {
@@ -822,9 +850,15 @@ type clashRealityOptions struct {
 
 // parseClashYAML parses Clash YAML format and converts to NodeConfig
 func parseClashYAML(content string) ([]NodeConfig, error) {
+	nodes, _, err := parseClashYAMLWithStats(content)
+	return nodes, err
+}
+
+func parseClashYAMLWithStats(content string) ([]NodeConfig, SubscriptionParseStats, error) {
+	stats := SubscriptionParseStats{}
 	var clash clashConfig
 	if err := yaml.Unmarshal([]byte(content), &clash); err != nil {
-		return nil, fmt.Errorf("parse clash yaml: %w", err)
+		return nil, stats, fmt.Errorf("parse clash yaml: %w", err)
 	}
 
 	var nodes []NodeConfig
@@ -835,10 +869,13 @@ func parseClashYAML(content string) ([]NodeConfig, error) {
 				Name: proxy.Name,
 				URI:  uri,
 			})
+			stats.ParsedNodes++
+		} else {
+			stats.ErrorNodes++
 		}
 	}
 
-	return nodes, nil
+	return nodes, stats, nil
 }
 
 // convertClashProxyToURI converts a Clash proxy config to a standard URI
