@@ -16,7 +16,6 @@ import (
 	"time"
 
 	"easy_proxies/internal/config"
-	"easy_proxies/internal/store"
 )
 
 //go:embed assets/index.html
@@ -206,53 +205,10 @@ func (s *Server) handleNodes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Monitoring tab should list all nodes in box manager config, then attach health/runtime state.
-	// It should not use full-store node listing as the primary source.
-	var nodes []Snapshot
-	runtime := s.mgr.Snapshot()
-	runtimeByURI := make(map[string]Snapshot, len(runtime))
-	for _, snap := range runtime {
-		runtimeByURI[snap.URI] = snap
-	}
-
-	healthByKey := s.mgr.Compute24hHealthMap()
-
-	if s.nodeMgr != nil {
-		cfgNodes, err := s.nodeMgr.ListConfigNodes(r.Context())
-		if err == nil && len(cfgNodes) > 0 {
-			nodes = make([]Snapshot, 0, len(cfgNodes))
-			for _, cn := range cfgNodes {
-				snap, ok := runtimeByURI[cn.URI]
-				if !ok {
-					snap = Snapshot{
-						NodeInfo: NodeInfo{
-							Name: cn.Name,
-							URI:  cn.URI,
-							Port: cn.Port,
-						},
-					}
-					snap.LastLatencyMs = -1
-				}
-				nodes = append(nodes, snap)
-			}
-		}
-	}
-
-	if len(nodes) == 0 {
-		nodes = runtime
-	}
-
+	// Monitoring tab should show runtime nodes only (nodes actually loaded in sing-box).
+	// This avoids full config-size traversal when config node set is much larger.
+	nodes := s.mgr.Snapshot()
 	nodes = s.mgr.Attach24hStats(nodes)
-	for i := range nodes {
-		host, port, _, hpErr := store.HostPortFromURI(nodes[i].URI)
-		if hpErr != nil || host == "" || port <= 0 {
-			continue
-		}
-		if healthy, ok := healthByKey[nodeRateKey(host, port)]; ok {
-			nodes[i].InitialCheckDone = true
-			nodes[i].Available = healthy
-		}
-	}
 
 	payload := map[string]any{"nodes": nodes}
 	writeJSON(w, payload)
