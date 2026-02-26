@@ -240,20 +240,22 @@ func (m *Manager) doRefresh() {
 		return
 	}
 
-	upCtx, cancelUp := context.WithTimeout(m.ctx, 15*time.Second)
+	upCtx, cancelUp := context.WithTimeout(m.ctx, 60*time.Second)
+	inputs := make([]store.UpsertNodeInput, 0, len(nodes))
 	for _, n := range nodes {
-		if _, upErr := m.store.UpsertNodeByHostPort(upCtx, store.UpsertNodeInput{
+		inputs = append(inputs, store.UpsertNodeInput{
 			URI:  n.URI,
 			Name: n.Name,
-		}); upErr != nil {
-			cancelUp()
-			m.mu.Lock()
-			m.status.LastError = fmt.Sprintf("store write failed: %v", upErr)
-			m.status.LastRefresh = time.Now()
-			m.mu.Unlock()
-			m.logger.Errorf("store write failed, skip reload: %v", upErr)
-			return
-		}
+		})
+	}
+	if upErr := m.store.UpsertNodesByHostPortBatch(upCtx, inputs); upErr != nil {
+		cancelUp()
+		m.mu.Lock()
+		m.status.LastError = fmt.Sprintf("store write failed: %v", upErr)
+		m.status.LastRefresh = time.Now()
+		m.mu.Unlock()
+		m.logger.Errorf("store write failed, skip reload: %v", upErr)
+		return
 	}
 	cancelUp()
 

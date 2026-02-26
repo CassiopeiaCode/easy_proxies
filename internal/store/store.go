@@ -24,6 +24,7 @@ type Store interface {
 
 	// Nodes
 	UpsertNodeByHostPort(ctx context.Context, in UpsertNodeInput) (Node, error)
+	UpsertNodesByHostPortBatch(ctx context.Context, in []UpsertNodeInput) error
 	DeleteNodeByURI(ctx context.Context, uri string) error
 	DeleteNodeByHostPort(ctx context.Context, host string, port int) error
 	ListNodes(ctx context.Context) ([]Node, error)

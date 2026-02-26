@@ -83,6 +83,108 @@ func (d *DB) UpsertNodeByHostPort(ctx context.Context, in store.UpsertNodeInput)
 	return out, nil
 }
 
+// UpsertNodesByHostPortBatch upserts node metadata by dedup key (host,port) for a batch.
+// It commits once with pebble.Sync to reduce fsync overhead for large refreshes.
+func (d *DB) UpsertNodesByHostPortBatch(ctx context.Context, in []store.UpsertNodeInput) error {
+	if d == nil || d.db == nil {
+		return errors.New("pebble: db not initialized")
+	}
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	}
+	if len(in) == 0 {
+		return nil
+	}
+
+	updates := make(map[string]store.Node, len(in))
+	now := time.Now().UTC()
+
+	for _, item := range in {
+		if ctx != nil {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+		}
+		item.URI = strings.TrimSpace(item.URI)
+		item.Name = strings.TrimSpace(item.Name)
+		if item.URI == "" {
+			return errors.New("uri is empty")
+		}
+
+		host, port, protocol, err := store.HostPortFromURI(item.URI)
+		if err != nil {
+			return err
+		}
+		if item.Name == "" {
+			item.Name = store.NameFromURI(item.URI)
+		}
+		keyStr := string(keyNode(host, port))
+		if existing, ok := updates[keyStr]; ok {
+			existing.URI = item.URI
+			if item.Name != "" {
+				existing.Name = item.Name
+			}
+			existing.Protocol = protocol
+			existing.UpdatedAt = now
+			updates[keyStr] = existing
+			continue
+		}
+
+		var out store.Node
+		k := []byte(keyStr)
+		if val, closer, gerr := d.db.Get(k); gerr == nil {
+			n, uerr := unmarshalNode(val)
+			_ = closer.Close()
+			if uerr == nil {
+				out = n
+				out.URI = item.URI
+				if item.Name != "" {
+					out.Name = item.Name
+				}
+				out.Protocol = protocol
+				out.UpdatedAt = now
+				updates[keyStr] = out
+				continue
+			}
+		}
+
+		out = store.Node{
+			ID:        0,
+			Host:      host,
+			Port:      port,
+			URI:       item.URI,
+			Name:      item.Name,
+			Protocol:  protocol,
+			CreatedAt: now,
+			UpdatedAt: now,
+		}
+		updates[keyStr] = out
+	}
+
+	batch := d.db.NewBatch()
+	defer batch.Close()
+	for k, node := range updates {
+		if ctx != nil {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+		}
+		b, err := marshalNode(node)
+		if err != nil {
+			return err
+		}
+		if err := batch.Set([]byte(k), b, nil); err != nil {
+			return fmt.Errorf("pebble batch set node: %w", err)
+		}
+	}
+	if err := batch.Commit(pebblepkg.Sync); err != nil {
+		return fmt.Errorf("pebble batch commit nodes: %w", err)
+	}
+	return nil
+}
+
 func (d *DB) DeleteNodeByURI(ctx context.Context, uri string) error {
 	uri = strings.TrimSpace(uri)
 	if uri == "" {
