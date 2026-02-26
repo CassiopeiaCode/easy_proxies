@@ -3,6 +3,8 @@ package app
 import (
 	"context"
 	"fmt"
+	"net/http"
+	"net/http/pprof"
 	"os"
 	"os/signal"
 	"syscall"
@@ -16,6 +18,39 @@ import (
 	pebblestore "easy_proxies/internal/store/pebble"
 	"easy_proxies/internal/subscription"
 )
+
+func startPprofServer(ctx context.Context, cfg *config.Config) {
+	if cfg == nil || !cfg.Pprof.Enabled {
+		return
+	}
+
+	addr := fmt.Sprintf("%s:%d", cfg.Pprof.Host, cfg.Pprof.Port)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/debug/pprof/", pprof.Index)
+	mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+
+	srv := &http.Server{
+		Addr:    addr,
+		Handler: mux,
+	}
+	logx.Printf("starting pprof server on http://%s/debug/pprof/", addr)
+
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			logx.Printf("⚠️  pprof server failed: %v", err)
+		}
+	}()
+
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(shutdownCtx)
+	}()
+}
 
 // Run builds the runtime components from config and blocks until shutdown.
 func Run(ctx context.Context, cfg *config.Config) error {
@@ -81,6 +116,7 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		return fmt.Errorf("start box manager: %w", err)
 	}
 	defer boxMgr.Close()
+	startPprofServer(ctx, cfg)
 
 	// Wire up config to monitor server for settings API
 	if server := boxMgr.MonitorServer(); server != nil {

@@ -333,3 +333,24 @@
 
 涉及模块：
 - `internal/store/pebble/nodes.go`
+
+### 20. 可配置 pprof 调试服务（已实现）
+
+目标：增加可选的运行时性能分析入口，便于线上排查 CPU/内存/阻塞问题。
+
+当前实现行为：
+- 新增 `pprof` 配置段：
+  - `pprof.enabled`：是否启用
+  - `pprof.host`：监听地址（默认 `127.0.0.1`）
+  - `pprof.port`：监听端口（默认 `6060`）
+- 启用后在独立 HTTP server 暴露标准 Go pprof 路由：
+  - `/debug/pprof/`
+  - `/debug/pprof/profile`
+  - `/debug/pprof/trace`
+  - 等标准端点
+- 进程退出时会随主 context 做优雅关闭。
+
+涉及模块：
+- `internal/config/config.go`
+- `internal/app/app.go`
+- `config.example.yaml`

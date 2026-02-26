@@ -11,6 +11,10 @@ management:
   probe_expected_status: 204
   # probe_expected_statuses: [200, 204, 301, 302]
   password: ""  # WebUI 访问密码，为空则不需要密码（可选）
+pprof:
+  enabled: false
+  host: 127.0.0.1
+  port: 6060
 listener:
   address: 0.0.0.0
   port: 2323

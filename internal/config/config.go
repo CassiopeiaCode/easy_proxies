@@ -45,6 +45,7 @@ type Config struct {
 	MultiPort  MultiPortConfig  `yaml:"multi_port"`
 	Pool       PoolConfig       `yaml:"pool"`
 	Management ManagementConfig `yaml:"management"`
+	Pprof      PprofConfig      `yaml:"pprof"`
 	Sticky     StickyConfig     `yaml:"sticky"`
 
 	// Store is the primary persistence configuration (Pebble).
@@ -95,6 +96,13 @@ type StickyConfig struct {
 	Password       string        `yaml:"password"`
 	SwitchInterval time.Duration `yaml:"switch_interval"`
 	HistorySize    int           `yaml:"history_size"`
+}
+
+// PprofConfig controls the optional pprof HTTP server.
+type PprofConfig struct {
+	Enabled bool   `yaml:"enabled"`
+	Host    string `yaml:"host"`
+	Port    uint16 `yaml:"port"`
 }
 
 // ManagementConfig controls the monitoring HTTP endpoint.
@@ -214,6 +222,12 @@ func (c *Config) normalize() error {
 	}
 	if c.Management.Listen == "" {
 		c.Management.Listen = "127.0.0.1:9090"
+	}
+	if c.Pprof.Host == "" {
+		c.Pprof.Host = "127.0.0.1"
+	}
+	if c.Pprof.Port == 0 {
+		c.Pprof.Port = 6060
 	}
 	if c.Sticky.Address == "" {
 		c.Sticky.Address = c.Listener.Address
