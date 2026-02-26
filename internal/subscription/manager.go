@@ -21,6 +21,11 @@ import (
 	"easy_proxies/internal/store"
 )
 
+const (
+	storeWriteTimeout = 60 * time.Second
+	storeReadTimeout  = 120 * time.Second
+)
+
 // Logger defines logging interface.
 type Logger interface {
 	Infof(format string, args ...any)
@@ -240,7 +245,7 @@ func (m *Manager) doRefresh() {
 		return
 	}
 
-	upCtx, cancelUp := context.WithTimeout(m.ctx, 60*time.Second)
+	upCtx, cancelUp := context.WithTimeout(m.ctx, storeWriteTimeout)
 	inputs := make([]store.UpsertNodeInput, 0, len(nodes))
 	for _, n := range nodes {
 		inputs = append(inputs, store.UpsertNodeInput{
@@ -259,7 +264,8 @@ func (m *Manager) doRefresh() {
 	}
 	cancelUp()
 
-	loadCtx, cancelLoad := context.WithTimeout(m.ctx, 5*time.Second)
+	readStart := time.Now()
+	loadCtx, cancelLoad := context.WithTimeout(m.ctx, storeReadTimeout)
 	active, listErr := m.store.ListActiveNodes(loadCtx)
 	cancelLoad()
 	if listErr != nil {
@@ -267,9 +273,10 @@ func (m *Manager) doRefresh() {
 		m.status.LastError = fmt.Sprintf("store read failed: %v", listErr)
 		m.status.LastRefresh = time.Now()
 		m.mu.Unlock()
-		m.logger.Errorf("store read failed, skip reload: %v", listErr)
+		m.logger.Errorf("store read failed, skip reload: %v (timeout=%s, elapsed=%s)", listErr, storeReadTimeout, time.Since(readStart))
 		return
 	}
+	m.logger.Infof("store read active nodes completed: %d nodes in %s", len(active), time.Since(readStart))
 	if len(active) == 0 {
 		m.mu.Lock()
 		m.status.LastError = "store read returned 0 active nodes: skip reload"
