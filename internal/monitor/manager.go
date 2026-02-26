@@ -214,12 +214,21 @@ func (m *Manager) StartPeriodicHealthCheck(interval, timeout time.Duration) {
 		return
 	}
 
+	// Capture the current context for the lifetime of this periodic loop.
+	// Important: ResetRuntime() replaces m.ctx with a fresh context. If the loop
+	// reads m.ctx dynamically, it may miss the cancellation of the old context and
+	// leak (causing multiple concurrent periodic probe loops after reloads).
+	loopCtx := m.ctx
+	if loopCtx == nil {
+		loopCtx = context.Background()
+	}
+
 	go func() {
 		// 启动后立即进行一次检查（可抢占：新一轮会取消旧一轮）
-		m.startProbeAllNodes(timeout)
+		m.startProbeAllNodesWithCtx(loopCtx, timeout)
 
 		// 启动后做一次历史统计清理（仅清理健康检查 hourly 聚合表，保留最近 7 天）
-		m.cleanupOldHealthStats()
+		m.cleanupOldHealthStatsWithCtx(loopCtx)
 
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
@@ -234,11 +243,11 @@ func (m *Manager) StartPeriodicHealthCheck(interval, timeout time.Duration) {
 
 		for {
 			select {
-			case <-m.ctx.Done():
+			case <-loopCtx.Done():
 				return
 			case <-ticker.C:
 				// Do not queue up; cancel the previous round and start a new one.
-				m.startProbeAllNodes(timeout)
+				m.startProbeAllNodesWithCtx(loopCtx, timeout)
 			case <-recomputeTicker.C:
 				if m.shouldPersistHealth() {
 					if err := m.applyHealthThresholdFromDB(); err != nil && m.logger != nil {
@@ -246,7 +255,7 @@ func (m *Manager) StartPeriodicHealthCheck(interval, timeout time.Duration) {
 					}
 				}
 			case <-cleanupTicker.C:
-				m.cleanupOldHealthStats()
+				m.cleanupOldHealthStatsWithCtx(loopCtx)
 			}
 		}
 	}()
@@ -257,8 +266,15 @@ func (m *Manager) StartPeriodicHealthCheck(interval, timeout time.Duration) {
 }
 
 func (m *Manager) startProbeAllNodes(timeout time.Duration) {
+	m.startProbeAllNodesWithCtx(m.ctx, timeout)
+}
+
+func (m *Manager) startProbeAllNodesWithCtx(baseCtx context.Context, timeout time.Duration) {
 	if m == nil {
 		return
+	}
+	if baseCtx == nil {
+		baseCtx = context.Background()
 	}
 
 	// Each call starts a new round; cancel the previous one (if still running).
@@ -268,7 +284,7 @@ func (m *Manager) startProbeAllNodes(timeout time.Duration) {
 	if m.probeRoundCancel != nil {
 		m.probeRoundCancel()
 	}
-	roundCtx, cancel := context.WithCancel(m.ctx)
+	roundCtx, cancel := context.WithCancel(baseCtx)
 	m.probeRoundCancel = cancel
 	m.probeRoundActiveID = roundID
 	m.probeRoundMu.Unlock()
@@ -287,8 +303,15 @@ func (m *Manager) startProbeAllNodes(timeout time.Duration) {
 }
 
 func (m *Manager) cleanupOldHealthStats() {
+	m.cleanupOldHealthStatsWithCtx(m.ctx)
+}
+
+func (m *Manager) cleanupOldHealthStatsWithCtx(baseCtx context.Context) {
 	if !m.shouldPersistHealth() {
 		return
+	}
+	if baseCtx == nil {
+		baseCtx = context.Background()
 	}
 
 	// 保留最近 7 天（按 hour_ts 存储；这里用 UTC 截断到整点）
@@ -301,7 +324,7 @@ func (m *Manager) cleanupOldHealthStats() {
 		return
 	}
 
-	cctx, cancel := context.WithTimeout(m.ctx, 5*time.Second)
+	cctx, cancel := context.WithTimeout(baseCtx, 5*time.Second)
 	deleted, err := db.CleanupHealthStatsBefore(cctx, cutoff)
 	cancel()
 
