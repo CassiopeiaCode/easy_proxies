@@ -56,6 +56,7 @@ type TimelineEvent struct {
 }
 
 const maxTimelineSize = 20
+const healthStatsCacheTTL = 5 * time.Second
 
 // Snapshot is a runtime view of a proxy node.
 type Snapshot struct {
@@ -144,9 +145,22 @@ type Manager struct {
 
 	// throttle health recompute triggered by real traffic.
 	lastHealthRecomputeUnix atomic.Int64
+	healthApplyRunning      atomic.Bool
 
 	db   store.Store
 	dbMu sync.Mutex
+
+	healthStatsLoadMu  sync.Mutex
+	healthStatsCache   healthStatsCacheEntry
+	healthStatsCacheMu sync.RWMutex
+}
+
+type healthStatsCacheEntry struct {
+	at          time.Time
+	rows        []nodeRate
+	rateByKey   map[string]nodeRate
+	healthByKey map[string]bool
+	threshold   float64
 }
 
 // Logger interface for logging
@@ -1082,7 +1096,14 @@ func (m *Manager) recordHealthCheck(ctx context.Context, u store.HealthCheckUpda
 	if db == nil {
 		return nil
 	}
-	return db.RecordHealthCheck(ctx, u)
+	if err := db.RecordHealthCheck(ctx, u); err != nil {
+		return err
+	}
+	// Invalidate cached 24h stats so subsequent reads/recompute refresh quickly.
+	m.healthStatsCacheMu.Lock()
+	m.healthStatsCache = healthStatsCacheEntry{}
+	m.healthStatsCacheMu.Unlock()
+	return nil
 }
 
 type nodeRate struct {
@@ -1094,6 +1115,11 @@ type nodeRate struct {
 }
 
 func (m *Manager) applyHealthThresholdFromDB() error {
+	if !m.healthApplyRunning.CompareAndSwap(false, true) {
+		return nil
+	}
+	defer m.healthApplyRunning.Store(false)
+
 	m.dbMu.Lock()
 	db := m.db
 	m.dbMu.Unlock()
@@ -1101,12 +1127,11 @@ func (m *Manager) applyHealthThresholdFromDB() error {
 		return nil
 	}
 
-	// Build rates map from node_health_hourly in last 24h.
-	cutoff := time.Now().UTC().Add(-24 * time.Hour)
-	rows, err := dbInternalQueryRates(m.ctx, db, cutoff)
+	stats, err := m.load24hStatsCached(db, false)
 	if err != nil {
 		return err
 	}
+	rows := stats.rows
 	if len(rows) == 0 {
 		// DB enabled but no 24h stats => mark all nodes unavailable so only DB path determines availability.
 		m.mu.RLock()
@@ -1123,25 +1148,6 @@ func (m *Manager) applyHealthThresholdFromDB() error {
 			e.mu.Unlock()
 		}
 		return nil
-	}
-
-	// Compute p95 from non-zero rates only (0..1).
-	rates := make([]float64, 0, len(rows))
-	for _, r := range rows {
-		if r.rate > 0 {
-			rates = append(rates, r.rate)
-		}
-	}
-	p95 := 0.0
-	if len(rates) > 0 {
-		p95 = percentile(rates, 0.95)
-	}
-	threshold := p95 - 0.05
-	if threshold < 0 {
-		threshold = 0
-	}
-	if threshold > 1 {
-		threshold = 1
 	}
 
 	// Apply availability based on threshold:
@@ -1165,8 +1171,8 @@ func (m *Manager) applyHealthThresholdFromDB() error {
 			continue
 		}
 
-		rate := lookupRate(rows, host, port)
-		if rate < 0 {
+		row, ok := stats.rateByKey[nodeRateKey(host, port)]
+		if !ok {
 			// No 24h stats => not schedulable.
 			e.available = false
 			e.initialCheckDone = true
@@ -1174,20 +1180,11 @@ func (m *Manager) applyHealthThresholdFromDB() error {
 			continue
 		}
 
-		e.available = rate >= threshold
+		e.available = row.rate >= stats.threshold
 		e.initialCheckDone = true
 		e.mu.Unlock()
 	}
 	return nil
-}
-
-func lookupRate(rows []nodeRate, host string, port int) float64 {
-	for _, r := range rows {
-		if r.host == host && r.port == port {
-			return r.rate
-		}
-	}
-	return -1
 }
 
 func dbInternalQueryRates(ctx context.Context, db store.Store, cutoff time.Time) ([]nodeRate, error) {
@@ -1208,6 +1205,79 @@ func dbInternalQueryRates(ctx context.Context, db store.Store, cutoff time.Time)
 	return out, nil
 }
 
+func (m *Manager) load24hStatsCached(db store.Store, forceRefresh bool) (healthStatsCacheEntry, error) {
+	if m == nil || db == nil {
+		return healthStatsCacheEntry{}, nil
+	}
+
+	now := time.Now()
+	if !forceRefresh {
+		m.healthStatsCacheMu.RLock()
+		cached := m.healthStatsCache
+		m.healthStatsCacheMu.RUnlock()
+		if !cached.at.IsZero() && now.Sub(cached.at) <= healthStatsCacheTTL {
+			return cached, nil
+		}
+	}
+
+	m.healthStatsLoadMu.Lock()
+	defer m.healthStatsLoadMu.Unlock()
+
+	if !forceRefresh {
+		m.healthStatsCacheMu.RLock()
+		cached := m.healthStatsCache
+		m.healthStatsCacheMu.RUnlock()
+		if !cached.at.IsZero() && time.Since(cached.at) <= healthStatsCacheTTL {
+			return cached, nil
+		}
+	}
+
+	cutoff := time.Now().UTC().Add(-24 * time.Hour)
+	rows, err := dbInternalQueryRates(m.ctx, db, cutoff)
+	if err != nil {
+		return healthStatsCacheEntry{}, err
+	}
+
+	rateByKey := make(map[string]nodeRate, len(rows))
+	rates := make([]float64, 0, len(rows))
+	for _, row := range rows {
+		rateByKey[nodeRateKey(row.host, row.port)] = row
+		if row.rate > 0 {
+			rates = append(rates, row.rate)
+		}
+	}
+
+	p95 := 0.0
+	if len(rates) > 0 {
+		p95 = percentile(rates, 0.95)
+	}
+	threshold := p95 - 0.05
+	if threshold < 0 {
+		threshold = 0
+	}
+	if threshold > 1 {
+		threshold = 1
+	}
+
+	healthByKey := make(map[string]bool, len(rows))
+	for _, row := range rows {
+		healthByKey[nodeRateKey(row.host, row.port)] = row.rate >= threshold
+	}
+
+	entry := healthStatsCacheEntry{
+		at:          time.Now(),
+		rows:        rows,
+		rateByKey:   rateByKey,
+		healthByKey: healthByKey,
+		threshold:   threshold,
+	}
+
+	m.healthStatsCacheMu.Lock()
+	m.healthStatsCache = entry
+	m.healthStatsCacheMu.Unlock()
+	return entry, nil
+}
+
 // Attach24hStats annotates snapshots with DB-derived 24h success/failure stats.
 func (m *Manager) Attach24hStats(snaps []Snapshot) []Snapshot {
 	if len(snaps) == 0 || m == nil || !m.shouldPersistHealth() {
@@ -1221,15 +1291,9 @@ func (m *Manager) Attach24hStats(snaps []Snapshot) []Snapshot {
 		return snaps
 	}
 
-	cutoff := time.Now().UTC().Add(-24 * time.Hour)
-	rows, err := dbInternalQueryRates(m.ctx, db, cutoff)
+	stats, err := m.load24hStatsCached(db, false)
 	if err != nil {
 		return snaps
-	}
-
-	rateByKey := make(map[string]nodeRate, len(rows))
-	for _, row := range rows {
-		rateByKey[nodeRateKey(row.host, row.port)] = row
 	}
 
 	for i := range snaps {
@@ -1237,7 +1301,7 @@ func (m *Manager) Attach24hStats(snaps []Snapshot) []Snapshot {
 		if hpErr != nil || host == "" || port <= 0 {
 			continue
 		}
-		if row, ok := rateByKey[nodeRateKey(host, port)]; ok {
+		if row, ok := stats.rateByKey[nodeRateKey(host, port)]; ok {
 			total := row.success + row.fail
 			snaps[i].DB24hSuccessCount = row.success
 			snaps[i].DB24hFailureCount = row.fail
@@ -1267,32 +1331,13 @@ func (m *Manager) Compute24hHealthMap() map[string]bool {
 		return out
 	}
 
-	cutoff := time.Now().UTC().Add(-24 * time.Hour)
-	rows, err := dbInternalQueryRates(m.ctx, db, cutoff)
-	if err != nil || len(rows) == 0 {
+	stats, err := m.load24hStatsCached(db, false)
+	if err != nil || len(stats.healthByKey) == 0 {
 		return out
 	}
 
-	rates := make([]float64, 0, len(rows))
-	for _, row := range rows {
-		if row.rate > 0 {
-			rates = append(rates, row.rate)
-		}
-	}
-	p95 := 0.0
-	if len(rates) > 0 {
-		p95 = percentile(rates, 0.95)
-	}
-	threshold := p95 - 0.05
-	if threshold < 0 {
-		threshold = 0
-	}
-	if threshold > 1 {
-		threshold = 1
-	}
-
-	for _, row := range rows {
-		out[nodeRateKey(row.host, row.port)] = row.rate >= threshold
+	for k, v := range stats.healthByKey {
+		out[k] = v
 	}
 	return out
 }
