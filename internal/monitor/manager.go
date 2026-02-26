@@ -56,7 +56,7 @@ type TimelineEvent struct {
 }
 
 const maxTimelineSize = 20
-const healthStatsCacheTTL = 5 * time.Second
+const healthStatsCacheTTL = 30 * time.Second
 
 // Snapshot is a runtime view of a proxy node.
 type Snapshot struct {
@@ -153,6 +153,7 @@ type Manager struct {
 	healthStatsLoadMu  sync.Mutex
 	healthStatsCache   healthStatsCacheEntry
 	healthStatsCacheMu sync.RWMutex
+	healthStatsLoading atomic.Bool
 }
 
 type healthStatsCacheEntry struct {
@@ -1099,10 +1100,6 @@ func (m *Manager) recordHealthCheck(ctx context.Context, u store.HealthCheckUpda
 	if err := db.RecordHealthCheck(ctx, u); err != nil {
 		return err
 	}
-	// Invalidate cached 24h stats so subsequent reads/recompute refresh quickly.
-	m.healthStatsCacheMu.Lock()
-	m.healthStatsCache = healthStatsCacheEntry{}
-	m.healthStatsCacheMu.Unlock()
 	return nil
 }
 
@@ -1210,20 +1207,52 @@ func (m *Manager) load24hStatsCached(db store.Store, forceRefresh bool) (healthS
 		return healthStatsCacheEntry{}, nil
 	}
 
-	now := time.Now()
-	if !forceRefresh {
-		m.healthStatsCacheMu.RLock()
-		cached := m.healthStatsCache
-		m.healthStatsCacheMu.RUnlock()
-		if !cached.at.IsZero() && now.Sub(cached.at) <= healthStatsCacheTTL {
-			return cached, nil
-		}
+	// forceRefresh is used by explicit refresh paths and remains blocking.
+	if forceRefresh {
+		return m.refresh24hStatsBlocking(db, true)
+	}
+
+	m.healthStatsCacheMu.RLock()
+	cached := m.healthStatsCache
+	m.healthStatsCacheMu.RUnlock()
+
+	// Cold start: no cache yet. Block and wait for one single-flight refresh.
+	if cached.at.IsZero() {
+		return m.refresh24hStatsBlocking(db, false)
+	}
+
+	// Fresh cache: return immediately.
+	if time.Since(cached.at) <= healthStatsCacheTTL {
+		return cached, nil
+	}
+
+	// Stale cache: return immediately, refresh in background (single-flight).
+	m.refresh24hStatsAsync(db)
+	return cached, nil
+}
+
+func (m *Manager) refresh24hStatsAsync(db store.Store) {
+	if m == nil || db == nil {
+		return
+	}
+	if !m.healthStatsLoading.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		defer m.healthStatsLoading.Store(false)
+		_, _ = m.refresh24hStatsBlocking(db, true)
+	}()
+}
+
+func (m *Manager) refresh24hStatsBlocking(db store.Store, force bool) (healthStatsCacheEntry, error) {
+	if m == nil || db == nil {
+		return healthStatsCacheEntry{}, nil
 	}
 
 	m.healthStatsLoadMu.Lock()
 	defer m.healthStatsLoadMu.Unlock()
 
-	if !forceRefresh {
+	if !force {
 		m.healthStatsCacheMu.RLock()
 		cached := m.healthStatsCache
 		m.healthStatsCacheMu.RUnlock()
