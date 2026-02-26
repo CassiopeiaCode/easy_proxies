@@ -1118,12 +1118,17 @@ func (m *Manager) applyHealthThresholdFromDB() error {
 		return nil
 	}
 
-	// Compute p95 of rates (0..1).
+	// Compute p95 from non-zero rates only (0..1).
 	rates := make([]float64, 0, len(rows))
 	for _, r := range rows {
-		rates = append(rates, r.rate)
+		if r.rate > 0 {
+			rates = append(rates, r.rate)
+		}
 	}
-	p95 := percentile(rates, 0.95)
+	p95 := 0.0
+	if len(rates) > 0 {
+		p95 = percentile(rates, 0.95)
+	}
 	threshold := p95 - 0.05
 	if threshold < 0 {
 		threshold = 0
