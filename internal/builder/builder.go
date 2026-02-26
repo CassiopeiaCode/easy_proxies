@@ -28,8 +28,10 @@ func Build(cfg *config.Config, st store.Store) (option.Options, error) {
 	baseOutbounds := make([]option.Outbound, 0, len(cfg.Nodes))
 	memberTags := make([]string, 0, len(cfg.Nodes))
 	metadata := make(map[string]poolout.MemberMeta)
-	var failedNodes []string
 	usedTags := make(map[string]int) // Track tag usage for uniqueness
+	damagedSkipped := 0
+	invalidBuild := 0
+	failedExamples := make([]string, 0, 5)
 
 	// Best-effort with shared store:
 	// - skip nodes already marked as damaged (so they will not be built into sing-box)
@@ -65,8 +67,10 @@ func Build(cfg *config.Config, st store.Store) (option.Options, error) {
 				if dErr != nil {
 					logx.Printf("⚠️  query damaged failed for %s:%d: %v (continue building)", host, port, dErr)
 				} else if damaged {
-					logx.Printf("⚠️  node '%s' is marked damaged in store, skipping build", nodeIdent)
-					failedNodes = append(failedNodes, node.Name)
+					damagedSkipped++
+					if len(failedExamples) < cap(failedExamples) {
+						failedExamples = append(failedExamples, nodeIdent)
+					}
 					continue
 				}
 			}
@@ -74,8 +78,10 @@ func Build(cfg *config.Config, st store.Store) (option.Options, error) {
 
 		outbound, err := buildNodeOutbound(tag, node.URI, cfg.SkipCertVerify)
 		if err != nil {
-			logx.Printf("❌ Failed to build node '%s': %v (skipping)", nodeIdent, err)
-			failedNodes = append(failedNodes, node.Name)
+			invalidBuild++
+			if len(failedExamples) < cap(failedExamples) {
+				failedExamples = append(failedExamples, nodeIdent)
+			}
 
 			// Build-time invalid: mark damaged (only when we can extract host:port).
 			if st != nil {
@@ -115,8 +121,9 @@ func Build(cfg *config.Config, st store.Store) (option.Options, error) {
 	}
 
 	// Log summary
-	if len(failedNodes) > 0 {
-		logx.Printf("⚠️  %d/%d nodes failed and were skipped: %v", len(failedNodes), len(cfg.Nodes), failedNodes)
+	failedTotal := damagedSkipped + invalidBuild
+	if failedTotal > 0 {
+		logx.Printf("⚠️  skipped %d/%d nodes (damaged=%d, invalid=%d, examples=%v)", failedTotal, len(cfg.Nodes), damagedSkipped, invalidBuild, failedExamples)
 	}
 	logx.Printf("✅ Successfully built %d/%d nodes", len(baseOutbounds), len(cfg.Nodes))
 
