@@ -1357,6 +1357,11 @@
         const status = getNodeStatus(node);
         const latency = node.last_latency_ms || -1;
         const quality = getLatencyQuality(latency);
+        const successCount = Number(node.success_count || 0);
+        const totalCount = Number(node.total_count || (successCount + Number(node.failure_count || 0)));
+        const successRate = typeof node.success_rate === 'number'
+          ? node.success_rate
+          : (totalCount > 0 ? (successCount / totalCount * 100) : 0);
 
         return `
           <div class="node-card ${status}">
@@ -1383,6 +1388,14 @@
             </div>
 
             <div class="metrics">
+              <div class="metric">
+                <div class="metric-label">成功率</div>
+                <div class="metric-value success">${successRate.toFixed(1)}%</div>
+              </div>
+              <div class="metric">
+                <div class="metric-label">成功/总次数</div>
+                <div class="metric-value">${successCount}/${totalCount}</div>
+              </div>
               <div class="metric">
                 <div class="metric-label">监听端口</div>
                 <div class="metric-value">${node.port || '—'}</div>

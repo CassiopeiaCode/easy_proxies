@@ -62,6 +62,8 @@ type Snapshot struct {
 	NodeInfo
 	FailureCount      int             `json:"failure_count"`
 	SuccessCount      int64           `json:"success_count"`
+	TotalCount        int64           `json:"total_count"`
+	SuccessRate       float64         `json:"success_rate"`
 	Blacklisted       bool            `json:"blacklisted"`
 	BlacklistedUntil  time.Time       `json:"blacklisted_until"`
 	ActiveConnections int32           `json:"active_connections"`
@@ -723,6 +725,8 @@ func (e *entry) snapshot() Snapshot {
 		NodeInfo:          e.info,
 		FailureCount:      e.failure,
 		SuccessCount:      e.success,
+		TotalCount:        e.success + int64(e.failure),
+		SuccessRate:       calcSuccessRate(e.success, e.failure),
 		Blacklisted:       e.blacklist,
 		BlacklistedUntil:  e.until,
 		ActiveConnections: e.active.Load(),
@@ -735,6 +739,14 @@ func (e *entry) snapshot() Snapshot {
 		InitialCheckDone:  e.initialCheckDone,
 		Timeline:          timelineCopy,
 	}
+}
+
+func calcSuccessRate(success int64, failure int) float64 {
+	total := success + int64(failure)
+	if total <= 0 {
+		return 0
+	}
+	return float64(success) / float64(total) * 100
 }
 
 func (e *entry) recordFailure(err error) {

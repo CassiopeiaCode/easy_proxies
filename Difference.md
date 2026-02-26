@@ -357,3 +357,21 @@
 - `internal/config/config.go`
 - `internal/app/app.go`
 - `config.example.yaml`
+
+### 21. 节点监控 Tab 展示成功率与成功/总次数（已实现）
+
+目标：在“节点监控”页直接看到每个节点的成功率，以及成功次数/总次数。
+
+当前实现行为：
+- 后端 `Snapshot` 新增字段：
+  - `total_count`：`success_count + failure_count`
+  - `success_rate`：`success_count / total_count * 100`（百分比）
+- `/api/nodes` 返回的节点数据包含上述字段，前端可直接消费。
+- 前端“节点监控”卡片新增：
+  - 成功率（`xx.x%`）
+  - 成功/总次数（`success_count/total_count`）
+- 前端对旧数据保留兼容：若后端未返回新字段，会回退到前端本地计算。
+
+涉及模块：
+- `internal/monitor/manager.go`
+- `internal/monitor/assets/index.html`
