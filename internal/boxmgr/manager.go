@@ -126,7 +126,9 @@ func (m *Manager) Start(ctx context.Context) error {
 	started := false
 	for retry := 0; retry < maxRetries; retry++ {
 		// Hard-timeout each rebuild attempt so one stuck create/start cannot block forever.
-		instance, err, timedOut := m.createAndStartWithTimeout(ctx, cfg, rebuildHardTimeout)
+		var err error
+		var timedOut bool
+		instance, err, timedOut = m.createAndStartWithTimeout(ctx, cfg, rebuildHardTimeout)
 		if timedOut {
 			timeoutRetries++
 			m.logger.Warnf("create sing-box timed out (attempt %d/%d), hard-timeout=%s", timeoutRetries, maxRebuildTimeoutRetries, rebuildHardTimeout)
@@ -266,7 +268,9 @@ func (m *Manager) Reload(newCfg *config.Config) error {
 	started := false
 	for retry := 0; retry < maxRetries; retry++ {
 		// Hard-timeout each rebuild attempt so one stuck create/start cannot block forever.
-		instance, err, timedOut := m.createAndStartWithTimeout(ctx, newCfg, rebuildHardTimeout)
+		var err error
+		var timedOut bool
+		instance, err, timedOut = m.createAndStartWithTimeout(ctx, newCfg, rebuildHardTimeout)
 		if timedOut {
 			timeoutRetries++
 			m.logger.Warnf("create new box timed out (attempt %d/%d), hard-timeout=%s", timeoutRetries, maxRebuildTimeoutRetries, rebuildHardTimeout)
