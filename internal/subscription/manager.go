@@ -22,7 +22,7 @@ import (
 )
 
 const (
-	storeWriteTimeout = 60 * time.Second
+	storeWriteTimeout = 10 * time.Minute
 	storeReadTimeout  = 120 * time.Second
 )
 
