@@ -62,6 +62,7 @@ type Manager struct {
 	mu sync.RWMutex
 
 	currentBox    *box.Box
+	currentCancel context.CancelFunc
 	monitorMgr    *monitor.Manager
 	monitorServer *monitor.Server
 	cfg           *config.Config
@@ -231,6 +232,7 @@ func (m *Manager) Reload(newCfg *config.Config) error {
 	}
 	ctx := m.baseCtx
 	oldBox := m.currentBox
+	oldCancel := m.currentCancel
 	oldCfg := m.cfg
 	m.mu.Unlock()
 
@@ -244,6 +246,7 @@ func (m *Manager) Reload(newCfg *config.Config) error {
 	// This avoids hard interruptions where create/build hangs or times out.
 	// On outbound init failures, best-effort mark damaged and retry quickly.
 	var instance *box.Box
+	var instanceCancel context.CancelFunc
 	maxDamagedRetries := 50
 	maxRetries := maxDamagedRetries + 10
 	damagedRetries := 0
@@ -254,8 +257,12 @@ func (m *Manager) Reload(newCfg *config.Config) error {
 		// Hard-timeout each rebuild attempt so one stuck create cannot block forever.
 		var err error
 		var timedOut bool
-		instance, err, timedOut = m.createWithTimeout(ctx, newCfg, rebuildHardTimeout)
+		instance, instanceCancel, err, timedOut = m.createWithTimeout(ctx, newCfg, rebuildHardTimeout)
 		if timedOut {
+			if instanceCancel != nil {
+				instanceCancel()
+				instanceCancel = nil
+			}
 			timeoutRetries++
 			m.logger.Warnf("create new box timed out (attempt %d/%d), hard-timeout=%s", timeoutRetries, maxRebuildTimeoutRetries, rebuildHardTimeout)
 			if timeoutRetries >= maxRebuildTimeoutRetries {
@@ -266,6 +273,10 @@ func (m *Manager) Reload(newCfg *config.Config) error {
 			continue
 		}
 		if err != nil {
+			if instanceCancel != nil {
+				instanceCancel()
+				instanceCancel = nil
+			}
 			if extractSingBoxInitOutboundIndex(err) >= 0 && damagedRetries < maxDamagedRetries {
 				damagedRetries++
 				m.logger.Warnf("create new box failed (init outbound), retrying after marking damaged (attempt %d/%d): %v", damagedRetries, maxDamagedRetries, err)
@@ -280,6 +291,9 @@ func (m *Manager) Reload(newCfg *config.Config) error {
 		break // Success
 	}
 	if !created || instance == nil {
+		if instanceCancel != nil {
+			instanceCancel()
+		}
 		if lastErr == nil {
 			lastErr = errors.New("failed to create new box after retries")
 		}
@@ -290,6 +304,9 @@ func (m *Manager) Reload(newCfg *config.Config) error {
 	// Any failure here must rollback to old config.
 	if oldBox != nil {
 		m.logger.Infof("stopping old instance to release ports...")
+		if oldCancel != nil {
+			oldCancel()
+		}
 		if err := oldBox.Close(); err != nil {
 			m.logger.Warnf("error closing old instance: %v", err)
 		}
@@ -309,11 +326,17 @@ func (m *Manager) Reload(newCfg *config.Config) error {
 
 	startErr, startTimedOut := m.startWithTimeout(ctx, instance, rebuildHardTimeout)
 	if startTimedOut {
+		if instanceCancel != nil {
+			instanceCancel()
+		}
 		_ = instance.Close()
 		m.rollbackToOldConfig(ctx, oldCfg)
 		return fmt.Errorf("start new box timed out after %s", rebuildHardTimeout)
 	}
 	if startErr != nil {
+		if instanceCancel != nil {
+			instanceCancel()
+		}
 		_ = instance.Close()
 		// Keep existing behavior for bind conflicts: reassign and retry on full reload path.
 		// Here old box is already closed, so rollback first to keep service available.
@@ -325,6 +348,10 @@ func (m *Manager) Reload(newCfg *config.Config) error {
 
 	m.mu.Lock()
 	m.currentBox = instance
+	if m.currentCancel != nil {
+		m.currentCancel()
+	}
+	m.currentCancel = instanceCancel
 	m.cfg = newCfg
 	m.mu.Unlock()
 
@@ -355,12 +382,18 @@ func (m *Manager) rollbackToOldConfig(ctx context.Context, oldCfg *config.Config
 		return
 	}
 	m.logger.Warnf("attempting rollback to previous config...")
-	instance, err := m.createBox(ctx, oldCfg)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	instanceCtx, cancel := context.WithCancel(ctx)
+	instance, err := m.createBoxWithContext(ctx, instanceCtx, oldCfg)
 	if err != nil {
+		cancel()
 		m.logger.Errorf("rollback failed to create box: %v", err)
 		return
 	}
 	if err := instance.Start(); err != nil {
+		cancel()
 		_ = instance.Close()
 		m.logger.Errorf("rollback failed to start box: %v", err)
 		return
@@ -368,6 +401,10 @@ func (m *Manager) rollbackToOldConfig(ctx context.Context, oldCfg *config.Config
 	m.mu.Lock()
 	m.currentBox = instance
 	m.cfg = oldCfg
+	if m.currentCancel != nil {
+		m.currentCancel()
+	}
+	m.currentCancel = cancel
 	m.mu.Unlock()
 	m.logger.Infof("rollback successful")
 }
@@ -379,6 +416,10 @@ func (m *Manager) Close() error {
 
 	var err error
 	if m.currentBox != nil {
+		if m.currentCancel != nil {
+			m.currentCancel()
+			m.currentCancel = nil
+		}
 		err = m.currentBox.Close()
 		m.currentBox = nil
 	}
@@ -412,6 +453,12 @@ func (m *Manager) MonitorServer() *monitor.Server {
 
 // createBox builds a sing-box instance from config.
 func (m *Manager) createBox(ctx context.Context, cfg *config.Config) (*box.Box, error) {
+	return m.createBoxWithContext(ctx, ctx, cfg)
+}
+
+// createBoxWithContext builds a sing-box instance from config.
+// opCtx is used for build-time operations; boxCtx is the long-lived runtime context for the instance.
+func (m *Manager) createBoxWithContext(opCtx context.Context, boxCtx context.Context, cfg *config.Config) (*box.Box, error) {
 	if cfg == nil {
 		return nil, errors.New("config is nil")
 	}
@@ -420,7 +467,7 @@ func (m *Manager) createBox(ctx context.Context, cfg *config.Config) (*box.Box, 
 	}
 
 	effectiveCfg := *cfg
-	effectiveCfg.Nodes = m.selectNodesForSingBox(ctx, cfg.Nodes)
+	effectiveCfg.Nodes = m.selectNodesForSingBox(opCtx, cfg.Nodes)
 	if len(effectiveCfg.Nodes) != len(cfg.Nodes) && m.logger != nil {
 		m.logger.Infof("node load limited for sing-box: selected=%d total=%d", len(effectiveCfg.Nodes), len(cfg.Nodes))
 	}
@@ -441,10 +488,14 @@ func (m *Manager) createBox(ctx context.Context, cfg *config.Config) (*box.Box, 
 	// our pool outbounds early (or context values are dropped internally).
 	m.preRegisterMonitorNodes(&effectiveCfg)
 
-	boxCtx := box.Context(ctx, inboundRegistry, outboundRegistry, endpointRegistry, dnsRegistry, serviceRegistry)
-	boxCtx = monitor.ContextWith(boxCtx, m.monitorMgr)
+	runtimeCtx := boxCtx
+	if runtimeCtx == nil {
+		runtimeCtx = context.Background()
+	}
+	boxRuntimeCtx := box.Context(runtimeCtx, inboundRegistry, outboundRegistry, endpointRegistry, dnsRegistry, serviceRegistry)
+	boxRuntimeCtx = monitor.ContextWith(boxRuntimeCtx, m.monitorMgr)
 
-	instance, err := box.New(box.Options{Context: boxCtx, Options: opts})
+	instance, err := box.New(box.Options{Context: boxRuntimeCtx, Options: opts})
 	if err != nil {
 		// Best-effort: if sing-box fails while initializing outbounds, try to map the failing outbound
 		// to a node URI and mark it as damaged, so next run can start with remaining nodes.
@@ -1261,24 +1312,44 @@ func cloneNodes(nodes []config.NodeConfig) []config.NodeConfig {
 }
 
 func (m *Manager) createAndStartWithTimeout(ctx context.Context, cfg *config.Config, timeout time.Duration) (*box.Box, error, bool) {
-	instance, err, timedOut := m.createWithTimeout(ctx, cfg, timeout)
+	instance, cancel, err, timedOut := m.createWithTimeout(ctx, cfg, timeout)
 	if err != nil || timedOut {
+		if cancel != nil {
+			cancel()
+		}
 		return nil, err, timedOut
 	}
 	startErr, startTimedOut := m.startWithTimeout(ctx, instance, timeout)
 	if startErr != nil {
+		if cancel != nil {
+			cancel()
+		}
 		_ = instance.Close()
 		return nil, startErr, startTimedOut
 	}
+
+	m.mu.Lock()
+	if m.currentCancel != nil {
+		m.currentCancel()
+	}
+	m.currentCancel = cancel
+	m.mu.Unlock()
+
 	return instance, nil, false
 }
 
-func (m *Manager) createWithTimeout(ctx context.Context, cfg *config.Config, timeout time.Duration) (*box.Box, error, bool) {
+func (m *Manager) createWithTimeout(ctx context.Context, cfg *config.Config, timeout time.Duration) (*box.Box, context.CancelFunc, error, bool) {
 	if timeout <= 0 {
 		timeout = rebuildHardTimeout
 	}
-	attemptCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	// instanceCtx is the long-lived context for the created sing-box instance.
+	// attemptCtx is only for bounding the build/create attempt.
+	instanceCtx, instanceCancel := context.WithCancel(ctx)
+	attemptCtx, attemptCancel := context.WithTimeout(ctx, timeout)
 
 	type result struct {
 		instance *box.Box
@@ -1287,21 +1358,26 @@ func (m *Manager) createWithTimeout(ctx context.Context, cfg *config.Config, tim
 	done := make(chan result, 1)
 
 	go func() {
-		instance, err := m.createBox(attemptCtx, cfg)
+		instance, err := m.createBoxWithContext(attemptCtx, instanceCtx, cfg)
 		done <- result{instance: instance, err: err}
 	}()
 
 	select {
 	case r := <-done:
+		attemptCancel()
 		if r.err != nil {
-			return nil, r.err, false
+			instanceCancel()
+			return nil, nil, r.err, false
 		}
-		return r.instance, nil, false
+		return r.instance, instanceCancel, nil, false
 	case <-attemptCtx.Done():
+		// Timeout/cancel: cancel the runtime context too, so any in-progress create work can stop.
+		attemptCancel()
+		instanceCancel()
 		if errors.Is(attemptCtx.Err(), context.DeadlineExceeded) {
-			return nil, fmt.Errorf("create timed out after %s", timeout), true
+			return nil, nil, fmt.Errorf("create timed out after %s", timeout), true
 		}
-		return nil, attemptCtx.Err(), false
+		return nil, nil, attemptCtx.Err(), false
 	}
 }
 
