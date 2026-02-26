@@ -86,9 +86,8 @@ func (d *DB) UpsertNodeByHostPort(ctx context.Context, in store.UpsertNodeInput)
 	return out, nil
 }
 
-// UpsertNodesByHostPortBatch upserts node metadata by dedup key (host,port) for a batch.
-// It loads existing records in one pass, merges in memory, then commits in chunks.
-// This intentionally ignores concurrent mid-flight changes and applies the merged snapshot.
+// UpsertNodesByHostPortBatch inserts missing nodes by dedup key (host,port) for a batch.
+// Existing records are kept as-is and are not rewritten.
 func (d *DB) UpsertNodesByHostPortBatch(ctx context.Context, in []store.UpsertNodeInput) error {
 	if d == nil || d.db == nil {
 		return errors.New("pebble: db not initialized")
@@ -144,7 +143,7 @@ func (d *DB) UpsertNodesByHostPortBatch(ctx context.Context, in []store.UpsertNo
 		}
 	}
 
-	existing := make(map[string]store.Node, len(prepared))
+	existing := make(map[string]struct{}, len(prepared))
 	iter, err := d.db.NewIter(&pebblepkg.IterOptions{
 		LowerBound: keyNodePrefixBytes(),
 		UpperBound: append([]byte(keyNodePrefix), 0xFF),
@@ -163,11 +162,7 @@ func (d *DB) UpsertNodesByHostPortBatch(ctx context.Context, in []store.UpsertNo
 		if _, ok := prepared[k]; !ok {
 			continue
 		}
-		n, uerr := unmarshalNode(iter.Value())
-		if uerr != nil {
-			continue
-		}
-		existing[k] = n
+		existing[k] = struct{}{}
 	}
 	if err := iter.Error(); err != nil {
 		iter.Close()
@@ -184,14 +179,7 @@ func (d *DB) UpsertNodesByHostPortBatch(ctx context.Context, in []store.UpsertNo
 	merged := make([]store.Node, 0, len(keys))
 	for _, k := range keys {
 		p := prepared[k]
-		if old, ok := existing[k]; ok {
-			old.URI = p.uri
-			if p.name != "" {
-				old.Name = p.name
-			}
-			old.Protocol = p.protocol
-			old.UpdatedAt = now
-			merged = append(merged, old)
+		if _, ok := existing[k]; ok {
 			continue
 		}
 		merged = append(merged, store.Node{

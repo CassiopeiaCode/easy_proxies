@@ -22,8 +22,10 @@ import (
 )
 
 const (
-	storeWriteTimeout = 10 * time.Minute
-	storeReadTimeout  = 120 * time.Second
+	storeWriteBatchTimeout = 10 * time.Minute
+	storeWriteItemTimeout  = 30 * time.Second
+	storeWriteBatchSize    = 2000
+	storeReadTimeout       = 120 * time.Second
 )
 
 // Logger defines logging interface.
@@ -245,9 +247,6 @@ func (m *Manager) doRefresh() {
 		return
 	}
 
-	upCtx, cancelUp := context.WithTimeout(m.ctx, storeWriteTimeout)
-	defer cancelUp()
-
 	inputs := make([]store.UpsertNodeInput, 0, len(nodes))
 	invalidCount := 0
 	invalidExamples := make([]string, 0, 5)
@@ -278,17 +277,40 @@ func (m *Manager) doRefresh() {
 
 	successCount := 0
 	failCount := 0
-	upErr := m.store.UpsertNodesByHostPortBatch(upCtx, inputs)
-	if upErr == nil {
-		successCount = len(inputs)
-	} else {
-		// Degrade gracefully: keep progress even if bulk merge+write fails.
-		m.logger.Warnf("store batch upsert failed, fallback to per-node: %v", upErr)
-		for _, in := range inputs {
-			if upCtx.Err() != nil {
+	for i := 0; i < len(inputs); i += storeWriteBatchSize {
+		if m.ctx.Err() != nil {
+			m.mu.Lock()
+			m.status.LastError = fmt.Sprintf("store write failed: %v", m.ctx.Err())
+			m.status.LastRefresh = time.Now()
+			m.mu.Unlock()
+			m.logger.Errorf("store write failed, skip reload: %v", m.ctx.Err())
+			return
+		}
+
+		end := i + storeWriteBatchSize
+		if end > len(inputs) {
+			end = len(inputs)
+		}
+		chunk := inputs[i:end]
+
+		chunkCtx, cancelChunk := context.WithTimeout(m.ctx, storeWriteBatchTimeout)
+		upErr := m.store.UpsertNodesByHostPortBatch(chunkCtx, chunk)
+		cancelChunk()
+		if upErr == nil {
+			successCount += len(chunk)
+			continue
+		}
+
+		// Degrade gracefully within the failed chunk with per-item timeout.
+		m.logger.Warnf("store batch upsert failed for chunk [%d,%d), fallback to per-node: %v", i, end, upErr)
+		for _, in := range chunk {
+			if m.ctx.Err() != nil {
 				break
 			}
-			if _, oneErr := m.store.UpsertNodeByHostPort(upCtx, in); oneErr != nil {
+			oneCtx, cancelOne := context.WithTimeout(m.ctx, storeWriteItemTimeout)
+			oneErr := m.store.UpsertNodesByHostPortBatch(oneCtx, []store.UpsertNodeInput{in})
+			cancelOne()
+			if oneErr != nil {
 				failCount++
 				continue
 			}
