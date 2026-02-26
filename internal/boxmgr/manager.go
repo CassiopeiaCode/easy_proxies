@@ -7,6 +7,7 @@ import (
 	"log"
 	"net"
 	"net/url"
+	"os"
 	"reflect"
 	"regexp"
 	"strings"
@@ -34,6 +35,8 @@ const (
 	healthCheckPollInterval   = 500 * time.Millisecond
 	periodicHealthInterval    = 5 * time.Minute
 	periodicHealthTimeout     = 10 * time.Second
+	rebuildHardTimeout        = 30 * time.Second
+	maxRebuildTimeoutRetries  = 10
 )
 
 // Logger defines logging interface for the manager.
@@ -118,9 +121,23 @@ func (m *Manager) Start(ctx context.Context) error {
 	maxRetries := 10
 	maxDamagedRetries := 50
 	damagedRetries := 0
+	timeoutRetries := 0
+	var lastErr error
+	started := false
 	for retry := 0; retry < maxRetries; retry++ {
-		var err error
-		instance, err = m.createBox(ctx, cfg)
+		// Hard-timeout each rebuild attempt so one stuck create/start cannot block forever.
+		instance, err, timedOut := m.createAndStartWithTimeout(ctx, cfg, rebuildHardTimeout)
+		if timedOut {
+			timeoutRetries++
+			m.logger.Warnf("create sing-box timed out (attempt %d/%d), hard-timeout=%s", timeoutRetries, maxRebuildTimeoutRetries, rebuildHardTimeout)
+			if timeoutRetries >= maxRebuildTimeoutRetries {
+				m.logger.Errorf("create sing-box timed out %d times, exiting with code 1", timeoutRetries)
+				os.Exit(1)
+			}
+			lastErr = fmt.Errorf("create sing-box timed out after %s", rebuildHardTimeout)
+			pool.ResetSharedStateStore()
+			continue
+		}
 		if err != nil {
 			// If this looks like an outbound init failure, createBox() already did best-effort damaged marking.
 			// Retry to allow builder to skip damaged nodes on the next Build().
@@ -131,21 +148,25 @@ func (m *Manager) Start(ctx context.Context) error {
 				time.Sleep(200 * time.Millisecond)
 				continue
 			}
-			return err
-		}
-		if err = instance.Start(); err != nil {
-			_ = instance.Close()
-			// Check if it's a port conflict error
+			// Keep existing behavior for bind conflicts: reassign and retry.
 			if conflictPort := extractPortFromBindError(err); conflictPort > 0 {
 				m.logger.Warnf("port %d is in use, reassigning and retrying...", conflictPort)
 				if reassigned := reassignConflictingPort(cfg, conflictPort); reassigned {
-					pool.ResetSharedStateStore() // Reset shared state for rebuild
+					pool.ResetSharedStateStore()
 					continue
 				}
 			}
-			return fmt.Errorf("start sing-box: %w", err)
+			lastErr = err
+			return lastErr
 		}
+		started = true
 		break // Success
+	}
+	if !started || instance == nil {
+		if lastErr == nil {
+			lastErr = errors.New("failed to create/start sing-box after retries")
+		}
+		return lastErr
 	}
 
 	m.mu.Lock()
@@ -240,9 +261,23 @@ func (m *Manager) Reload(newCfg *config.Config) error {
 	maxRetries := 10
 	maxDamagedRetries := 50
 	damagedRetries := 0
+	timeoutRetries := 0
+	var lastErr error
+	started := false
 	for retry := 0; retry < maxRetries; retry++ {
-		var err error
-		instance, err = m.createBox(ctx, newCfg)
+		// Hard-timeout each rebuild attempt so one stuck create/start cannot block forever.
+		instance, err, timedOut := m.createAndStartWithTimeout(ctx, newCfg, rebuildHardTimeout)
+		if timedOut {
+			timeoutRetries++
+			m.logger.Warnf("create new box timed out (attempt %d/%d), hard-timeout=%s", timeoutRetries, maxRebuildTimeoutRetries, rebuildHardTimeout)
+			if timeoutRetries >= maxRebuildTimeoutRetries {
+				m.logger.Errorf("create new box timed out %d times, exiting with code 1", timeoutRetries)
+				os.Exit(1)
+			}
+			lastErr = fmt.Errorf("create new box timed out after %s", rebuildHardTimeout)
+			pool.ResetSharedStateStore()
+			continue
+		}
 		if err != nil {
 			if extractSingBoxInitOutboundIndex(err) >= 0 && damagedRetries < maxDamagedRetries {
 				damagedRetries++
@@ -251,12 +286,7 @@ func (m *Manager) Reload(newCfg *config.Config) error {
 				time.Sleep(200 * time.Millisecond)
 				continue
 			}
-			m.rollbackToOldConfig(ctx, oldCfg)
-			return fmt.Errorf("create new box: %w", err)
-		}
-		if err = instance.Start(); err != nil {
-			_ = instance.Close()
-			// Check if it's a port conflict error
+			// Keep existing behavior for bind conflicts: reassign and retry.
 			if conflictPort := extractPortFromBindError(err); conflictPort > 0 {
 				m.logger.Warnf("port %d is in use, reassigning and retrying...", conflictPort)
 				if reassigned := reassignConflictingPort(newCfg, conflictPort); reassigned {
@@ -264,10 +294,19 @@ func (m *Manager) Reload(newCfg *config.Config) error {
 					continue
 				}
 			}
+			lastErr = err
 			m.rollbackToOldConfig(ctx, oldCfg)
-			return fmt.Errorf("start new box: %w", err)
+			return fmt.Errorf("create new box: %w", lastErr)
 		}
+		started = true
 		break // Success
+	}
+	if !started || instance == nil {
+		if lastErr == nil {
+			lastErr = errors.New("failed to create/start new box after retries")
+		}
+		m.rollbackToOldConfig(ctx, oldCfg)
+		return fmt.Errorf("create new box: %w", lastErr)
 	}
 
 	m.applyConfigSettings(newCfg)
@@ -1072,6 +1111,46 @@ func cloneNodes(nodes []config.NodeConfig) []config.NodeConfig {
 	out := make([]config.NodeConfig, len(nodes))
 	copy(out, nodes)
 	return out
+}
+
+func (m *Manager) createAndStartWithTimeout(ctx context.Context, cfg *config.Config, timeout time.Duration) (*box.Box, error, bool) {
+	if timeout <= 0 {
+		timeout = rebuildHardTimeout
+	}
+	attemptCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	type result struct {
+		instance *box.Box
+		err      error
+	}
+	done := make(chan result, 1)
+
+	go func() {
+		instance, err := m.createBox(attemptCtx, cfg)
+		if err != nil {
+			done <- result{err: err}
+			return
+		}
+
+		if startErr := instance.Start(); startErr != nil {
+			_ = instance.Close()
+			done <- result{err: fmt.Errorf("start sing-box: %w", startErr)}
+			return
+		}
+
+		done <- result{instance: instance}
+	}()
+
+	select {
+	case r := <-done:
+		return r.instance, r.err, false
+	case <-attemptCtx.Done():
+		if errors.Is(attemptCtx.Err(), context.DeadlineExceeded) {
+			return nil, fmt.Errorf("create/start timed out after %s", timeout), true
+		}
+		return nil, attemptCtx.Err(), false
+	}
 }
 
 func (m *Manager) copyConfigLocked() *config.Config {
