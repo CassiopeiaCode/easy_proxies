@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"sort"
 	"strings"
 	"time"
@@ -385,5 +386,132 @@ func (d *DB) MarkNodeDamaged(ctx context.Context, host string, port int, reason 
 	if err := d.db.Set(k, b, pebblepkg.Sync); err != nil {
 		return fmt.Errorf("pebble set node: %w", err)
 	}
+
+	// Heuristic damage propagation:
+	// if a node is marked damaged, also mark nodes whose URI signatures are identical
+	// after ignoring name/host/ip related fields.
+	_ = d.markDamagedByHeuristic(ctx, n.URI, reason, host, port)
 	return nil
+}
+
+func (d *DB) markDamagedByHeuristic(ctx context.Context, rawURI, reason, sourceHost string, sourcePort int) error {
+	if d == nil || d.db == nil {
+		return errors.New("pebble: db not initialized")
+	}
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	}
+
+	targetSig, ok := damagedSignature(rawURI)
+	if !ok {
+		return nil
+	}
+
+	iter, err := d.db.NewIter(&pebblepkg.IterOptions{
+		LowerBound: keyNodePrefixBytes(),
+		UpperBound: append([]byte(keyNodePrefix), 0xFF),
+	})
+	if err != nil {
+		return fmt.Errorf("pebble iter: %w", err)
+	}
+	defer iter.Close()
+
+	now := time.Now().UTC()
+	batch := d.db.NewBatch()
+	defer batch.Close()
+	updated := 0
+
+	for iter.First(); iter.Valid(); iter.Next() {
+		if ctx != nil {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+		}
+		n, uerr := unmarshalNode(iter.Value())
+		if uerr != nil {
+			continue
+		}
+
+		// Skip the originally marked node; it is already persisted.
+		if strings.EqualFold(strings.TrimSpace(n.Host), strings.TrimSpace(sourceHost)) && n.Port == sourcePort {
+			continue
+		}
+
+		sig, ok := damagedSignature(n.URI)
+		if !ok || sig != targetSig {
+			continue
+		}
+		if n.IsDamaged {
+			continue
+		}
+
+		n.IsDamaged = true
+		n.DamageReason = reason
+		n.UpdatedAt = now
+		b, merr := marshalNode(n)
+		if merr != nil {
+			return merr
+		}
+		if err := batch.Set(keyNode(n.Host, n.Port), b, nil); err != nil {
+			return fmt.Errorf("pebble batch set node: %w", err)
+		}
+		updated++
+	}
+	if err := iter.Error(); err != nil {
+		return fmt.Errorf("pebble iter nodes: %w", err)
+	}
+	if updated == 0 {
+		return nil
+	}
+	if err := batch.Commit(pebblepkg.Sync); err != nil {
+		return fmt.Errorf("pebble batch commit nodes: %w", err)
+	}
+	return nil
+}
+
+func damagedSignature(rawURI string) (string, bool) {
+	rawURI = strings.TrimSpace(rawURI)
+	if rawURI == "" {
+		return "", false
+	}
+
+	u, err := url.Parse(rawURI)
+	if err != nil || strings.TrimSpace(u.Scheme) == "" {
+		return "", false
+	}
+
+	scheme := strings.ToLower(strings.TrimSpace(u.Scheme))
+	user := ""
+	if u.User != nil {
+		user = u.User.String()
+	}
+	port := u.Port()
+	path := u.EscapedPath()
+
+	// Ignore query keys that commonly encode server host/name identity.
+	drop := map[string]struct{}{
+		"host":       {},
+		"sni":        {},
+		"servername": {},
+		"peer":       {},
+		"add":        {},
+		"ps":         {}, // name/remark
+	}
+	q := u.Query()
+	parts := make([]string, 0, len(q))
+	for k, vals := range q {
+		if _, skip := drop[strings.ToLower(strings.TrimSpace(k))]; skip {
+			continue
+		}
+		sort.Strings(vals)
+		parts = append(parts, k+"="+strings.Join(vals, ","))
+	}
+	sort.Strings(parts)
+	querySig := strings.Join(parts, "&")
+
+	// Exclude hostname/IP and fragment(name) on purpose.
+	// Keep protocol, auth/userinfo, port, path and filtered query as heuristic identity.
+	return scheme + "|" + user + "|" + port + "|" + path + "|" + querySig, true
 }
