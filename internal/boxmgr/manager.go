@@ -34,7 +34,7 @@ const (
 	healthCheckPollInterval   = 500 * time.Millisecond
 	periodicHealthInterval    = 5 * time.Minute
 	periodicHealthTimeout     = 10 * time.Second
-	rebuildHardTimeout        = 30 * time.Second
+	rebuildHardTimeout        = 120 * time.Second
 	maxRebuildTimeoutRetries  = 10
 )
 
