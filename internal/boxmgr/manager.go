@@ -5,11 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"net"
 	"net/url"
 	"os"
 	"reflect"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -36,6 +38,8 @@ const (
 	periodicHealthTimeout     = 10 * time.Second
 	rebuildHardTimeout        = 120 * time.Second
 	maxRebuildTimeoutRetries  = 10
+	maxSingBoxNodes           = 5000
+	healthyNodeRatio          = 0.9
 )
 
 // Logger defines logging interface for the manager.
@@ -413,7 +417,13 @@ func (m *Manager) createBox(ctx context.Context, cfg *config.Config) (*box.Box, 
 		return nil, errors.New("monitor manager not initialized")
 	}
 
-	opts, err := builder.Build(cfg, m.store)
+	effectiveCfg := *cfg
+	effectiveCfg.Nodes = m.selectNodesForSingBox(ctx, cfg.Nodes)
+	if len(effectiveCfg.Nodes) != len(cfg.Nodes) && m.logger != nil {
+		m.logger.Infof("node load limited for sing-box: selected=%d total=%d", len(effectiveCfg.Nodes), len(cfg.Nodes))
+	}
+
+	opts, err := builder.Build(&effectiveCfg, m.store)
 	if err != nil {
 		return nil, fmt.Errorf("build sing-box options: %w", err)
 	}
@@ -427,7 +437,7 @@ func (m *Manager) createBox(ctx context.Context, cfg *config.Config) (*box.Box, 
 
 	// Pre-register nodes so monitor APIs can see them even if sing-box does not instantiate
 	// our pool outbounds early (or context values are dropped internally).
-	m.preRegisterMonitorNodes(cfg)
+	m.preRegisterMonitorNodes(&effectiveCfg)
 
 	boxCtx := box.Context(ctx, inboundRegistry, outboundRegistry, endpointRegistry, dnsRegistry, serviceRegistry)
 	boxCtx = monitor.ContextWith(boxCtx, m.monitorMgr)
@@ -436,10 +446,171 @@ func (m *Manager) createBox(ctx context.Context, cfg *config.Config) (*box.Box, 
 	if err != nil {
 		// Best-effort: if sing-box fails while initializing outbounds, try to map the failing outbound
 		// to a node URI and mark it as damaged, so next run can start with remaining nodes.
-		m.tryMarkDamagedFromSingBoxInitError(cfg, opts, err)
+		m.tryMarkDamagedFromSingBoxInitError(&effectiveCfg, opts, err)
 		return nil, fmt.Errorf("create sing-box instance: %w", err)
 	}
 	return instance, nil
+}
+
+func (m *Manager) selectNodesForSingBox(ctx context.Context, nodes []config.NodeConfig) []config.NodeConfig {
+	if len(nodes) <= maxSingBoxNodes {
+		return cloneNodes(nodes)
+	}
+
+	healthySet, err := m.computeHealthyNodeSet(ctx, nodes)
+	if err != nil && m.logger != nil {
+		m.logger.Warnf("compute healthy node set failed, fallback to first %d nodes: %v", maxSingBoxNodes, err)
+	}
+
+	healthyNodes := make([]config.NodeConfig, 0, len(nodes))
+	otherNodes := make([]config.NodeConfig, 0, len(nodes))
+	for _, node := range nodes {
+		host, port, _, hpErr := store.HostPortFromURI(node.URI)
+		if hpErr == nil {
+			if _, ok := healthySet[nodeHostPortKey(host, port)]; ok {
+				healthyNodes = append(healthyNodes, node)
+				continue
+			}
+		}
+		otherNodes = append(otherNodes, node)
+	}
+
+	healthyQuota := int(float64(maxSingBoxNodes) * healthyNodeRatio)
+	if healthyQuota < 0 {
+		healthyQuota = 0
+	}
+	if healthyQuota > maxSingBoxNodes {
+		healthyQuota = maxSingBoxNodes
+	}
+
+	selectedHealthy := minInt(len(healthyNodes), healthyQuota)
+	selectedOther := minInt(len(otherNodes), maxSingBoxNodes-selectedHealthy)
+
+	selected := make([]config.NodeConfig, 0, maxSingBoxNodes)
+	selected = append(selected, healthyNodes[:selectedHealthy]...)
+	selected = append(selected, otherNodes[:selectedOther]...)
+
+	remaining := maxSingBoxNodes - len(selected)
+	if remaining > 0 && len(healthyNodes) > selectedHealthy {
+		extra := minInt(remaining, len(healthyNodes)-selectedHealthy)
+		selected = append(selected, healthyNodes[selectedHealthy:selectedHealthy+extra]...)
+		remaining -= extra
+	}
+	if remaining > 0 && len(otherNodes) > selectedOther {
+		extra := minInt(remaining, len(otherNodes)-selectedOther)
+		selected = append(selected, otherNodes[selectedOther:selectedOther+extra]...)
+	}
+
+	if len(selected) > maxSingBoxNodes {
+		selected = selected[:maxSingBoxNodes]
+	}
+	return selected
+}
+
+func (m *Manager) computeHealthyNodeSet(ctx context.Context, nodes []config.NodeConfig) (map[string]struct{}, error) {
+	healthy := make(map[string]struct{})
+	if len(nodes) == 0 || m.store == nil {
+		return healthy, nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	queryCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+
+	cutoff := time.Now().UTC().Add(-24 * time.Hour)
+	rows, err := m.store.QueryNodeRatesSince(queryCtx, cutoff)
+	if err != nil {
+		return healthy, err
+	}
+	if len(rows) == 0 {
+		return healthy, nil
+	}
+
+	rates := make([]float64, 0, len(rows))
+	rateByKey := make(map[string]float64, len(rows))
+	for _, row := range rows {
+		if row.Rate > 0 {
+			rates = append(rates, row.Rate)
+		}
+		rateByKey[nodeHostPortKey(row.Host, row.Port)] = row.Rate
+	}
+
+	p95 := 0.0
+	if len(rates) > 0 {
+		p95 = percentileFloat(rates, 0.95)
+	}
+	threshold := p95 - 0.05
+	if threshold < 0 {
+		threshold = 0
+	}
+	if threshold > 1 {
+		threshold = 1
+	}
+
+	for _, node := range nodes {
+		host, port, _, hpErr := store.HostPortFromURI(node.URI)
+		if hpErr != nil || host == "" || port <= 0 {
+			continue
+		}
+		if rate, ok := rateByKey[nodeHostPortKey(host, port)]; ok && rate >= threshold {
+			healthy[nodeHostPortKey(host, port)] = struct{}{}
+		}
+	}
+	return healthy, nil
+}
+
+func nodeHostPortKey(host string, port int) string {
+	return fmt.Sprintf("%s:%d", strings.TrimSpace(host), port)
+}
+
+func percentileFloat(values []float64, q float64) float64 {
+	if len(values) == 0 {
+		return 0
+	}
+	if q <= 0 {
+		return minFloat(values)
+	}
+	if q >= 1 {
+		return maxFloat(values)
+	}
+	sort.Float64s(values)
+	pos := q * float64(len(values)-1)
+	lower := int(math.Floor(pos))
+	upper := int(math.Ceil(pos))
+	if lower == upper {
+		return values[lower]
+	}
+	weight := pos - float64(lower)
+	return values[lower]*(1-weight) + values[upper]*weight
+}
+
+func minFloat(values []float64) float64 {
+	min := values[0]
+	for _, v := range values[1:] {
+		if v < min {
+			min = v
+		}
+	}
+	return min
+}
+
+func maxFloat(values []float64) float64 {
+	max := values[0]
+	for _, v := range values[1:] {
+		if v > max {
+			max = v
+		}
+	}
+	return max
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // gracefulSwitch swaps the current box with a new one.

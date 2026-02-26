@@ -74,6 +74,10 @@
 - store 启用时，`Available` 的唯一写入来源：p95-5% 阈值计算（无其它路径可覆写）。
   - 若 store 启用但近 24h 没有任何统计行，则所有节点视为不可调度（Available=false），避免沿用历史脏状态。
 - pool 调度过滤：仅允许 `InitialCheckDone=true 且 Available=true` 的节点进入候选集；`InitialCheckDone=false`（尚未完成初始检查/尚未应用阈值）也不会被调度，避免未检查节点承载真实流量。
+- sing-box 加载节点上限与分层选取：
+  - 在 `createBox` 前会基于 store 最近 24h 统计按同一口径临时重算“健康节点集合”（p95-5%，且 p95 仅统计成功率 `>0`）。
+  - 当候选节点超过 5000 时，最多加载 5000：优先 90% 健康节点，其余 10% 从其它节点补齐；任一类不足时由另一类补足。
+  - 该筛选仅影响 sing-box 实际加载节点（从而影响运行时健康检查与入站请求路由范围），不影响订阅刷新入库。
 - 全量重算：store 启用时，每 5 分钟强制全量重算全部节点的 `Available`（即使 probe 间隔更长或真实流量触发被节流）。
 - 自动清理：hourly 统计自动删除 7 天前的历史聚合数据。
 
@@ -81,6 +85,7 @@
 - internal/store/pebble/*：hourly 聚合写入、近 24h 成功率查询、历史数据清理。
 - internal/monitor/manager.go：周期性 probe 结果写入 store；真实连接健康事件写入 store；按 24h 成功率计算 p95-5% 阈值并更新节点 Available；每 5 分钟全量重算；定时清理 7 天前统计数据。
 - internal/outbound/pool/pool.go：调度时读取 monitor 的 Available/InitialCheckDone 进行过滤；新增“连接建立后 10 秒内累计未收到 1KB 数据则记一次失败（不影响连接）”的软失败逻辑。
+- internal/boxmgr/manager.go：createBox 前按 24h 口径选取最多 5000 节点（90% 健康 + 10% 其它）用于 sing-box 实际加载。
 
 注意：
 - 成功率统计与阈值过滤依赖从 URI 提取 host:port；若某类 URI 无法提取 host:port，则不会参与 hourly 统计与阈值过滤。
