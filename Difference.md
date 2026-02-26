@@ -185,9 +185,151 @@
 - config.example.yaml：sticky 示例配置。
 - docker-compose.yml、Dockerfile：sticky 端口说明与暴露。
 
+### 11. 订阅刷新 grep 统计日志 + 订阅解析兼容增强（已实现）
+
+目标：
+- 刷新订阅时输出便于 `grep` 的固定键值日志，至少包含：
+  - 订阅 URL
+  - 拉取内容大小（bytes）
+  - 解析得到的节点数
+  - 解析失败/跳过的节点数
+- 提升“有内容但解析失败”的订阅兼容性，减少因上游格式不规范导致整份丢弃。
+
+当前实现行为：
+- 订阅刷新新增固定格式日志（每个订阅 URL 一行）：
+  - 成功：`sub_refresh_result url="..." size_bytes=... parsed_nodes=... error_nodes=...`
+  - 失败：`sub_refresh_result url="..." size_bytes=... parsed_nodes=0 error_nodes=0 err="..."`
+- `subscription` 与 `config` 之间新增解析统计通道：
+  - `ParseSubscriptionContentWithStats(...)` 返回 `ParsedNodes/ErrorNodes`；
+  - 原有 `ParseSubscriptionContent(...)` 保持兼容，内部复用新实现。
+- PlainText 解析增强：
+  - 保持原有“每行 URI / URI + 备注”兼容；
+  - 新增对嵌入式链接提取（如 `Link: ss://...`），可识别并提取 URI。
+- Clash YAML 解析增强：
+  - `port` / `alterId` 支持数字字符串（如 `"443"`、`"64"`），避免因类型严格导致整份 YAML 解析失败。
+- 本地分析临时目录策略：
+  - `.gitignore` 新增 `.tmp/`，用于订阅原文排查等临时文件，避免误提交。
+
+涉及模块：
+- `internal/subscription/manager.go`：订阅拉取结果日志、`size_bytes/error_nodes` 统计输出。
+- `internal/config/config.go`：`ParseSubscriptionContentWithStats`、PlainText URI 提取增强、Clash `intOrString` 兼容解析。
+- `.gitignore`：新增 `.tmp/`。
+
 ## 关键语义：damaged vs health
 
 - damaged：持久化状态（DB），用于“导入/重载阶段”剔除明显错误/不应被加载的节点；damaged 的变动应伴随 sing-box 重载/构建发生。
 - health（健康度）：基于最近 24h 成功率（p95-5% 阈值）判断节点是否“可调度”。
   - store 启用时，`Available` 只由阈值计算写入（p95-5%）；启动初检/手动标记/probe 即时结果不会覆写可调度性口径。
   - 运行时失败不仅来源于周期性 probe，也包括真实连接的成功/失败事件（节流入库），从而让业务流量能反馈到健康统计与可调度性。
+
+## 本次会话新增差异（2026-02）
+
+### 12. 重建硬超时 + 超时累计退出（已实现）
+
+目标：避免 sing-box create/start 在单次重建中长时间卡死。
+
+当前实现行为：
+- 启动/重载每次 create+start 都套硬超时（默认 30s）。
+- 若连续超时达到 10 次，进程直接 `exit 1`，避免无限卡住。
+- 同时修复“重试全部失败仍继续走成功路径”的隐患。
+
+涉及模块：
+- `internal/boxmgr/manager.go`
+
+### 13. 全进程共享 Store 实例（已实现）
+
+目标：消除同进程重复 `pebblestore.Open` 导致的锁冲突（`lock held by current process`）。
+
+当前实现行为：
+- 在 `app.Run` 中只打开一次 Pebble Store，并通过依赖注入传给 `boxmgr/monitor/subscription/builder`。
+- 相关模块不再自行 `Open/Close` 同一路径 Pebble。
+- `monitor.Stop()` 不再关闭共享 Store（由 app 生命周期统一关闭）。
+- `Config.Save()` 不再自行打开 Pebble 写节点，节点持久化统一由运行时组件负责。
+
+涉及模块：
+- `internal/app/app.go`
+- `internal/boxmgr/manager.go`
+- `internal/monitor/manager.go`
+- `internal/subscription/manager.go`
+- `internal/builder/builder.go`
+- `internal/config/config.go`
+
+### 14. 订阅刷新强门控：写/读 Store 成功才允许 reload（已实现）
+
+目标：避免“Store 异常时仍用抓取结果重载 sing-box”。
+
+当前实现行为：
+- Store 不可用：本轮刷新直接失败并 `skip reload`。
+- Store 写入失败：直接失败并 `skip reload`。
+- Store 读取 active 失败：直接失败并 `skip reload`。
+- 读取 active 为 0：直接 `skip reload`。
+- 不再回退到“用 fetched nodes 直接重载”。
+
+涉及模块：
+- `internal/subscription/manager.go`
+
+### 15. 订阅写入改为 Pebble Batch（已实现）
+
+目标：降低大规模节点 upsert 的 fsync 开销，减少 `context deadline exceeded`。
+
+当前实现行为：
+- 新增 Store 批量接口：`UpsertNodesByHostPortBatch`。
+- Pebble 实现使用 `Batch` 聚合写入后一次 `Commit(Sync)`。
+- 订阅刷新改为批量 upsert，而非逐条 `Set(Sync)`。
+
+涉及模块：
+- `internal/store/store.go`
+- `internal/store/pebble/nodes.go`
+- `internal/subscription/manager.go`
+
+### 16. 订阅读取 active 超时与耗时日志（已实现）
+
+目标：大库扫描时避免过短超时导致误判失败，并提供诊断信息。
+
+当前实现行为：
+- 订阅写入超时常量化（60s）。
+- 订阅读取 active 超时提升（120s）。
+- 增加读取耗时日志（读到多少节点、耗时多久）。
+
+涉及模块：
+- `internal/subscription/manager.go`
+
+### 17. Reality `public_key` 前置校验（已实现）
+
+目标：在 builder 阶段提前发现无效 `public_key`，而不是等到 sing-box init 报错。
+
+当前实现行为：
+- 当 `security=reality` 时，对 `pbk` 做前置校验：
+  - 支持常见 base64 变体（含 URL-safe）。
+  - 解码后长度必须为 32 字节（X25519 公钥长度）。
+- 校验失败会在构建阶段直接判无效，走现有 damaged 标记与跳过路径。
+
+涉及模块：
+- `internal/builder/builder.go`
+
+### 18. 重试策略与日志精简（已实现）
+
+目标：减少“未收敛就提前失败”和构建日志刷屏。
+
+当前实现行为：
+- 启动/重载重试上限改为与 damaged 收敛联动（`maxRetries = maxDamagedRetries + 10`）。
+- 构建阶段去掉逐节点 `marked damaged ... skipping build` 噪声日志。
+- 失败日志改为汇总：总失败数、damaged/invalid 计数、少量示例。
+
+涉及模块：
+- `internal/boxmgr/manager.go`
+- `internal/builder/builder.go`
+
+### 19. damaged 启发式联动标记（已实现）
+
+目标：某节点确认 damaged 后，快速屏蔽“除 name/host/ip 外其余特征一致”的同类节点。
+
+当前实现行为：
+- 在 `MarkNodeDamaged` 后执行启发式传播：
+  - 计算 URI 签名（忽略 name/host/ip 相关字段）。
+  - 扫描节点并批量标记签名相同节点为 damaged。
+  - 使用 Batch 提交。
+- 用于加速同模板垃圾节点收敛，降低后续反复初始化失败。
+
+涉及模块：
+- `internal/store/pebble/nodes.go`
