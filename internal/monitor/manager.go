@@ -17,7 +17,6 @@ import (
 	"time"
 
 	"easy_proxies/internal/store"
-	pebblestore "easy_proxies/internal/store/pebble"
 
 	M "github.com/sagernet/sing/common/metadata"
 )
@@ -150,13 +149,15 @@ type Logger interface {
 }
 
 // NewManager constructs a manager and pre-validates the probe target.
-func NewManager(cfg Config) (*Manager, error) {
+// Store lifecycle is managed by the app and injected here.
+func NewManager(cfg Config, st store.Store) (*Manager, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	m := &Manager{
 		cfg:    cfg,
 		nodes:  make(map[string]*entry),
 		ctx:    ctx,
 		cancel: cancel,
+		db:     st,
 	}
 
 	if cfg.ProbeTarget != "" {
@@ -172,19 +173,6 @@ func NewManager(cfg Config) (*Manager, error) {
 		}
 	}
 
-	if cfg.Database.Enabled && strings.TrimSpace(cfg.Database.Path) != "" {
-		openCtx, cancelOpen := context.WithTimeout(ctx, 5*time.Second)
-		db, err := pebblestore.Open(openCtx, pebblestore.Options{Dir: cfg.Database.Path})
-		cancelOpen()
-		if err != nil {
-			// Best-effort: monitoring can still work without DB.
-			if m.logger != nil {
-				m.logger.Warn("open store failed, health persistence disabled: ", err)
-			}
-		} else {
-			m.db = db
-		}
-	}
 	return m, nil
 }
 
@@ -468,7 +456,8 @@ func (m *Manager) ResetRuntime() {
 	m.mu.Unlock()
 }
 
-// Stop stops the periodic health check and closes DB.
+// Stop stops the periodic health check.
+// Shared store lifecycle is managed by app.Run and must not be closed here.
 func (m *Manager) Stop() {
 	if m.cancel != nil {
 		m.cancel()
@@ -482,12 +471,6 @@ func (m *Manager) Stop() {
 	}
 	m.probeRoundMu.Unlock()
 
-	m.dbMu.Lock()
-	if m.db != nil {
-		_ = m.db.Close()
-		m.db = nil
-	}
-	m.dbMu.Unlock()
 }
 
 func parsePort(value string) uint16 {
@@ -1018,25 +1001,11 @@ func (m *Manager) shouldPersistHealth() bool {
 func (m *Manager) ListStoreNodes(ctx context.Context) ([]store.Node, error) {
 	m.dbMu.Lock()
 	db := m.db
-	dbPath := strings.TrimSpace(m.cfg.Database.Path)
 	m.dbMu.Unlock()
 	if db != nil {
 		return db.ListNodes(ctx)
 	}
-	if dbPath == "" {
-		return nil, errors.New("store not available")
-	}
-
-	openCtx := ctx
-	if openCtx == nil {
-		openCtx = m.ctx
-	}
-	tmp, err := pebblestore.Open(openCtx, pebblestore.Options{Dir: dbPath})
-	if err != nil {
-		return nil, fmt.Errorf("open store: %w", err)
-	}
-	defer tmp.Close()
-	return tmp.ListNodes(ctx)
+	return nil, errors.New("store not available")
 }
 
 const (

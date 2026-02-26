@@ -16,8 +16,6 @@ import (
 	"time"
 
 	"easy_proxies/internal/logx"
-	"easy_proxies/internal/store"
-	pebblestore "easy_proxies/internal/store/pebble"
 
 	"gopkg.in/yaml.v3"
 )
@@ -1178,30 +1176,8 @@ func (c *Config) SaveNodes() error {
 		}
 	}
 
-	// In forced-persistence mode: persist nodes into the Pebble store and never write nodes.txt.
-	if strings.TrimSpace(c.Store.Dir) != "" {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-
-		st, err := pebblestore.Open(ctx, pebblestore.Options{Dir: c.Store.Dir})
-		if err != nil {
-			return fmt.Errorf("open store: %w", err)
-		}
-		defer st.Close()
-
-		// Persist both inline/file nodes into store (best-effort per node).
-		all := make([]NodeConfig, 0, len(inlineNodes)+len(fileNodes))
-		all = append(all, inlineNodes...)
-		all = append(all, fileNodes...)
-		for _, n := range all {
-			if _, upErr := st.UpsertNodeByHostPort(ctx, store.UpsertNodeInput{
-				URI:  n.URI,
-				Name: n.Name,
-			}); upErr != nil {
-				return fmt.Errorf("upsert node to store: %w", upErr)
-			}
-		}
-	}
+	// Node persistence is handled by runtime components via injected shared store.
+	// Save() only persists config file contents.
 
 	// Only update config.yaml if there are inline nodes to save
 	// and preserve the original config structure

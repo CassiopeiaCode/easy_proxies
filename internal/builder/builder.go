@@ -14,9 +14,8 @@ import (
 
 	"easy_proxies/internal/config"
 	"easy_proxies/internal/logx"
-	"easy_proxies/internal/store"
-	pebblestore "easy_proxies/internal/store/pebble"
 	poolout "easy_proxies/internal/outbound/pool"
+	"easy_proxies/internal/store"
 
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/option"
@@ -25,30 +24,17 @@ import (
 )
 
 // Build converts high level config into sing-box Options tree.
-func Build(cfg *config.Config) (option.Options, error) {
+func Build(cfg *config.Config, st store.Store) (option.Options, error) {
 	baseOutbounds := make([]option.Outbound, 0, len(cfg.Nodes))
 	memberTags := make([]string, 0, len(cfg.Nodes))
 	metadata := make(map[string]poolout.MemberMeta)
 	var failedNodes []string
 	usedTags := make(map[string]int) // Track tag usage for uniqueness
 
-	// Best-effort: when store is enabled:
+	// Best-effort with shared store:
 	// - skip nodes already marked as damaged (so they will not be built into sing-box)
 	// - mark "build-time" invalid nodes as damaged
-	var st store.Store
-	if cfg != nil && strings.TrimSpace(cfg.Store.Dir) != "" {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		var err error
-		st, err = pebblestore.Open(ctx, pebblestore.Options{Dir: cfg.Store.Dir})
-		cancel()
-		if err != nil {
-			logx.Printf("⚠️  store open failed, damaged tracking disabled: %v", err)
-			st = nil
-		}
-	}
-	if st != nil {
-		defer st.Close()
-	}
+	// Store lifecycle is managed by app.Run; do not Open/Close here.
 
 	for _, node := range cfg.Nodes {
 		baseTag := sanitizeTag(node.Name)

@@ -25,6 +25,7 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	if err != nil {
 		return fmt.Errorf("open store: %w", err)
 	}
+	defer st.Close()
 
 	// Import nodes from config into store, then load active nodes as runtime node list.
 	importCtx, cancelImport := context.WithTimeout(ctx, 10*time.Second)
@@ -48,9 +49,6 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		cfg.Nodes = nodes
 		logx.Printf("✅ loaded %d active nodes from store", len(active))
 	}
-
-	// Release startup store handle before monitor manager opens the same Pebble dir.
-	_ = st.Close()
 
 	// Build monitor config
 	proxyUsername := cfg.Listener.Username
@@ -78,7 +76,7 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	}
 
 	// Create and start BoxManager
-	boxMgr := boxmgr.New(cfg, monitorCfg)
+	boxMgr := boxmgr.New(cfg, monitorCfg, st)
 	if err := boxMgr.Start(ctx); err != nil {
 		return fmt.Errorf("start box manager: %w", err)
 	}
@@ -92,7 +90,7 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	// Create and start SubscriptionManager if enabled
 	var subMgr *subscription.Manager
 	if cfg.SubscriptionRefresh.Enabled && len(cfg.Subscriptions) > 0 {
-		subMgr = subscription.New(cfg, boxMgr)
+		subMgr = subscription.New(cfg, boxMgr, st)
 		subMgr.Start()
 		defer subMgr.Stop()
 

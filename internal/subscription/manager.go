@@ -19,7 +19,6 @@ import (
 	"easy_proxies/internal/logx"
 	"easy_proxies/internal/monitor"
 	"easy_proxies/internal/store"
-	pebblestore "easy_proxies/internal/store/pebble"
 )
 
 // Logger defines logging interface.
@@ -43,6 +42,7 @@ type Manager struct {
 
 	baseCfg *config.Config
 	boxMgr  *boxmgr.Manager
+	store   store.Store
 	logger  Logger
 
 	status        monitor.SubscriptionStatus
@@ -57,11 +57,12 @@ type Manager struct {
 }
 
 // New creates a SubscriptionManager.
-func New(cfg *config.Config, boxMgr *boxmgr.Manager, opts ...Option) *Manager {
+func New(cfg *config.Config, boxMgr *boxmgr.Manager, st store.Store, opts ...Option) *Manager {
 	ctx, cancel := context.WithCancel(context.Background())
 	m := &Manager{
 		baseCfg:       cfg,
 		boxMgr:        boxMgr,
+		store:         st,
 		ctx:           ctx,
 		cancel:        cancel,
 		manualRefresh: make(chan struct{}, 1),
@@ -226,53 +227,62 @@ func (m *Manager) doRefresh() {
 
 	m.logger.Infof("fetched %d nodes from subscriptions", len(nodes))
 
-	// If DB is enabled, treat DB as the primary node store:
+	// Store is the source of truth:
 	// - upsert nodes by host:port (dedup)
-	// - reload from DB active nodes
-	// In this repo, nodes.txt is read-only and must not be written.
-	var merged []config.NodeConfig
-
-	if m.baseCfg != nil && strings.TrimSpace(m.baseCfg.Store.Dir) != "" {
-		openCtx, cancelOpen := context.WithTimeout(m.ctx, 5*time.Second)
-		st, stErr := pebblestore.Open(openCtx, pebblestore.Options{Dir: m.baseCfg.Store.Dir})
-		cancelOpen()
-		if stErr != nil {
-			m.logger.Warnf("open store failed, fallback to nodes.txt only: %v", stErr)
-		} else {
-			upCtx, cancelUp := context.WithTimeout(m.ctx, 15*time.Second)
-			for _, n := range nodes {
-				if _, upErr := st.UpsertNodeByHostPort(upCtx, store.UpsertNodeInput{
-					URI:  n.URI,
-					Name: n.Name,
-				}); upErr != nil {
-					// Cannot extract host:port => drop.
-					m.logger.Warnf("drop node (cannot extract host:port): %s (%v)", n.Name, upErr)
-				}
-			}
-			cancelUp()
-
-			loadCtx, cancelLoad := context.WithTimeout(m.ctx, 5*time.Second)
-			active, listErr := st.ListActiveNodes(loadCtx)
-			cancelLoad()
-			_ = st.Close()
-
-			if listErr != nil {
-				m.logger.Warnf("list active nodes from store failed, fallback to nodes.txt only: %v", listErr)
-			} else if len(active) > 0 {
-				merged = make([]config.NodeConfig, 0, len(active))
-				for _, n := range active {
-					merged = append(merged, config.NodeConfig{
-						Name: n.Name,
-						URI:  n.URI,
-					})
-				}
-			}
-		}
+	// - then reload strictly from store active nodes
+	// If store write/read fails, do not reload.
+	if m.store == nil {
+		m.mu.Lock()
+		m.status.LastError = "store unavailable: skip reload"
+		m.status.LastRefresh = time.Now()
+		m.mu.Unlock()
+		m.logger.Errorf("store unavailable, skip reload")
+		return
 	}
 
-	// Fallback: no DB or DB result empty => use fetched nodes.
-	if len(merged) == 0 {
-		merged = nodes
+	upCtx, cancelUp := context.WithTimeout(m.ctx, 15*time.Second)
+	for _, n := range nodes {
+		if _, upErr := m.store.UpsertNodeByHostPort(upCtx, store.UpsertNodeInput{
+			URI:  n.URI,
+			Name: n.Name,
+		}); upErr != nil {
+			cancelUp()
+			m.mu.Lock()
+			m.status.LastError = fmt.Sprintf("store write failed: %v", upErr)
+			m.status.LastRefresh = time.Now()
+			m.mu.Unlock()
+			m.logger.Errorf("store write failed, skip reload: %v", upErr)
+			return
+		}
+	}
+	cancelUp()
+
+	loadCtx, cancelLoad := context.WithTimeout(m.ctx, 5*time.Second)
+	active, listErr := m.store.ListActiveNodes(loadCtx)
+	cancelLoad()
+	if listErr != nil {
+		m.mu.Lock()
+		m.status.LastError = fmt.Sprintf("store read failed: %v", listErr)
+		m.status.LastRefresh = time.Now()
+		m.mu.Unlock()
+		m.logger.Errorf("store read failed, skip reload: %v", listErr)
+		return
+	}
+	if len(active) == 0 {
+		m.mu.Lock()
+		m.status.LastError = "store read returned 0 active nodes: skip reload"
+		m.status.LastRefresh = time.Now()
+		m.mu.Unlock()
+		m.logger.Warnf("store read returned 0 active nodes, skip reload")
+		return
+	}
+
+	merged := make([]config.NodeConfig, 0, len(active))
+	for _, n := range active {
+		merged = append(merged, config.NodeConfig{
+			Name: n.Name,
+			URI:  n.URI,
+		})
 	}
 
 	// nodes.txt is read-only in this repo. Do not write any cache file.

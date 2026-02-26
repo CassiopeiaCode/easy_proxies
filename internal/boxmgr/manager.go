@@ -18,9 +18,8 @@ import (
 	"easy_proxies/internal/config"
 	"easy_proxies/internal/logx"
 	"easy_proxies/internal/monitor"
-	"easy_proxies/internal/store"
-	pebblestore "easy_proxies/internal/store/pebble"
 	"easy_proxies/internal/outbound/pool"
+	"easy_proxies/internal/store"
 
 	"github.com/sagernet/sing-box"
 	"github.com/sagernet/sing-box/include"
@@ -63,6 +62,7 @@ type Manager struct {
 	monitorServer *monitor.Server
 	cfg           *config.Config
 	monitorCfg    monitor.Config
+	store         store.Store
 
 	drainTimeout      time.Duration
 	minAvailableNodes int
@@ -73,10 +73,12 @@ type Manager struct {
 }
 
 // New creates a BoxManager with the given config.
-func New(cfg *config.Config, monitorCfg monitor.Config, opts ...Option) *Manager {
+// Store lifecycle is managed by app.Run and injected here.
+func New(cfg *config.Config, monitorCfg monitor.Config, st store.Store, opts ...Option) *Manager {
 	m := &Manager{
 		cfg:        cfg,
 		monitorCfg: monitorCfg,
+		store:      st,
 	}
 	m.applyConfigSettings(cfg)
 	for _, opt := range opts {
@@ -411,7 +413,7 @@ func (m *Manager) createBox(ctx context.Context, cfg *config.Config) (*box.Box, 
 		return nil, errors.New("monitor manager not initialized")
 	}
 
-	opts, err := builder.Build(cfg)
+	opts, err := builder.Build(cfg, m.store)
 	if err != nil {
 		return nil, fmt.Errorf("build sing-box options: %w", err)
 	}
@@ -555,7 +557,7 @@ func (m *Manager) ensureMonitor(ctx context.Context) error {
 		return nil
 	}
 
-	monitorMgr, err := monitor.NewManager(m.monitorCfg)
+	monitorMgr, err := monitor.NewManager(m.monitorCfg, m.store)
 	if err != nil {
 		m.mu.Unlock()
 		return fmt.Errorf("init monitor manager: %w", err)
@@ -675,18 +677,11 @@ func (m *Manager) CreateNode(ctx context.Context, node config.NodeConfig) (confi
 		normalized.Source = config.NodeSourceInline
 	}
 
-	// Persist node into store (Pebble).
-	if strings.TrimSpace(m.cfg.Store.Dir) != "" {
-		dbCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		st, err := pebblestore.Open(dbCtx, pebblestore.Options{Dir: m.cfg.Store.Dir})
-		cancel()
-		if err != nil {
-			return config.NodeConfig{}, fmt.Errorf("open store: %w", err)
-		}
+	// Persist node into shared store.
+	if m.store != nil {
 		upCtx, cancelUp := context.WithTimeout(context.Background(), 5*time.Second)
-		_, upErr := st.UpsertNodeByHostPort(upCtx, store.UpsertNodeInput{URI: normalized.URI, Name: normalized.Name})
+		_, upErr := m.store.UpsertNodeByHostPort(upCtx, store.UpsertNodeInput{URI: normalized.URI, Name: normalized.Name})
 		cancelUp()
-		_ = st.Close()
 		if upErr != nil {
 			return config.NodeConfig{}, fmt.Errorf("upsert node to store: %w", upErr)
 		}
@@ -731,27 +726,19 @@ func (m *Manager) UpdateNode(ctx context.Context, name string, node config.NodeC
 
 	prev := m.cfg.Nodes[idx]
 
-	// Persist updates into store (Pebble).
+	// Persist updates into shared store.
 	// If host:port changed, delete the old record and upsert the new one.
-	if strings.TrimSpace(m.cfg.Store.Dir) != "" {
-		dbCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		st, err := pebblestore.Open(dbCtx, pebblestore.Options{Dir: m.cfg.Store.Dir})
-		cancel()
-		if err != nil {
-			return config.NodeConfig{}, fmt.Errorf("open store: %w", err)
-		}
-
+	if m.store != nil {
 		// Best-effort delete old key if URI changed.
 		if strings.TrimSpace(prev.URI) != "" && strings.TrimSpace(prev.URI) != strings.TrimSpace(normalized.URI) {
 			delCtx, cancelDel := context.WithTimeout(context.Background(), 5*time.Second)
-			_ = st.DeleteNodeByURI(delCtx, prev.URI)
+			_ = m.store.DeleteNodeByURI(delCtx, prev.URI)
 			cancelDel()
 		}
 
 		upCtx, cancelUp := context.WithTimeout(context.Background(), 5*time.Second)
-		_, upErr := st.UpsertNodeByHostPort(upCtx, store.UpsertNodeInput{URI: normalized.URI, Name: normalized.Name})
+		_, upErr := m.store.UpsertNodeByHostPort(upCtx, store.UpsertNodeInput{URI: normalized.URI, Name: normalized.Name})
 		cancelUp()
-		_ = st.Close()
 		if upErr != nil {
 			return config.NodeConfig{}, fmt.Errorf("upsert node to store: %w", upErr)
 		}
@@ -788,18 +775,11 @@ func (m *Manager) DeleteNode(ctx context.Context, name string) error {
 
 	uriToDelete := m.cfg.Nodes[idx].URI
 
-	// Delete from store (Pebble).
-	if strings.TrimSpace(m.cfg.Store.Dir) != "" && strings.TrimSpace(uriToDelete) != "" {
-		dbCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		st, err := pebblestore.Open(dbCtx, pebblestore.Options{Dir: m.cfg.Store.Dir})
-		cancel()
-		if err != nil {
-			return fmt.Errorf("open store: %w", err)
-		}
+	// Delete from shared store.
+	if m.store != nil && strings.TrimSpace(uriToDelete) != "" {
 		delCtx, cancelDel := context.WithTimeout(context.Background(), 5*time.Second)
-		delErr := st.DeleteNodeByURI(delCtx, uriToDelete)
+		delErr := m.store.DeleteNodeByURI(delCtx, uriToDelete)
 		cancelDel()
-		_ = st.Close()
 		if delErr != nil {
 			return fmt.Errorf("delete node from store: %w", delErr)
 		}
@@ -862,12 +842,12 @@ func (m *Manager) CurrentPortMap() map[string]uint16 {
 // --- Helper functions ---
 
 var (
-// portBindErrorRegex matches "listen tcp4 0.0.0.0:24282: bind: address already in use"
-portBindErrorRegex = regexp.MustCompile(`listen tcp[46]? [^:]+:(\d+): bind: address already in use`)
+	// portBindErrorRegex matches "listen tcp4 0.0.0.0:24282: bind: address already in use"
+	portBindErrorRegex = regexp.MustCompile(`listen tcp[46]? [^:]+:(\d+): bind: address already in use`)
 
-// singBoxInitOutboundIdxRegex matches sing-box init errors like:
-// "initialize outbound[107]: create client transport: none: unknown transport type: none"
-singBoxInitOutboundIdxRegex = regexp.MustCompile(`initialize outbound\[(\d+)\]`)
+	// singBoxInitOutboundIdxRegex matches sing-box init errors like:
+	// "initialize outbound[107]: create client transport: none: unknown transport type: none"
+	singBoxInitOutboundIdxRegex = regexp.MustCompile(`initialize outbound\[(\d+)\]`)
 )
 
 // extractPortFromBindError extracts the port number from a bind error message.
@@ -1032,10 +1012,7 @@ func outboundTagAtIndex(opts any, idx int) string {
 }
 
 func (m *Manager) tryMarkDamagedFromSingBoxInitError(cfg *config.Config, opts any, cause error) {
-	if cfg == nil || cause == nil {
-		return
-	}
-	if strings.TrimSpace(cfg.Store.Dir) == "" {
+	if cfg == nil || cause == nil || m.store == nil {
 		return
 	}
 
@@ -1063,14 +1040,7 @@ func (m *Manager) tryMarkDamagedFromSingBoxInitError(cfg *config.Config, opts an
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-
-	db, err := pebblestore.Open(ctx, pebblestore.Options{Dir: cfg.Store.Dir})
-	if err != nil {
-		return
-	}
-	defer db.Close()
-
-	_ = db.MarkNodeDamaged(ctx, host, port, cause.Error())
+	_ = m.store.MarkNodeDamaged(ctx, host, port, cause.Error())
 }
 
 // reassignConflictingPort finds the node using the conflicting port and assigns a new port.
