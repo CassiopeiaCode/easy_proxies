@@ -143,6 +143,10 @@
 - 重载开始时，先取消 monitor 的运行时 context（终止 in-flight probes/periodic loop），并清空运行时节点注册表（nodes map）；等待新实例启动后重新注册节点。
 - 重载成功后，同样等待 monitor 重新注册，再启动 periodic health check。
 - 在观察到节点重新注册后，会立即将 store 的近 24h 健康阈值应用到运行态节点（不必等待下一轮 periodic probe），用于尽快收敛 `Available/InitialCheckDone` 语义与调度/展示口径。
+- 重载切换改为“两阶段”：
+  - 阶段 1：旧实例继续运行时先执行 `createBox`（含构建/初始化重试与超时控制）；
+  - 阶段 2：仅在准备好新实例后才关闭旧实例并启动新实例。
+  - 若阶段 1 失败，旧实例不会被中断；若阶段 2 失败，会回滚拉起旧配置实例，避免服务长时间不可用。
 
 涉及模块：
 - internal/monitor/manager.go：新增 ResetRuntime（保留 DB/Config，仅重置运行态）。

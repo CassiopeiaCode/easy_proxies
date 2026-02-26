@@ -232,15 +232,6 @@ func (m *Manager) Reload(newCfg *config.Config) error {
 	ctx := m.baseCtx
 	oldBox := m.currentBox
 	oldCfg := m.cfg
-	monitorMgr := m.monitorMgr
-	m.currentBox = nil // Mark as reloading
-
-	// Reload 期间如果 monitor 正在健康检查，会继续用旧 probe/旧 outbound 产生大量失败与脏数据。
-	// 这里先取消正在进行的探测并清空运行时节点注册表，等待新实例重新注册。
-	if monitorMgr != nil {
-		monitorMgr.ResetRuntime()
-		m.healthCheckStarted = false
-	}
 	m.mu.Unlock()
 
 	if ctx == nil {
@@ -249,21 +240,8 @@ func (m *Manager) Reload(newCfg *config.Config) error {
 
 	m.logger.Infof("reloading with %d nodes", len(newCfg.Nodes))
 
-	// For multi-port mode, we must close old instance first to release ports
-	// This causes a brief interruption but avoids port conflicts
-	if oldBox != nil {
-		m.logger.Infof("stopping old instance to release ports...")
-		if err := oldBox.Close(); err != nil {
-			m.logger.Warnf("error closing old instance: %v", err)
-		}
-		// Give OS time to release ports
-		time.Sleep(500 * time.Millisecond)
-	}
-
-	// Reset shared state store to ensure clean state for new config
-	pool.ResetSharedStateStore()
-
-	// Create and start new box instance with automatic port conflict resolution.
+	// Phase 1: create new box while old instance is still running.
+	// This avoids hard interruptions where create/build hangs or times out.
 	// On outbound init failures, best-effort mark damaged and retry quickly.
 	var instance *box.Box
 	maxDamagedRetries := 50
@@ -271,20 +249,19 @@ func (m *Manager) Reload(newCfg *config.Config) error {
 	damagedRetries := 0
 	timeoutRetries := 0
 	var lastErr error
-	started := false
+	created := false
 	for retry := 0; retry < maxRetries; retry++ {
-		// Hard-timeout each rebuild attempt so one stuck create/start cannot block forever.
+		// Hard-timeout each rebuild attempt so one stuck create cannot block forever.
 		var err error
 		var timedOut bool
-		instance, err, timedOut = m.createAndStartWithTimeout(ctx, newCfg, rebuildHardTimeout)
+		instance, err, timedOut = m.createWithTimeout(ctx, newCfg, rebuildHardTimeout)
 		if timedOut {
 			timeoutRetries++
 			m.logger.Warnf("create new box timed out (attempt %d/%d), hard-timeout=%s", timeoutRetries, maxRebuildTimeoutRetries, rebuildHardTimeout)
 			if timeoutRetries >= maxRebuildTimeoutRetries {
-				m.logger.Errorf("create new box timed out %d times, exiting with code 1", timeoutRetries)
-				os.Exit(1)
+				lastErr = fmt.Errorf("create new box timed out %d times, hard-timeout=%s", timeoutRetries, rebuildHardTimeout)
+				break
 			}
-			lastErr = fmt.Errorf("create new box timed out after %s", rebuildHardTimeout)
 			pool.ResetSharedStateStore()
 			continue
 		}
@@ -296,27 +273,52 @@ func (m *Manager) Reload(newCfg *config.Config) error {
 				time.Sleep(200 * time.Millisecond)
 				continue
 			}
-			// Keep existing behavior for bind conflicts: reassign and retry.
-			if conflictPort := extractPortFromBindError(err); conflictPort > 0 {
-				m.logger.Warnf("port %d is in use, reassigning and retrying...", conflictPort)
-				if reassigned := reassignConflictingPort(newCfg, conflictPort); reassigned {
-					pool.ResetSharedStateStore()
-					continue
-				}
-			}
 			lastErr = err
-			m.rollbackToOldConfig(ctx, oldCfg)
-			return fmt.Errorf("create new box: %w", lastErr)
+			break
 		}
-		started = true
+		created = true
 		break // Success
 	}
-	if !started || instance == nil {
+	if !created || instance == nil {
 		if lastErr == nil {
-			lastErr = errors.New("failed to create/start new box after retries")
+			lastErr = errors.New("failed to create new box after retries")
 		}
-		m.rollbackToOldConfig(ctx, oldCfg)
 		return fmt.Errorf("create new box: %w", lastErr)
+	}
+
+	// Phase 2: cutover window. Stop old box to release ports, then start the prepared instance.
+	// Any failure here must rollback to old config.
+	if oldBox != nil {
+		m.logger.Infof("stopping old instance to release ports...")
+		if err := oldBox.Close(); err != nil {
+			m.logger.Warnf("error closing old instance: %v", err)
+		}
+		// Give OS time to release ports
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	// Reload 期间如果 monitor 正在健康检查，会继续用旧 probe/旧 outbound 产生大量失败与脏数据。
+	// 在切换窗口再重置，避免构建失败时影响旧实例运行期监控。
+	m.mu.Lock()
+	if m.monitorMgr != nil {
+		m.monitorMgr.ResetRuntime()
+		m.healthCheckStarted = false
+	}
+	m.currentBox = nil // Mark as switching
+	m.mu.Unlock()
+
+	startErr, startTimedOut := m.startWithTimeout(ctx, instance, rebuildHardTimeout)
+	if startTimedOut {
+		_ = instance.Close()
+		m.rollbackToOldConfig(ctx, oldCfg)
+		return fmt.Errorf("start new box timed out after %s", rebuildHardTimeout)
+	}
+	if startErr != nil {
+		_ = instance.Close()
+		// Keep existing behavior for bind conflicts: reassign and retry on full reload path.
+		// Here old box is already closed, so rollback first to keep service available.
+		m.rollbackToOldConfig(ctx, oldCfg)
+		return fmt.Errorf("start new box: %w", startErr)
 	}
 
 	m.applyConfigSettings(newCfg)
@@ -1259,6 +1261,19 @@ func cloneNodes(nodes []config.NodeConfig) []config.NodeConfig {
 }
 
 func (m *Manager) createAndStartWithTimeout(ctx context.Context, cfg *config.Config, timeout time.Duration) (*box.Box, error, bool) {
+	instance, err, timedOut := m.createWithTimeout(ctx, cfg, timeout)
+	if err != nil || timedOut {
+		return nil, err, timedOut
+	}
+	startErr, startTimedOut := m.startWithTimeout(ctx, instance, timeout)
+	if startErr != nil {
+		_ = instance.Close()
+		return nil, startErr, startTimedOut
+	}
+	return instance, nil, false
+}
+
+func (m *Manager) createWithTimeout(ctx context.Context, cfg *config.Config, timeout time.Duration) (*box.Box, error, bool) {
 	if timeout <= 0 {
 		timeout = rebuildHardTimeout
 	}
@@ -1273,28 +1288,49 @@ func (m *Manager) createAndStartWithTimeout(ctx context.Context, cfg *config.Con
 
 	go func() {
 		instance, err := m.createBox(attemptCtx, cfg)
-		if err != nil {
-			done <- result{err: err}
-			return
-		}
-
-		if startErr := instance.Start(); startErr != nil {
-			_ = instance.Close()
-			done <- result{err: fmt.Errorf("start sing-box: %w", startErr)}
-			return
-		}
-
-		done <- result{instance: instance}
+		done <- result{instance: instance, err: err}
 	}()
 
 	select {
 	case r := <-done:
-		return r.instance, r.err, false
+		if r.err != nil {
+			return nil, r.err, false
+		}
+		return r.instance, nil, false
 	case <-attemptCtx.Done():
 		if errors.Is(attemptCtx.Err(), context.DeadlineExceeded) {
-			return nil, fmt.Errorf("create/start timed out after %s", timeout), true
+			return nil, fmt.Errorf("create timed out after %s", timeout), true
 		}
 		return nil, attemptCtx.Err(), false
+	}
+}
+
+func (m *Manager) startWithTimeout(ctx context.Context, instance *box.Box, timeout time.Duration) (error, bool) {
+	if instance == nil {
+		return errors.New("instance is nil"), false
+	}
+	if timeout <= 0 {
+		timeout = rebuildHardTimeout
+	}
+	attemptCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- instance.Start()
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			return fmt.Errorf("start sing-box: %w", err), false
+		}
+		return nil, false
+	case <-attemptCtx.Done():
+		if errors.Is(attemptCtx.Err(), context.DeadlineExceeded) {
+			return fmt.Errorf("start timed out after %s", timeout), true
+		}
+		return attemptCtx.Err(), false
 	}
 }
 
