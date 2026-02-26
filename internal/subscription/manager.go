@@ -24,7 +24,7 @@ import (
 const (
 	storeWriteTimeout = 10 * time.Minute
 	storeReadTimeout  = 120 * time.Second
-	storeWriteBatch   = 2000
+	storeWriteBatch   = 100
 )
 
 // Logger defines logging interface.
@@ -288,6 +288,7 @@ func (m *Manager) doRefresh() {
 			m.logger.Errorf("store write failed, skip reload: %v", upCtx.Err())
 			return
 		}
+		
 		end := i + storeWriteBatch
 		if end > len(inputs) {
 			end = len(inputs)
@@ -296,6 +297,7 @@ func (m *Manager) doRefresh() {
 		upErr := m.store.UpsertNodesByHostPortBatch(upCtx, chunk)
 		if upErr == nil {
 			successCount += len(chunk)
+			m.logger.Infof("store upsert partially success: %d nodes", successCount)
 			continue
 		}
 
