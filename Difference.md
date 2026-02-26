@@ -258,6 +258,38 @@
 
 当前实现行为：
 - 在 `app.Run` 中只打开一次 Pebble Store，并通过依赖注入传给 `boxmgr/monitor/subscription/builder`。
+
+### 14. 修复 periodic health check 在 ResetRuntime/Reload 后 goroutine 泄漏（已实现）
+
+问题现象：
+- 多次 Reload 后，monitor 的周期性健康检查 goroutine 未按预期退出，导致同一时刻存在多个健康检查循环。
+- 多个循环会互相触发 “新一轮取消旧一轮”，产生大量 `context cancelled` 的 probe 结果与脏数据，进一步影响可调度性判断。
+
+根因：
+- `ResetRuntime()` 会替换 `m.ctx` 为一个新的 context；而周期循环使用 `select { case <-m.ctx.Done(): ... }` 动态读取 `m.ctx`，可能错过旧 ctx 的取消，从而泄漏旧循环。
+
+修复后行为：
+- 周期健康检查循环在启动时捕获 `loopCtx`（当时的 `m.ctx`），后续只监听该 ctx 的 Done，从而保证 `ResetRuntime()` 取消旧 ctx 时能可靠退出旧循环。
+
+涉及模块：
+- `internal/monitor/manager.go`
+
+### 15. 修复 sing-box 实例 runtime context 被 create 超时取消，导致真实流量拨号被取消（已实现）
+
+问题现象：
+- 客户端一入站即出现大量 `dial tcp ...: operation was canceled`，表现为 CONNECT 先返回 `200 Connection established`，随后 TLS/数据流立刻被 RST/中断。
+
+根因：
+- `createWithTimeout()` 使用带超时的 `attemptCtx` 作为 `box.Context(...)` 的基础 context；函数返回时会 `cancel()`，间接把实例 runtime context 一并取消。
+- 结果是：实例启动后 `ctx` 已处于 cancelled 状态，所有下游 `DialContext` 都会被取消。
+
+修复后行为：
+- 分离“创建阶段超时控制 ctx（attemptCtx）”与“实例生命周期 ctx（instanceCtx）”：
+  - `attemptCtx` 仅用于限制 create/build 时长；
+  - `instanceCtx` 随实例存活，并在 Reload/Close/rollback 时显式 cancel。
+
+涉及模块：
+- `internal/boxmgr/manager.go`
 - 相关模块不再自行 `Open/Close` 同一路径 Pebble。
 - `monitor.Stop()` 不再关闭共享 Store（由 app 生命周期统一关闭）。
 - `Config.Save()` 不再自行打开 Pebble 写节点，节点持久化统一由运行时组件负责。
