@@ -24,7 +24,6 @@ import (
 const (
 	storeWriteTimeout = 10 * time.Minute
 	storeReadTimeout  = 120 * time.Second
-	storeWriteBatch   = 100
 )
 
 // Logger defines logging interface.
@@ -279,31 +278,13 @@ func (m *Manager) doRefresh() {
 
 	successCount := 0
 	failCount := 0
-	for i := 0; i < len(inputs); i += storeWriteBatch {
-		if upCtx.Err() != nil {
-			m.mu.Lock()
-			m.status.LastError = fmt.Sprintf("store write failed: %v", upCtx.Err())
-			m.status.LastRefresh = time.Now()
-			m.mu.Unlock()
-			m.logger.Errorf("store write failed, skip reload: %v", upCtx.Err())
-			return
-		}
-		
-		end := i + storeWriteBatch
-		if end > len(inputs) {
-			end = len(inputs)
-		}
-		chunk := inputs[i:end]
-		upErr := m.store.UpsertNodesByHostPortBatch(upCtx, chunk)
-		if upErr == nil {
-			successCount += len(chunk)
-			m.logger.Infof("store upsert partially success: %d nodes", successCount)
-			continue
-		}
-
-		// Degrade gracefully on chunk failure: isolate bad records and keep progress.
-		m.logger.Warnf("store batch upsert failed for chunk [%d,%d), fallback to per-node: %v", i, end, upErr)
-		for _, in := range chunk {
+	upErr := m.store.UpsertNodesByHostPortBatch(upCtx, inputs)
+	if upErr == nil {
+		successCount = len(inputs)
+	} else {
+		// Degrade gracefully: keep progress even if bulk merge+write fails.
+		m.logger.Warnf("store batch upsert failed, fallback to per-node: %v", upErr)
+		for _, in := range inputs {
 			if upCtx.Err() != nil {
 				break
 			}

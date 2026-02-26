@@ -276,10 +276,11 @@
 
 当前实现行为：
 - 新增 Store 批量接口：`UpsertNodesByHostPortBatch`。
-- Pebble 实现使用 `Batch` 聚合写入后一次 `Commit(Sync)`。
-- 订阅刷新改为批量 upsert，而非逐条 `Set(Sync)`。
-- 订阅写入采用分批 upsert（默认每批 2000）。
-- 某个批次失败时会降级为该批逐条 upsert，避免整轮失败。
+- 订阅刷新改为单次批量 upsert 调用，而非外层循环小批次调用。
+- Pebble 批量 upsert 先一次扫描加载“命中键”的已有记录，在内存合并后再写回。
+- 写回阶段采用分块 `Batch Commit(Sync)`（默认每块 2000 条），降低单次超大 batch 风险。
+- 合并写回按快照语义执行：对批处理中途并发写入不做冲突检测（即忽略新修改）。
+- 若单次批量 upsert 失败，会降级为逐条 upsert，避免整轮失败。
 - 写入前会先过滤无法解析 host:port 的非法 URI，仅丢弃坏节点并继续。
 
 涉及模块：

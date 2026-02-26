@@ -14,6 +14,8 @@ import (
 	pebblepkg "github.com/cockroachdb/pebble"
 )
 
+const nodeUpsertWriteChunkSize = 2000
+
 // UpsertNodeByHostPort upserts node metadata by dedup key (host,port) extracted from URI.
 func (d *DB) UpsertNodeByHostPort(ctx context.Context, in store.UpsertNodeInput) (store.Node, error) {
 	if d == nil || d.db == nil {
@@ -85,7 +87,8 @@ func (d *DB) UpsertNodeByHostPort(ctx context.Context, in store.UpsertNodeInput)
 }
 
 // UpsertNodesByHostPortBatch upserts node metadata by dedup key (host,port) for a batch.
-// It commits once with pebble.Sync to reduce fsync overhead for large refreshes.
+// It loads existing records in one pass, merges in memory, then commits in chunks.
+// This intentionally ignores concurrent mid-flight changes and applies the merged snapshot.
 func (d *DB) UpsertNodesByHostPortBatch(ctx context.Context, in []store.UpsertNodeInput) error {
 	if d == nil || d.db == nil {
 		return errors.New("pebble: db not initialized")
@@ -99,7 +102,16 @@ func (d *DB) UpsertNodesByHostPortBatch(ctx context.Context, in []store.UpsertNo
 		return nil
 	}
 
-	updates := make(map[string]store.Node, len(in))
+	type preparedNode struct {
+		key      string
+		host     string
+		port     int
+		uri      string
+		name     string
+		protocol string
+	}
+
+	prepared := make(map[string]preparedNode, len(in))
 	now := time.Now().UTC()
 
 	for _, item := range in {
@@ -122,66 +134,106 @@ func (d *DB) UpsertNodesByHostPortBatch(ctx context.Context, in []store.UpsertNo
 			item.Name = store.NameFromURI(item.URI)
 		}
 		keyStr := string(keyNode(host, port))
-		if existing, ok := updates[keyStr]; ok {
-			existing.URI = item.URI
-			if item.Name != "" {
-				existing.Name = item.Name
-			}
-			existing.Protocol = protocol
-			existing.UpdatedAt = now
-			updates[keyStr] = existing
-			continue
+		prepared[keyStr] = preparedNode{
+			key:      keyStr,
+			host:     host,
+			port:     port,
+			uri:      item.URI,
+			name:     item.Name,
+			protocol: protocol,
 		}
-
-		var out store.Node
-		k := []byte(keyStr)
-		if val, closer, gerr := d.db.Get(k); gerr == nil {
-			n, uerr := unmarshalNode(val)
-			_ = closer.Close()
-			if uerr == nil {
-				out = n
-				out.URI = item.URI
-				if item.Name != "" {
-					out.Name = item.Name
-				}
-				out.Protocol = protocol
-				out.UpdatedAt = now
-				updates[keyStr] = out
-				continue
-			}
-		}
-
-		out = store.Node{
-			ID:        0,
-			Host:      host,
-			Port:      port,
-			URI:       item.URI,
-			Name:      item.Name,
-			Protocol:  protocol,
-			CreatedAt: now,
-			UpdatedAt: now,
-		}
-		updates[keyStr] = out
 	}
 
-	batch := d.db.NewBatch()
-	defer batch.Close()
-	for k, node := range updates {
+	existing := make(map[string]store.Node, len(prepared))
+	iter, err := d.db.NewIter(&pebblepkg.IterOptions{
+		LowerBound: keyNodePrefixBytes(),
+		UpperBound: append([]byte(keyNodePrefix), 0xFF),
+	})
+	if err != nil {
+		return fmt.Errorf("pebble iter nodes: %w", err)
+	}
+	for iter.First(); iter.Valid(); iter.Next() {
+		if ctx != nil {
+			if err := ctx.Err(); err != nil {
+				iter.Close()
+				return err
+			}
+		}
+		k := string(iter.Key())
+		if _, ok := prepared[k]; !ok {
+			continue
+		}
+		n, uerr := unmarshalNode(iter.Value())
+		if uerr != nil {
+			continue
+		}
+		existing[k] = n
+	}
+	if err := iter.Error(); err != nil {
+		iter.Close()
+		return fmt.Errorf("pebble iter nodes: %w", err)
+	}
+	_ = iter.Close()
+
+	keys := make([]string, 0, len(prepared))
+	for k := range prepared {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	merged := make([]store.Node, 0, len(keys))
+	for _, k := range keys {
+		p := prepared[k]
+		if old, ok := existing[k]; ok {
+			old.URI = p.uri
+			if p.name != "" {
+				old.Name = p.name
+			}
+			old.Protocol = p.protocol
+			old.UpdatedAt = now
+			merged = append(merged, old)
+			continue
+		}
+		merged = append(merged, store.Node{
+			ID:        0,
+			Host:      p.host,
+			Port:      p.port,
+			URI:       p.uri,
+			Name:      p.name,
+			Protocol:  p.protocol,
+			CreatedAt: now,
+			UpdatedAt: now,
+		})
+	}
+
+	for i := 0; i < len(merged); i += nodeUpsertWriteChunkSize {
 		if ctx != nil {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
 		}
-		b, err := marshalNode(node)
-		if err != nil {
-			return err
+		end := i + nodeUpsertWriteChunkSize
+		if end > len(merged) {
+			end = len(merged)
 		}
-		if err := batch.Set([]byte(k), b, nil); err != nil {
-			return fmt.Errorf("pebble batch set node: %w", err)
+
+		batch := d.db.NewBatch()
+		for _, node := range merged[i:end] {
+			b, err := marshalNode(node)
+			if err != nil {
+				batch.Close()
+				return err
+			}
+			if err := batch.Set(keyNode(node.Host, node.Port), b, nil); err != nil {
+				batch.Close()
+				return fmt.Errorf("pebble batch set node: %w", err)
+			}
 		}
-	}
-	if err := batch.Commit(pebblepkg.Sync); err != nil {
-		return fmt.Errorf("pebble batch commit nodes: %w", err)
+		if err := batch.Commit(pebblepkg.Sync); err != nil {
+			batch.Close()
+			return fmt.Errorf("pebble batch commit nodes: %w", err)
+		}
+		_ = batch.Close()
 	}
 	return nil
 }
