@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"easy_proxies/internal/config"
+	"easy_proxies/internal/store"
 )
 
 //go:embed assets/index.html
@@ -205,17 +206,53 @@ func (s *Server) handleNodes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Only return nodes that have completed initial check AND are available.
-	// SnapshotFiltered(true) keeps nodes that haven't been checked yet (InitialCheckDone=false),
-	// which can look like "healthy" even though probes are still failing.
-	all := s.mgr.Snapshot()
-	nodes := make([]Snapshot, 0, len(all))
-	for _, snap := range all {
-		if snap.InitialCheckDone && snap.Available {
-			nodes = append(nodes, snap)
+	// Monitoring tab should list all nodes in box manager config, then attach health/runtime state.
+	// It should not use full-store node listing as the primary source.
+	var nodes []Snapshot
+	runtime := s.mgr.Snapshot()
+	runtimeByURI := make(map[string]Snapshot, len(runtime))
+	for _, snap := range runtime {
+		runtimeByURI[snap.URI] = snap
+	}
+
+	healthByKey := s.mgr.Compute24hHealthMap()
+
+	if s.nodeMgr != nil {
+		cfgNodes, err := s.nodeMgr.ListConfigNodes(r.Context())
+		if err == nil && len(cfgNodes) > 0 {
+			nodes = make([]Snapshot, 0, len(cfgNodes))
+			for _, cn := range cfgNodes {
+				snap, ok := runtimeByURI[cn.URI]
+				if !ok {
+					snap = Snapshot{
+						NodeInfo: NodeInfo{
+							Name: cn.Name,
+							URI:  cn.URI,
+							Port: cn.Port,
+						},
+					}
+					snap.LastLatencyMs = -1
+				}
+				nodes = append(nodes, snap)
+			}
 		}
 	}
+
+	if len(nodes) == 0 {
+		nodes = runtime
+	}
+
 	nodes = s.mgr.Attach24hStats(nodes)
+	for i := range nodes {
+		host, port, _, hpErr := store.HostPortFromURI(nodes[i].URI)
+		if hpErr != nil || host == "" || port <= 0 {
+			continue
+		}
+		if healthy, ok := healthByKey[nodeRateKey(host, port)]; ok {
+			nodes[i].InitialCheckDone = true
+			nodes[i].Available = healthy
+		}
+	}
 
 	payload := map[string]any{"nodes": nodes}
 	writeJSON(w, payload)
@@ -377,9 +414,42 @@ func (s *Server) handleProbeAll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Get all nodes
-	snapshots := s.mgr.Snapshot()
-	total := len(snapshots)
+	// Build probe targets from boxmgr config nodes first (fallback to runtime snapshot).
+	runtime := s.mgr.Snapshot()
+	runtimeByURI := make(map[string]Snapshot, len(runtime))
+	for _, snap := range runtime {
+		runtimeByURI[snap.URI] = snap
+	}
+
+	type probeTarget struct {
+		tag       string
+		name      string
+		probeable bool
+	}
+	targets := make([]probeTarget, 0, len(runtime))
+	if s.nodeMgr != nil {
+		if cfgNodes, err := s.nodeMgr.ListConfigNodes(r.Context()); err == nil && len(cfgNodes) > 0 {
+			targets = make([]probeTarget, 0, len(cfgNodes))
+			for _, cn := range cfgNodes {
+				if snap, ok := runtimeByURI[cn.URI]; ok && snap.Tag != "" {
+					targets = append(targets, probeTarget{tag: snap.Tag, name: cn.Name, probeable: true})
+					continue
+				}
+				name := cn.Name
+				if name == "" {
+					name = cn.URI
+				}
+				targets = append(targets, probeTarget{name: name, probeable: false})
+			}
+		}
+	}
+	if len(targets) == 0 {
+		for _, snap := range runtime {
+			targets = append(targets, probeTarget{tag: snap.Tag, name: snap.Name, probeable: snap.Tag != ""})
+		}
+	}
+
+	total := len(targets)
 	if total == 0 {
 		fmt.Fprintf(w, "data: %s\n\n", `{"type":"complete","total":0,"success":0,"failed":0}`)
 		flusher.Flush()
@@ -399,18 +469,22 @@ func (s *Server) handleProbeAll(w http.ResponseWriter, r *http.Request) {
 	}
 	results := make(chan probeResult, total)
 
-	// Launch all probes concurrently
-	for _, snap := range snapshots {
-		go func(snap Snapshot, mgr *Manager) {
+	// Launch all probes concurrently; non-probeable nodes are reported as failed immediately.
+	for _, target := range targets {
+		if !target.probeable {
+			results <- probeResult{tag: "", name: target.name, latency: -1, err: "node not loaded in runtime"}
+			continue
+		}
+		go func(target probeTarget, mgr *Manager) {
 			ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 			defer cancel()
-			latency, err := mgr.Probe(ctx, snap.Tag)
+			latency, err := mgr.Probe(ctx, target.tag)
 			if err != nil {
-				results <- probeResult{tag: snap.Tag, name: snap.Name, latency: -1, err: err.Error()}
+				results <- probeResult{tag: target.tag, name: target.name, latency: -1, err: err.Error()}
 			} else {
-				results <- probeResult{tag: snap.Tag, name: snap.Name, latency: latency.Milliseconds(), err: ""}
+				results <- probeResult{tag: target.tag, name: target.name, latency: latency.Milliseconds(), err: ""}
 			}
-		}(snap, s.mgr)
+		}(target, s.mgr)
 	}
 
 	// Collect results as they come in with overall timeout

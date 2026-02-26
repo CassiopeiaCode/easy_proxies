@@ -1252,6 +1252,51 @@ func (m *Manager) Attach24hStats(snaps []Snapshot) []Snapshot {
 	return snaps
 }
 
+// Compute24hHealthMap computes DB-derived 24h health flags by host:port.
+// health=true means rate >= threshold where threshold = p95(non-zero rates) - 0.05.
+func (m *Manager) Compute24hHealthMap() map[string]bool {
+	out := make(map[string]bool)
+	if m == nil || !m.shouldPersistHealth() {
+		return out
+	}
+
+	m.dbMu.Lock()
+	db := m.db
+	m.dbMu.Unlock()
+	if db == nil {
+		return out
+	}
+
+	cutoff := time.Now().UTC().Add(-24 * time.Hour)
+	rows, err := dbInternalQueryRates(m.ctx, db, cutoff)
+	if err != nil || len(rows) == 0 {
+		return out
+	}
+
+	rates := make([]float64, 0, len(rows))
+	for _, row := range rows {
+		if row.rate > 0 {
+			rates = append(rates, row.rate)
+		}
+	}
+	p95 := 0.0
+	if len(rates) > 0 {
+		p95 = percentile(rates, 0.95)
+	}
+	threshold := p95 - 0.05
+	if threshold < 0 {
+		threshold = 0
+	}
+	if threshold > 1 {
+		threshold = 1
+	}
+
+	for _, row := range rows {
+		out[nodeRateKey(row.host, row.port)] = row.rate >= threshold
+	}
+	return out
+}
+
 func nodeRateKey(host string, port int) string {
 	return host + ":" + strconv.Itoa(port)
 }

@@ -1355,6 +1355,7 @@
       emptyState.style.display = 'none';
       container.innerHTML = nodes.map(node => {
         const status = getNodeStatus(node);
+        const canProbe = Boolean(node.tag && String(node.tag).trim() !== '');
         const latency = node.last_latency_ms || -1;
         const quality = getLatencyQuality(latency);
         const runtimeSuccessCount = Number(node.success_count || 0);
@@ -1378,7 +1379,7 @@
             <div class="node-header">
               <div class="node-info">
                 <div class="node-name">${node.name || node.tag}</div>
-                <div class="node-tag">${node.tag}</div>
+                <div class="node-tag">${node.tag || '-'}</div>
               </div>
               <span class="status-badge ${status}">
                 <span class="status-icon"></span>
@@ -1433,7 +1434,7 @@
 
             <div class="node-footer">
               <div style="flex: 1;"></div>
-              <button class="btn btn-secondary btn-sm" onclick="probe('${node.tag}')">
+              <button class="btn btn-secondary btn-sm" ${canProbe ? `onclick="probe('${node.tag}')"` : 'disabled'} title="${canProbe ? '' : '该节点当前未加载到运行时，无法探测'}">
                 🔍 探测延迟
               </button>
               ${node.blacklisted ? `
