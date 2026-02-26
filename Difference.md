@@ -33,7 +33,7 @@
 
 ### 3. 启动时导入 + 异步订阅去重（已实现：store 主数据源 + nodes.txt 兼容）
 
-目标：启动优先从 store 加载可用节点快速启动；订阅/文件导入按 host:port 去重入库，入库成功触发重载；无法提取 host:port 的节点直接过滤掉（不入库、不载入、不参与调度）。
+目标：启动优先从 store 加载可用节点快速启动；订阅/文件导入按 host:port 去重入库；无法提取 host:port 的节点直接过滤掉（不入库、不载入、不参与调度）。
 
 当前实现行为：
 - `nodes.txt` 始终作为数据源：配置加载阶段总会读取 `nodes_file`（默认 `nodes.txt`）；即使存在订阅，也不会忽略本地 nodes.txt。
@@ -43,15 +43,15 @@
   - 若启用 store，则会 best-effort 将当前 `cfg.Nodes`（包含 inline + nodes.txt）按 host:port upsert 写入 store；
   - 随后从 store 加载 active nodes（非 damaged）作为运行时节点列表（store 成为主数据源）。
 - 订阅刷新异步去重入库：
-  - SubscriptionManager 拉取订阅后先按 host:port upsert 入库去重；
-  - 再从 store 读取 active nodes 组装成新的运行时 nodes 并触发 reload；
+  - SubscriptionManager 拉取订阅后先按 host:port upsert 入库去重（仅插入缺失节点，已有记录不重写）；
+  - 刷新流程不再触发 sing-box reload，现网运行态由现有实例保持；
   - 订阅内容解析与启动加载阶段统一：同一套完整解析逻辑（Base64 / Clash YAML / 纯文本逐行 URI）。
   - 注意：本 fork 中 `nodes.txt` 为只读，订阅刷新不再写回 `nodes.txt`。
 
 涉及模块：
 - internal/app/app.go：启动时 upsert 导入 + 从 store 加载 active nodes。
 - internal/config/config.go：订阅解析完整实现（Base64 / Clash YAML / 纯文本逐行 URI）。
-- internal/subscription/manager.go：订阅刷新复用 config 的订阅解析 + upsert 去重入库 + 从 store 读 active nodes reload（不写 nodes.txt）。
+- internal/subscription/manager.go：订阅刷新复用 config 的订阅解析 + upsert 去重入库（仅新增，不写 nodes.txt，不触发 reload）。
 
 ### 4. 健康检查统计落库 + 24h 成功率阈值调度（已实现）
 
@@ -270,15 +270,14 @@
 - `internal/builder/builder.go`
 - `internal/config/config.go`
 
-### 14. 订阅刷新强门控：写/读 Store 成功才允许 reload（已实现）
+### 14. 订阅刷新强门控：仅写 Store，不触发 reload（已实现）
 
-目标：避免“Store 异常时仍用抓取结果重载 sing-box”。
+目标：避免订阅刷新过程影响现网 sing-box 运行态；只做持久化增量入库。
 
 当前实现行为：
-- Store 不可用：本轮刷新直接失败并 `skip reload`。
-- Store 写入失败：直接失败并 `skip reload`。
-- Store 读取 active 失败：直接失败并 `skip reload`。
-- 读取 active 为 0：直接 `skip reload`。
+- Store 不可用：本轮刷新直接失败，且不触发 reload。
+- Store 写入失败：直接失败，且不触发 reload。
+- 订阅刷新流程只负责入库，不再读取 active nodes 组装运行时配置。
 - 不再回退到“用 fetched nodes 直接重载”。
 
 涉及模块：
@@ -391,8 +390,8 @@
   - 24h 统计总调用次数
 - 前端对旧数据保留兼容：若后端未返回 `db_24h_*` 字段，会回退到运行时计数口径计算。
 - 节点监控页的数据源调整：
-  - `/api/nodes` 的节点主集合改为 boxmgr 当前配置节点（`ListConfigNodes`），不再以数据库全量节点为主。
-  - 每个节点再合并运行时快照与 DB 24h 健康统计；无运行时实例时仍会展示，但探测按钮禁用。
+  - `/api/nodes` 的节点主集合改为 monitor 运行时快照（即 sing-box 实际加载并注册到运行时的节点），不再返回全量数据库节点，也不再遍历 boxmgr 配置节点做主集合。
+  - 因 sing-box 侧存在最多 5000 节点加载上限，`/api/nodes` 的返回规模随运行时节点集合变化，通常不超过该上限。
   - `/api/nodes/probe-all` 的待探测列表也改为 boxmgr 配置节点；未加载到运行时的节点会返回不可探测错误项。
 
 涉及模块：

@@ -235,15 +235,15 @@ func (m *Manager) doRefresh() {
 	m.logger.Infof("fetched %d nodes from subscriptions", len(nodes))
 
 	// Store is the source of truth:
-	// - upsert nodes by host:port (dedup)
-	// - then reload strictly from store active nodes
-	// If store write/read fails, do not reload.
+	// - upsert nodes by host:port (dedup; insert missing only)
+	// - do not reload sing-box here
+	// If store write fails, just record error and return.
 	if m.store == nil {
 		m.mu.Lock()
-		m.status.LastError = "store unavailable: skip reload"
+		m.status.LastError = "store unavailable"
 		m.status.LastRefresh = time.Now()
 		m.mu.Unlock()
-		m.logger.Errorf("store unavailable, skip reload")
+		m.logger.Errorf("store unavailable")
 		return
 	}
 
@@ -271,7 +271,7 @@ func (m *Manager) doRefresh() {
 		m.status.LastError = "store write failed: 0 valid nodes after filtering"
 		m.status.LastRefresh = time.Now()
 		m.mu.Unlock()
-		m.logger.Errorf("store write failed, skip reload: no valid nodes")
+		m.logger.Errorf("store write failed: no valid nodes")
 		return
 	}
 
@@ -283,7 +283,7 @@ func (m *Manager) doRefresh() {
 			m.status.LastError = fmt.Sprintf("store write failed: %v", m.ctx.Err())
 			m.status.LastRefresh = time.Now()
 			m.mu.Unlock()
-			m.logger.Errorf("store write failed, skip reload: %v", m.ctx.Err())
+			m.logger.Errorf("store write failed: %v", m.ctx.Err())
 			return
 		}
 
@@ -323,7 +323,7 @@ func (m *Manager) doRefresh() {
 		m.status.LastError = "store write failed: 0 nodes written"
 		m.status.LastRefresh = time.Now()
 		m.mu.Unlock()
-		m.logger.Errorf("store write failed, skip reload: 0 nodes written")
+		m.logger.Errorf("store write failed: 0 nodes written")
 		return
 	}
 	if failCount > 0 {
@@ -332,68 +332,19 @@ func (m *Manager) doRefresh() {
 		m.logger.Infof("store upsert success: %d nodes", successCount)
 	}
 
-	readStart := time.Now()
-	loadCtx, cancelLoad := context.WithTimeout(m.ctx, storeReadTimeout)
-	active, listErr := m.store.ListActiveNodes(loadCtx)
-	cancelLoad()
-	if listErr != nil {
-		m.mu.Lock()
-		m.status.LastError = fmt.Sprintf("store read failed: %v", listErr)
-		m.status.LastRefresh = time.Now()
-		m.mu.Unlock()
-		m.logger.Errorf("store read failed, skip reload: %v (timeout=%s, elapsed=%s)", listErr, storeReadTimeout, time.Since(readStart))
-		return
-	}
-	m.logger.Infof("store read active nodes completed: %d nodes in %s", len(active), time.Since(readStart))
-	if len(active) == 0 {
-		m.mu.Lock()
-		m.status.LastError = "store read returned 0 active nodes: skip reload"
-		m.status.LastRefresh = time.Now()
-		m.mu.Unlock()
-		m.logger.Warnf("store read returned 0 active nodes, skip reload")
-		return
-	}
-
-	merged := make([]config.NodeConfig, 0, len(active))
-	for _, n := range active {
-		merged = append(merged, config.NodeConfig{
-			Name: n.Name,
-			URI:  n.URI,
-		})
-	}
-
 	// nodes.txt is read-only in this repo. Do not write any cache file.
 	// Still update hash/mod time so UI can show a stable "not modified" state.
-	newHash := m.computeNodesHash(merged)
+	newHash := m.computeNodesHash(nodes)
 	m.mu.Lock()
 	m.lastSubHash = newHash
 	m.lastNodesModTime = time.Now()
 	m.status.NodesModified = false
-	m.mu.Unlock()
-
-	// Get current port mapping to preserve existing node ports
-	portMap := m.boxMgr.CurrentPortMap()
-
-	// Create new config with updated nodes
-	newCfg := m.createNewConfig(merged)
-
-	// Trigger BoxManager reload with port preservation
-	if err := m.boxMgr.ReloadWithPortMap(newCfg, portMap); err != nil {
-		m.logger.Errorf("reload failed: %v", err)
-		m.mu.Lock()
-		m.status.LastError = err.Error()
-		m.status.LastRefresh = time.Now()
-		m.mu.Unlock()
-		return
-	}
-
-	m.mu.Lock()
+	m.status.NodeCount = len(nodes)
 	m.status.LastRefresh = time.Now()
-	m.status.NodeCount = len(merged)
 	m.status.LastError = ""
 	m.mu.Unlock()
 
-	m.logger.Infof("subscription refresh completed, %d nodes active", len(merged))
+	m.logger.Infof("subscription refresh completed: store upsert only, no sing-box reload (fetched=%d, valid=%d, attempted=%d)", len(nodes), len(inputs), successCount)
 }
 
 // getNodesFilePath returns the path to nodes.txt.
