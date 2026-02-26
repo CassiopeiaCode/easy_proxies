@@ -118,10 +118,10 @@ func (m *Manager) Start(ctx context.Context) error {
 
 	// Try to start, with automatic port conflict resolution.
 	// Additionally, if sing-box fails during outbound initialization (e.g. "initialize outbound[N]: ... unknown ..."),
-	// we will best-effort mark that node as damaged and retry quickly. After 5 attempts, we give up.
+	// we will best-effort mark that node as damaged and retry quickly.
 	var instance *box.Box
-	maxRetries := 10
 	maxDamagedRetries := 50
+	maxRetries := maxDamagedRetries + 10
 	damagedRetries := 0
 	timeoutRetries := 0
 	var lastErr error
@@ -260,10 +260,10 @@ func (m *Manager) Reload(newCfg *config.Config) error {
 	pool.ResetSharedStateStore()
 
 	// Create and start new box instance with automatic port conflict resolution.
-	// On outbound init failures, best-effort mark damaged and retry quickly (up to 5 times).
+	// On outbound init failures, best-effort mark damaged and retry quickly.
 	var instance *box.Box
-	maxRetries := 10
 	maxDamagedRetries := 50
+	maxRetries := maxDamagedRetries + 10
 	damagedRetries := 0
 	timeoutRetries := 0
 	var lastErr error

@@ -37,6 +37,11 @@ func Build(cfg *config.Config, st store.Store) (option.Options, error) {
 	// Store lifecycle is managed by app.Run; do not Open/Close here.
 
 	for _, node := range cfg.Nodes {
+		nodeIdent := node.Name
+		if host, port, _, hpErr := store.HostPortFromURI(node.URI); hpErr == nil && host != "" && port > 0 {
+			nodeIdent = fmt.Sprintf("%s (%s:%d)", node.Name, host, port)
+		}
+
 		baseTag := sanitizeTag(node.Name)
 		if baseTag == "" {
 			baseTag = fmt.Sprintf("node-%d", len(memberTags)+1)
@@ -60,7 +65,7 @@ func Build(cfg *config.Config, st store.Store) (option.Options, error) {
 				if dErr != nil {
 					logx.Printf("⚠️  query damaged failed for %s:%d: %v (continue building)", host, port, dErr)
 				} else if damaged {
-					logx.Printf("⚠️  node '%s' is marked damaged in store, skipping build", node.Name)
+					logx.Printf("⚠️  node '%s' is marked damaged in store, skipping build", nodeIdent)
 					failedNodes = append(failedNodes, node.Name)
 					continue
 				}
@@ -69,7 +74,7 @@ func Build(cfg *config.Config, st store.Store) (option.Options, error) {
 
 		outbound, err := buildNodeOutbound(tag, node.URI, cfg.SkipCertVerify)
 		if err != nil {
-			logx.Printf("❌ Failed to build node '%s': %v (skipping)", node.Name, err)
+			logx.Printf("❌ Failed to build node '%s': %v (skipping)", nodeIdent, err)
 			failedNodes = append(failedNodes, node.Name)
 
 			// Build-time invalid: mark damaged (only when we can extract host:port).
@@ -563,7 +568,11 @@ func buildTLSOptions(query url.Values, skipCertVerify bool) (*option.OutboundTLS
 		tlsOptions.UTLS = &option.OutboundUTLSOptions{Enabled: true, Fingerprint: fp}
 	}
 	if security == "reality" {
-		tlsOptions.Reality = &option.OutboundRealityOptions{Enabled: true, PublicKey: query.Get("pbk"), ShortID: query.Get("sid")}
+		pbk := strings.TrimSpace(query.Get("pbk"))
+		if err := validateRealityPublicKey(pbk); err != nil {
+			return nil, err
+		}
+		tlsOptions.Reality = &option.OutboundRealityOptions{Enabled: true, PublicKey: pbk, ShortID: query.Get("sid")}
 		// Reality requires uTLS; use default fingerprint if not specified
 		if tlsOptions.UTLS == nil {
 			if fp == "" {
@@ -573,6 +582,39 @@ func buildTLSOptions(query url.Values, skipCertVerify bool) (*option.OutboundTLS
 		}
 	}
 	return tlsOptions, nil
+}
+
+func validateRealityPublicKey(pbk string) error {
+	if pbk == "" {
+		return errors.New("reality public_key is empty")
+	}
+
+	// In query strings, '+' may be decoded to space by URL parser.
+	normalized := strings.ReplaceAll(pbk, " ", "+")
+
+	decoders := []func(string) ([]byte, error){
+		base64.RawURLEncoding.DecodeString,
+		base64.URLEncoding.DecodeString,
+		base64.RawStdEncoding.DecodeString,
+		base64.StdEncoding.DecodeString,
+	}
+	var decoded []byte
+	var ok bool
+	for _, decode := range decoders {
+		if b, err := decode(normalized); err == nil {
+			decoded = b
+			ok = true
+			break
+		}
+	}
+	if !ok {
+		return fmt.Errorf("invalid reality public_key encoding: %q", pbk)
+	}
+	// Reality public key is X25519 public key, which is 32 bytes.
+	if len(decoded) != 32 {
+		return fmt.Errorf("invalid reality public_key length: got %d bytes, want 32", len(decoded))
+	}
+	return nil
 }
 
 func buildV2RayTransport(query url.Values) (*option.V2RayTransportOptions, error) {
