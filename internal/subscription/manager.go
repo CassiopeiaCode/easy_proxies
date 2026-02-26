@@ -293,7 +293,8 @@ func (m *Manager) doRefresh() {
 			end = len(inputs)
 		}
 		chunk := inputs[i:end]
-		if upErr := m.store.UpsertNodesByHostPortBatch(upCtx, chunk); upErr == nil {
+		upErr := m.store.UpsertNodesByHostPortBatch(upCtx, chunk)
+		if upErr == nil {
 			successCount += len(chunk)
 			continue
 		}
