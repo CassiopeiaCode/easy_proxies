@@ -24,6 +24,7 @@ import (
 const (
 	storeWriteTimeout = 10 * time.Minute
 	storeReadTimeout  = 120 * time.Second
+	storeWriteBatch   = 2000
 )
 
 // Logger defines logging interface.
@@ -246,23 +247,84 @@ func (m *Manager) doRefresh() {
 	}
 
 	upCtx, cancelUp := context.WithTimeout(m.ctx, storeWriteTimeout)
+	defer cancelUp()
+
 	inputs := make([]store.UpsertNodeInput, 0, len(nodes))
+	invalidCount := 0
+	invalidExamples := make([]string, 0, 5)
 	for _, n := range nodes {
+		if _, _, _, hpErr := store.HostPortFromURI(n.URI); hpErr != nil {
+			invalidCount++
+			if len(invalidExamples) < cap(invalidExamples) {
+				invalidExamples = append(invalidExamples, n.URI)
+			}
+			continue
+		}
 		inputs = append(inputs, store.UpsertNodeInput{
 			URI:  n.URI,
 			Name: n.Name,
 		})
 	}
-	if upErr := m.store.UpsertNodesByHostPortBatch(upCtx, inputs); upErr != nil {
-		cancelUp()
+	if invalidCount > 0 {
+		m.logger.Warnf("drop invalid nodes before store upsert: %d (examples=%v)", invalidCount, invalidExamples)
+	}
+	if len(inputs) == 0 {
 		m.mu.Lock()
-		m.status.LastError = fmt.Sprintf("store write failed: %v", upErr)
+		m.status.LastError = "store write failed: 0 valid nodes after filtering"
 		m.status.LastRefresh = time.Now()
 		m.mu.Unlock()
-		m.logger.Errorf("store write failed, skip reload: %v", upErr)
+		m.logger.Errorf("store write failed, skip reload: no valid nodes")
 		return
 	}
-	cancelUp()
+
+	successCount := 0
+	failCount := 0
+	for i := 0; i < len(inputs); i += storeWriteBatch {
+		if upCtx.Err() != nil {
+			m.mu.Lock()
+			m.status.LastError = fmt.Sprintf("store write failed: %v", upCtx.Err())
+			m.status.LastRefresh = time.Now()
+			m.mu.Unlock()
+			m.logger.Errorf("store write failed, skip reload: %v", upCtx.Err())
+			return
+		}
+		end := i + storeWriteBatch
+		if end > len(inputs) {
+			end = len(inputs)
+		}
+		chunk := inputs[i:end]
+		if upErr := m.store.UpsertNodesByHostPortBatch(upCtx, chunk); upErr == nil {
+			successCount += len(chunk)
+			continue
+		}
+
+		// Degrade gracefully on chunk failure: isolate bad records and keep progress.
+		m.logger.Warnf("store batch upsert failed for chunk [%d,%d), fallback to per-node: %v", i, end, upErr)
+		for _, in := range chunk {
+			if upCtx.Err() != nil {
+				break
+			}
+			if _, oneErr := m.store.UpsertNodeByHostPort(upCtx, in); oneErr != nil {
+				failCount++
+				continue
+			}
+			successCount++
+		}
+	}
+
+	if successCount == 0 {
+		m.mu.Lock()
+		m.status.LastError = "store write failed: 0 nodes written"
+		m.status.LastRefresh = time.Now()
+		m.mu.Unlock()
+		m.logger.Errorf("store write failed, skip reload: 0 nodes written")
+		return
+	}
+	if failCount > 0 {
+		m.logger.Warnf("store upsert partial success: success=%d fail=%d", successCount, failCount)
+	} else {
+		m.logger.Infof("store upsert success: %d nodes", successCount)
+	}
 
 	readStart := time.Now()
 	loadCtx, cancelLoad := context.WithTimeout(m.ctx, storeReadTimeout)
