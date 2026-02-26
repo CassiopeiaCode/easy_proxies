@@ -1357,11 +1357,21 @@
         const status = getNodeStatus(node);
         const latency = node.last_latency_ms || -1;
         const quality = getLatencyQuality(latency);
-        const successCount = Number(node.success_count || 0);
-        const totalCount = Number(node.total_count || (successCount + Number(node.failure_count || 0)));
-        const successRate = typeof node.success_rate === 'number'
+        const runtimeSuccessCount = Number(node.success_count || 0);
+        const runtimeTotalCount = Number(node.total_count || (runtimeSuccessCount + Number(node.failure_count || 0)));
+        const runtimeSuccessRate = typeof node.success_rate === 'number'
           ? node.success_rate
-          : (totalCount > 0 ? (successCount / totalCount * 100) : 0);
+          : (runtimeTotalCount > 0 ? (runtimeSuccessCount / runtimeTotalCount * 100) : 0);
+        const runtimeFailureRate = Math.max(0, 100 - runtimeSuccessRate);
+
+        const dbTotalCount = Number(node.db_24h_total_count || 0);
+        const successRate = typeof node.db_24h_success_rate === 'number'
+          ? node.db_24h_success_rate
+          : runtimeSuccessRate;
+        const failureRate = typeof node.db_24h_failure_rate === 'number'
+          ? node.db_24h_failure_rate
+          : runtimeFailureRate;
+        const statsWindowText = dbTotalCount > 0 ? `24h 统计: ${dbTotalCount} 次` : '24h 统计: 暂无数据';
 
         return `
           <div class="node-card ${status}">
@@ -1389,12 +1399,12 @@
 
             <div class="metrics">
               <div class="metric">
-                <div class="metric-label">成功率</div>
+                <div class="metric-label">成功率(24h)</div>
                 <div class="metric-value success">${successRate.toFixed(1)}%</div>
               </div>
               <div class="metric">
-                <div class="metric-label">成功/总次数</div>
-                <div class="metric-value">${successCount}/${totalCount}</div>
+                <div class="metric-label">失败率(24h)</div>
+                <div class="metric-value ${failureRate > 0 ? 'error' : ''}">${failureRate.toFixed(1)}%</div>
               </div>
               <div class="metric">
                 <div class="metric-label">监听端口</div>
@@ -1415,6 +1425,7 @@
             </div>
 
             <div class="time-info">
+              <div>${statsWindowText}</div>
               <div>✓ 最近成功: ${formatTime(node.last_success)}</div>
               <div>✗ 最近失败: ${formatTime(node.last_failure)}</div>
               ${node.blacklisted ? `<div style="color: var(--error);">⚠ 拉黑至: ${new Date(node.blacklisted_until).toLocaleString('zh-CN')}</div>` : ''}

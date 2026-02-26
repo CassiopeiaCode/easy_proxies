@@ -373,12 +373,16 @@
 - 后端 `Snapshot` 新增字段：
   - `total_count`：`success_count + failure_count`
   - `success_rate`：`success_count / total_count * 100`（百分比）
+  - `db_24h_success_count` / `db_24h_failure_count` / `db_24h_total_count`
+  - `db_24h_success_rate` / `db_24h_failure_rate`
 - `/api/nodes` 返回的节点数据包含上述字段，前端可直接消费。
 - 前端“节点监控”卡片新增：
-  - 成功率（`xx.x%`）
-  - 成功/总次数（`success_count/total_count`）
-- 前端对旧数据保留兼容：若后端未返回新字段，会回退到前端本地计算。
+  - 成功率（24h）
+  - 失败率（24h）
+  - 24h 统计总调用次数
+- 前端对旧数据保留兼容：若后端未返回 `db_24h_*` 字段，会回退到运行时计数口径计算。
 
 涉及模块：
 - `internal/monitor/manager.go`
+- `internal/monitor/server.go`
 - `internal/monitor/assets/index.html`

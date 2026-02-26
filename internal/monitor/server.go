@@ -215,6 +215,7 @@ func (s *Server) handleNodes(w http.ResponseWriter, r *http.Request) {
 			nodes = append(nodes, snap)
 		}
 	}
+	nodes = s.mgr.Attach24hStats(nodes)
 
 	payload := map[string]any{"nodes": nodes}
 	writeJSON(w, payload)

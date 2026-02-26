@@ -64,6 +64,11 @@ type Snapshot struct {
 	SuccessCount      int64           `json:"success_count"`
 	TotalCount        int64           `json:"total_count"`
 	SuccessRate       float64         `json:"success_rate"`
+	DB24hSuccessCount int64           `json:"db_24h_success_count"`
+	DB24hFailureCount int64           `json:"db_24h_failure_count"`
+	DB24hTotalCount   int64           `json:"db_24h_total_count"`
+	DB24hSuccessRate  float64         `json:"db_24h_success_rate"`
+	DB24hFailureRate  float64         `json:"db_24h_failure_rate"`
 	Blacklisted       bool            `json:"blacklisted"`
 	BlacklistedUntil  time.Time       `json:"blacklisted_until"`
 	ActiveConnections int32           `json:"active_connections"`
@@ -1081,9 +1086,11 @@ func (m *Manager) recordHealthCheck(ctx context.Context, u store.HealthCheckUpda
 }
 
 type nodeRate struct {
-	host string
-	port int
-	rate float64
+	host    string
+	port    int
+	rate    float64
+	success int64
+	fail    int64
 }
 
 func (m *Manager) applyHealthThresholdFromDB() error {
@@ -1191,12 +1198,62 @@ func dbInternalQueryRates(ctx context.Context, db store.Store, cutoff time.Time)
 	out := make([]nodeRate, 0, len(rates))
 	for _, r := range rates {
 		out = append(out, nodeRate{
-			host: r.Host,
-			port: r.Port,
-			rate: r.Rate,
+			host:    r.Host,
+			port:    r.Port,
+			rate:    r.Rate,
+			success: r.SuccessCount,
+			fail:    r.FailCount,
 		})
 	}
 	return out, nil
+}
+
+// Attach24hStats annotates snapshots with DB-derived 24h success/failure stats.
+func (m *Manager) Attach24hStats(snaps []Snapshot) []Snapshot {
+	if len(snaps) == 0 || m == nil || !m.shouldPersistHealth() {
+		return snaps
+	}
+
+	m.dbMu.Lock()
+	db := m.db
+	m.dbMu.Unlock()
+	if db == nil {
+		return snaps
+	}
+
+	cutoff := time.Now().UTC().Add(-24 * time.Hour)
+	rows, err := dbInternalQueryRates(m.ctx, db, cutoff)
+	if err != nil {
+		return snaps
+	}
+
+	rateByKey := make(map[string]nodeRate, len(rows))
+	for _, row := range rows {
+		rateByKey[nodeRateKey(row.host, row.port)] = row
+	}
+
+	for i := range snaps {
+		host, port, _, hpErr := store.HostPortFromURI(snaps[i].URI)
+		if hpErr != nil || host == "" || port <= 0 {
+			continue
+		}
+		if row, ok := rateByKey[nodeRateKey(host, port)]; ok {
+			total := row.success + row.fail
+			snaps[i].DB24hSuccessCount = row.success
+			snaps[i].DB24hFailureCount = row.fail
+			snaps[i].DB24hTotalCount = total
+			snaps[i].DB24hSuccessRate = row.rate * 100
+			if total > 0 {
+				snaps[i].DB24hFailureRate = float64(row.fail) / float64(total) * 100
+			}
+		}
+	}
+
+	return snaps
+}
+
+func nodeRateKey(host string, port int) string {
+	return host + ":" + strconv.Itoa(port)
 }
 
 func percentile(values []float64, q float64) float64 {
