@@ -411,9 +411,14 @@ func (m *Manager) probeAllNodes(roundCtx context.Context, timeout time.Duration)
 						Success:   err == nil,
 						LatencyMs: latencyMs,
 					}
-					saveCtx, cancelSave := context.WithTimeout(roundCtx, 3*time.Second)
+					// Probe rounds are preemptible (a new round cancels the previous one). Persisting
+					// health stats should not be coupled to the round context; otherwise DB stats may
+					// be written but runtime availability recompute can be perpetually skipped.
+					saveCtx, cancelSave := context.WithTimeout(m.ctx, 3*time.Second)
 					_ = m.recordHealthCheck(saveCtx, u)
 					cancelSave()
+					// Apply DB-derived availability soon so pool scheduling reflects the latest stats.
+					m.scheduleHealthRecompute()
 				}
 			}
 
