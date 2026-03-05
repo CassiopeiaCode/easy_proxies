@@ -394,7 +394,13 @@ func buildHTTPProxyOptions(u *url.URL, skipCertVerify bool) (option.HTTPOutbound
 		return option.HTTPOutboundOptions{}, errors.New("nil uri")
 	}
 
-	server, port, err := hostPort(u, 8080)
+	// For HTTP(S) proxy nodes, require an explicit port to avoid mismatched defaults
+	// between builder and store (host:port dedup + health stats).
+	if strings.TrimSpace(u.Port()) == "" {
+		return option.HTTPOutboundOptions{}, errors.New("http(s) proxy uri missing port")
+	}
+
+	server, port, err := hostPort(u, 0)
 	if err != nil {
 		return option.HTTPOutboundOptions{}, err
 	}

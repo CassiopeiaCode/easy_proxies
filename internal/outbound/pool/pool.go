@@ -284,7 +284,9 @@ func (p *poolOutbound) probeAllMembersOnStartup() {
 	destination, ok := p.monitor.DestinationForProbe()
 	if !ok {
 		p.logger.Warn("probe target not configured, skipping initial health check")
-		// 没有配置探测目标时，标记所有节点为可用
+		// Note:
+		// - In non-DB mode, we mark nodes as "initial check done" so scheduling can proceed.
+		// - In DB mode, availability is derived from DB 24h stats (p95-5%) and these writes are ignored.
 		p.mu.Lock()
 		for _, member := range p.members {
 			if member.entry != nil {
@@ -298,6 +300,7 @@ func (p *poolOutbound) probeAllMembersOnStartup() {
 	_, useTLS, hostHeader, path, serverName, insecure, ok := p.monitor.ProbeHTTPInfo()
 	if !ok {
 		p.logger.Warn("probe target not configured, skipping initial health check")
+		// See note above about DB mode: MarkInitialCheckDone is ignored when store is enabled.
 		p.mu.Lock()
 		for _, member := range p.members {
 			if member.entry != nil {
@@ -330,7 +333,8 @@ func (p *poolOutbound) probeAllMembersOnStartup() {
 			failedCount++
 			if member.entry != nil {
 				member.entry.RecordFailure(err)
-				member.entry.MarkInitialCheckDone(false) // 标记为不可用
+				// Non-DB mode only: in DB mode this is ignored and availability comes from DB threshold.
+				member.entry.MarkInitialCheckDone(false)
 			}
 			cancel()
 			continue
@@ -345,6 +349,7 @@ func (p *poolOutbound) probeAllMembersOnStartup() {
 			failedCount++
 			if member.entry != nil {
 				member.entry.RecordFailure(err)
+				// Non-DB mode only: in DB mode this is ignored and availability comes from DB threshold.
 				member.entry.MarkInitialCheckDone(false)
 			}
 			cancel()
@@ -358,6 +363,7 @@ func (p *poolOutbound) probeAllMembersOnStartup() {
 		availableCount++
 		if member.entry != nil {
 			member.entry.RecordSuccessWithLatency(latency)
+			// Non-DB mode only: in DB mode this is ignored and availability comes from DB threshold.
 			member.entry.MarkInitialCheckDone(true)
 		}
 

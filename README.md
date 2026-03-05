@@ -86,8 +86,8 @@ listener:
 # Pool Settings
 pool:
   mode: sequential            # sequential or random
-  failure_threshold: 3        # Failures before blacklist
-  blacklist_duration: 24h     # Blacklist duration
+  failure_threshold: 3        # Deprecated: ignored (scheduling uses DB 24h health only)
+  blacklist_duration: 24h     # Deprecated: ignored (scheduling uses DB 24h health only)
 
 # Multi-Port Mode
 multi_port:
@@ -114,8 +114,8 @@ listener:
 
 pool:
   mode: sequential  # sequential or random
-  failure_threshold: 3
-  blacklist_duration: 24h
+  failure_threshold: 3  # Deprecated: ignored (scheduling uses DB 24h health only)
+  blacklist_duration: 24h  # Deprecated: ignored (scheduling uses DB 24h health only)
 ```
 
 **Use Case:** Automatic failover, load balancing
@@ -189,8 +189,8 @@ multi_port:
 
 pool:
   mode: balance        # sequential, random, or balance
-  failure_threshold: 3
-  blacklist_duration: 24h
+  failure_threshold: 3  # Deprecated: ignored (scheduling uses DB 24h health only)
+  blacklist_duration: 24h  # Deprecated: ignored (scheduling uses DB 24h health only)
 ```
 
 **Startup Output:**

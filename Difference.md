@@ -430,3 +430,24 @@
 
 涉及模块：
 - `internal/boxmgr/manager.go`
+
+## 本次会话新增差异（2026-03）
+
+### 24. 调度健康语义收敛 + HTTP(S) 节点 URI 强制显式端口（已实现）
+
+目标：
+- 统一“可调度（schedulable）”口径：运行态调度仅依据 DB 近 24h 成功率阈值（p95(非0)-5%）推导的 `Available/InitialCheckDone`。
+- 消除 `http://host` / `https://host` 这类未显式端口的节点在“实际连接端口 / host:port 去重键 / 健康统计键”之间产生隐性漂移。
+
+当前实现行为：
+- 调度 gating 统一使用 `InitialCheckDone && Available`（DB 模式下 `MarkInitialCheckDone/MarkAvailable` 外部写入会被忽略）。
+- 对节点 URI 的 `http(s)://`：必须显式写端口，否则视为非法节点（不入库、不参与健康统计、构建阶段会被跳过）。
+- `pool.failure_threshold` / `pool.blacklist_duration` 标记为已废弃（不再影响调度），避免配置含义误导。
+
+涉及模块：
+- `internal/store/uri.go`
+- `internal/builder/builder.go`
+- `internal/outbound/pool/pool.go`
+- `config.example.yaml`
+- `README.md`
+- `README_ZH.md`

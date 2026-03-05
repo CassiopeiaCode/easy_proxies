@@ -86,8 +86,8 @@ listener:
 # 节点池配置
 pool:
   mode: sequential            # sequential (顺序) 或 random (随机)
-  failure_threshold: 3        # 失败阈值，超过后拉黑节点
-  blacklist_duration: 24h     # 拉黑时长
+  failure_threshold: 3        # Deprecated: 已废弃/不生效（调度仅看 DB 24h 健康）
+  blacklist_duration: 24h     # Deprecated: 已废弃/不生效（调度仅看 DB 24h 健康）
 
 # 多端口模式
 multi_port:
@@ -114,8 +114,8 @@ listener:
 
 pool:
   mode: sequential  # sequential (顺序) 或 random (随机)
-  failure_threshold: 3
-  blacklist_duration: 24h
+  failure_threshold: 3  # Deprecated: 已废弃/不生效（调度仅看 DB 24h 健康）
+  blacklist_duration: 24h  # Deprecated: 已废弃/不生效（调度仅看 DB 24h 健康）
 ```
 
 **适用场景：** 自动故障转移、负载均衡
@@ -190,8 +190,8 @@ multi_port:
 
 pool:
   mode: balance        # sequential (顺序)、random (随机) 或 balance (负载均衡)
-  failure_threshold: 3
-  blacklist_duration: 24h
+  failure_threshold: 3  # Deprecated: 已废弃/不生效（调度仅看 DB 24h 健康）
+  blacklist_duration: 24h  # Deprecated: 已废弃/不生效（调度仅看 DB 24h 健康）
 ```
 
 **启动时输出：**

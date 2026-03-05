@@ -22,8 +22,8 @@ listener:
   password: password
 pool:
   mode: sequential
-  failure_threshold: 3
-  blacklist_duration: 24h
+  failure_threshold: 3  # Deprecated: ignored (scheduling is DB 24h health only)
+  blacklist_duration: 24h  # Deprecated: ignored (scheduling is DB 24h health only)
 multi_port:
   address: 0.0.0.0
   base_port: 24000

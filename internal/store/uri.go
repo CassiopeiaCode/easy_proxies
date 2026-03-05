@@ -110,9 +110,16 @@ func HostPortFromURI(raw string) (host string, port int, protocol string, err er
 	}
 
 	if portStr == "" {
+		// For HTTP(S) proxy URIs used as "nodes", require an explicit port to avoid
+		// implicit defaults drifting across modules (builder/store/health/dedup).
+		//
+		// This function is primarily used for node dedup keys (host:port) and health stats.
+		// Allowing implicit defaults here can cause "same node" to be tracked under a
+		// different host:port than the actual outbound connection uses.
+		if protocol == "http" || protocol == "https" {
+			return "", 0, protocol, errors.New("missing port for http(s) proxy uri")
+		}
 		switch protocol {
-		case "http":
-			port = 80
 		case "socks", "socks5", "socks4", "socks4a":
 			port = 1080
 		default:
