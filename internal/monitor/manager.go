@@ -57,6 +57,7 @@ type TimelineEvent struct {
 
 const maxTimelineSize = 20
 const healthStatsCacheTTL = 30 * time.Second
+const dbThresholdMinTotal = 20
 
 // Snapshot is a runtime view of a proxy node.
 type Snapshot struct {
@@ -279,7 +280,11 @@ func (m *Manager) logDebugState() {
 	dbEnabled := m.shouldPersistHealth()
 	cacheAt := time.Time{}
 	cacheRows := 0
+	cachedThreshold := 0.0
 	threshold := 0.0
+	p95 := 0.0
+	eligibleKeys := 0
+	eligibleNonZero := 0
 	var rateByKey map[string]nodeRate
 
 	if dbEnabled {
@@ -293,7 +298,7 @@ func (m *Manager) logDebugState() {
 			} else {
 				cacheAt = stats.at
 				cacheRows = len(stats.rows)
-				threshold = stats.threshold
+				cachedThreshold = stats.threshold
 				rateByKey = stats.rateByKey
 			}
 		}
@@ -326,6 +331,16 @@ func (m *Manager) logDebugState() {
 		}
 	}
 
+	if dbEnabled && rateByKey != nil && total > 0 {
+		uris := make([]string, 0, total)
+		for i := range snaps {
+			if snaps[i].URI != "" {
+				uris = append(uris, snaps[i].URI)
+			}
+		}
+		threshold, p95, eligibleKeys, eligibleNonZero = computeDBThresholdForURIs(uris, rateByKey)
+	}
+
 	probeRoundActiveID := func() int64 {
 		m.probeRoundMu.Lock()
 		defer m.probeRoundMu.Unlock()
@@ -352,6 +367,10 @@ func (m *Manager) logDebugState() {
 		" db=", dbEnabled,
 		" stats_rows=", cacheRows,
 		" threshold=", fmt.Sprintf("%.4f", threshold),
+		" p95=", fmt.Sprintf("%.4f", p95),
+		" eligible_keys=", eligibleKeys,
+		" eligible_nonzero=", eligibleNonZero,
+		" cached_threshold=", fmt.Sprintf("%.4f", cachedThreshold),
 		" cache_age=", cacheAge,
 		" probe_round=", probeRoundActiveID,
 		" last_recompute=", lastRecompute,
@@ -1333,6 +1352,12 @@ func (m *Manager) applyHealthThresholdFromDB() error {
 	}
 	m.mu.RUnlock()
 
+	uris := make([]string, 0, len(entries))
+	for _, e := range entries {
+		uris = append(uris, e.info.URI)
+	}
+	threshold, _, _, _ := computeDBThresholdForURIs(uris, stats.rateByKey)
+
 	for _, e := range entries {
 		e.mu.Lock()
 		host, port, _, hpErr := store.HostPortFromURI(e.info.URI)
@@ -1353,7 +1378,16 @@ func (m *Manager) applyHealthThresholdFromDB() error {
 			continue
 		}
 
-		e.available = row.rate >= stats.threshold
+		total := row.success + row.fail
+		if total < dbThresholdMinTotal {
+			// Not enough samples => treat as not schedulable (equivalent to "no 24h stats").
+			e.available = false
+			e.initialCheckDone = true
+			e.mu.Unlock()
+			continue
+		}
+
+		e.available = row.rate >= threshold
 		e.initialCheckDone = true
 		e.mu.Unlock()
 	}
@@ -1549,6 +1583,58 @@ func (m *Manager) Compute24hHealthMap() map[string]bool {
 
 func nodeRateKey(host string, port int) string {
 	return host + ":" + strconv.Itoa(port)
+}
+
+// computeDBThresholdForURIs computes the DB-mode scheduling threshold for the given runtime URIs.
+// It implements "p95(non-zero) - 5%" but scopes percentile computation to the current runtime set
+// and ignores low-sample keys to avoid stale/one-hit stats dominating threshold.
+func computeDBThresholdForURIs(uris []string, rateByKey map[string]nodeRate) (threshold, p95 float64, eligibleKeys, eligibleNonZero int) {
+	if len(uris) == 0 || len(rateByKey) == 0 {
+		return 1, 0, 0, 0
+	}
+
+	rates := make([]float64, 0, len(uris))
+	seen := make(map[string]struct{}, len(uris))
+	for _, uri := range uris {
+		host, port, _, hpErr := store.HostPortFromURI(uri)
+		if hpErr != nil || host == "" || port <= 0 {
+			continue
+		}
+		k := nodeRateKey(host, port)
+		if _, ok := seen[k]; ok {
+			continue
+		}
+		seen[k] = struct{}{}
+
+		row, ok := rateByKey[k]
+		if !ok {
+			continue
+		}
+		total := row.success + row.fail
+		if total < dbThresholdMinTotal {
+			continue
+		}
+		eligibleKeys++
+		if row.rate > 0 {
+			eligibleNonZero++
+			rates = append(rates, row.rate)
+		}
+	}
+
+	// No eligible non-zero rates => schedule none.
+	if len(rates) == 0 {
+		return 1, 0, eligibleKeys, 0
+	}
+
+	p95 = percentile(rates, 0.95)
+	threshold = p95 - 0.05
+	if threshold < 0 {
+		threshold = 0
+	}
+	if threshold > 1 {
+		threshold = 1
+	}
+	return threshold, p95, eligibleKeys, eligibleNonZero
 }
 
 func percentile(values []float64, q float64) float64 {
