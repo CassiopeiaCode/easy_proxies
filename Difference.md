@@ -451,3 +451,19 @@
 - `config.example.yaml`
 - `README.md`
 - `README_ZH.md`
+
+### 25. WebUI 前端重构：以“可调度”语义为中心（已实现）
+
+目标：
+- 消除 WebUI 中“健康/拉黑/订阅/调试”等与当前 DB 调度口径不一致的隐性语义漂移，让界面展示与运行态调度逻辑保持一致。
+
+当前实现行为：
+- WebUI 仅保留两个入口：`监控` 与 `节点管理`（移除调试 / Pebble / 设置等面板）。
+- 监控页节点状态统一为三态：
+  - `not-ready`：`!initial_check_done`
+  - `schedulable`：`initial_check_done && available`
+  - `unschedulable`：其它情况
+- 统计卡片统一围绕调度：总节点 / 可调度 / 不可调度 / 未就绪 / 活跃连接；移除“拉黑/订阅状态”等展示与操作。
+
+涉及模块：
+- `internal/monitor/assets/index.html`
