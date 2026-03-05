@@ -467,3 +467,16 @@
 
 涉及模块：
 - `internal/monitor/assets/index.html`
+
+### 26. DB 模式调度阈值与运行态收敛：修复“全量历史 stats 抬高 p95 导致 0 可用”（已实现）
+
+问题：
+- DB 中 24h 统计以 `host:port` 聚合，且可能包含历史/非当前运行态节点的 key；如果用“全量 stats”直接计算 `p95(non-zero)-5%`，阈值可能被抬到接近 1，导致当前 runtime 节点全部 `Available=false`，进而 pool 报 `no healthy proxy available`。
+
+修复后行为：
+- DB 模式下 `InitialCheckDone` 在节点注册时即置为 `true`，避免被“初检”语义阻塞；调度实质只由 DB 推导的 `Available` 决定。
+- 计算 `p95(non-zero)-5%` 时限定作用域为“当前 runtime 节点集合的 host:port 交集”，并忽略样本量不足的 key（避免低样本 100% 主导阈值）。
+- 周期 debug 日志每 10 秒输出一次系统汇总并随机抽样 10 个节点，便于定位阈值/统计/可用性问题。
+
+涉及模块：
+- `internal/monitor/manager.go`
