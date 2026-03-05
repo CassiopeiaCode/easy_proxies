@@ -1315,13 +1315,20 @@ func (m *Manager) applyHealthThresholdFromDB() error {
 		return nil
 	}
 
-	// Always force refresh when recomputing runtime availability.
-	// Rationale: at startup we may cache an empty 24h window before probes/traffic write stats.
-	// If we reuse that cache, DB-mode scheduling can be stuck with Available=false for up to
-	// healthStatsCacheTTL even after fresh stats arrive.
-	stats, err := m.load24hStatsCached(db, true)
+	// Do not force refresh for every recompute: QueryNodeRatesSince scans Pebble hourly aggregates
+	// and is expensive. Use cache and let refresh happen at most once per TTL.
+	//
+	// Cold-start safety: if cache returns 0 rows, do one forced refresh to avoid being stuck with
+	// an empty cached window during the first TTL period after stats start being written.
+	stats, err := m.load24hStatsCached(db, false)
 	if err != nil {
 		return err
+	}
+	if len(stats.rows) == 0 {
+		stats, err = m.load24hStatsCached(db, true)
+		if err != nil {
+			return err
+		}
 	}
 	rows := stats.rows
 	if len(rows) == 0 {
