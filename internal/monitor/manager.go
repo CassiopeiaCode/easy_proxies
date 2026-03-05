@@ -238,6 +238,9 @@ func (m *Manager) StartPeriodicHealthCheck(interval, timeout time.Duration) {
 		recomputeTicker := time.NewTicker(5 * time.Minute)
 		defer recomputeTicker.Stop()
 
+		debugTicker := time.NewTicker(10 * time.Second)
+		defer debugTicker.Stop()
+
 		cleanupTicker := time.NewTicker(12 * time.Hour)
 		defer cleanupTicker.Stop()
 
@@ -254,6 +257,8 @@ func (m *Manager) StartPeriodicHealthCheck(interval, timeout time.Duration) {
 						m.logger.Warn("apply health threshold failed: ", err)
 					}
 				}
+			case <-debugTicker.C:
+				m.logDebugState()
 			case <-cleanupTicker.C:
 				m.cleanupOldHealthStatsWithCtx(loopCtx)
 			}
@@ -262,6 +267,140 @@ func (m *Manager) StartPeriodicHealthCheck(interval, timeout time.Duration) {
 
 	if m.logger != nil {
 		m.logger.Info("periodic health check started, interval: ", interval)
+	}
+}
+
+func (m *Manager) logDebugState() {
+	if m == nil || m.logger == nil {
+		return
+	}
+
+	now := time.Now()
+	dbEnabled := m.shouldPersistHealth()
+	cacheAt := time.Time{}
+	cacheRows := 0
+	threshold := 0.0
+	var rateByKey map[string]nodeRate
+
+	if dbEnabled {
+		m.dbMu.Lock()
+		db := m.db
+		m.dbMu.Unlock()
+		if db != nil {
+			stats, err := m.load24hStatsCached(db, false)
+			if err != nil {
+				m.logger.Warn("debug: load 24h stats failed: ", err)
+			} else {
+				cacheAt = stats.at
+				cacheRows = len(stats.rows)
+				threshold = stats.threshold
+				rateByKey = stats.rateByKey
+			}
+		}
+	}
+
+	snaps := m.Snapshot()
+	total := len(snaps)
+	readyCount := 0
+	availableCount := 0
+	schedulableCount := 0
+	notReadyCount := 0
+	blacklistedCount := 0
+	activeConns := int64(0)
+
+	for _, s := range snaps {
+		if s.Blacklisted {
+			blacklistedCount++
+		}
+		activeConns += int64(s.ActiveConnections)
+		if s.InitialCheckDone {
+			readyCount++
+		} else {
+			notReadyCount++
+		}
+		if s.Available {
+			availableCount++
+		}
+		if s.InitialCheckDone && s.Available {
+			schedulableCount++
+		}
+	}
+
+	probeRoundActiveID := func() int64 {
+		m.probeRoundMu.Lock()
+		defer m.probeRoundMu.Unlock()
+		return m.probeRoundActiveID
+	}()
+	lastRecomputeUnix := m.lastHealthRecomputeUnix.Load()
+	lastRecompute := ""
+	if lastRecomputeUnix > 0 {
+		lastRecompute = time.Unix(lastRecomputeUnix, 0).Format(time.RFC3339)
+	}
+	cacheAge := ""
+	if !cacheAt.IsZero() {
+		cacheAge = now.Sub(cacheAt).Truncate(time.Millisecond).String()
+	}
+
+	m.logger.Info(
+		"debug: nodes_total=", total,
+		" ready=", readyCount,
+		" not_ready=", notReadyCount,
+		" available=", availableCount,
+		" schedulable=", schedulableCount,
+		" blacklisted=", blacklistedCount,
+		" active_conns=", activeConns,
+		" db=", dbEnabled,
+		" stats_rows=", cacheRows,
+		" threshold=", fmt.Sprintf("%.4f", threshold),
+		" cache_age=", cacheAge,
+		" probe_round=", probeRoundActiveID,
+		" last_recompute=", lastRecompute,
+		" probe_ready=", m.probeReady,
+	)
+
+	if total == 0 {
+		return
+	}
+
+	// Sample up to 10 nodes and log details.
+	n := 10
+	if total < n {
+		n = total
+	}
+	rng := rand.New(rand.NewSource(now.UnixNano()))
+	rng.Shuffle(total, func(i, j int) { snaps[i], snaps[j] = snaps[j], snaps[i] })
+
+	for i := 0; i < n; i++ {
+		s := snaps[i]
+		hostPort := ""
+		db24h := ""
+		if dbEnabled && rateByKey != nil && s.URI != "" {
+			host, port, _, hpErr := store.HostPortFromURI(s.URI)
+			if hpErr == nil && host != "" && port > 0 {
+				hostPort = fmt.Sprintf("%s:%d", host, port)
+				if row, ok := rateByKey[nodeRateKey(host, port)]; ok {
+					totalCnt := row.success + row.fail
+					db24h = fmt.Sprintf(" db24h=%d rate=%.2f%%", totalCnt, row.rate*100)
+				} else {
+					db24h = " db24h=0"
+				}
+			}
+		}
+		if hostPort != "" {
+			hostPort = " hp=" + hostPort
+		}
+		m.logger.Info(
+			"debug: node tag=", s.Tag,
+			" name=", s.Name,
+			hostPort,
+			" init=", s.InitialCheckDone,
+			" avail=", s.Available,
+			" bl=", s.Blacklisted,
+			" active=", s.ActiveConnections,
+			" last_lat_ms=", s.LastLatencyMs,
+			" last_err=", s.LastError,
+			db24h,
+		)
 	}
 }
 
