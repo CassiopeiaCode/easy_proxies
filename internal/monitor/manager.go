@@ -537,6 +537,11 @@ func (m *Manager) Register(info NodeInfo) *EntryHandle {
 			timeline: make([]TimelineEvent, 0, maxTimelineSize),
 			mgr:      m,
 		}
+		// In DB mode, "InitialCheckDone" is not a startup probe marker; scheduling is derived from DB stats.
+		// Set it to true immediately so runtime gating effectively depends on DB-derived Available only.
+		if m.shouldPersistHealth() {
+			e.initialCheckDone = true
+		}
 		m.nodes[info.Tag] = e
 	} else {
 		e.info = info
