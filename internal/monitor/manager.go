@@ -1157,7 +1157,11 @@ func (m *Manager) applyHealthThresholdFromDB() error {
 		return nil
 	}
 
-	stats, err := m.load24hStatsCached(db, false)
+	// Always force refresh when recomputing runtime availability.
+	// Rationale: at startup we may cache an empty 24h window before probes/traffic write stats.
+	// If we reuse that cache, DB-mode scheduling can be stuck with Available=false for up to
+	// healthStatsCacheTTL even after fresh stats arrive.
+	stats, err := m.load24hStatsCached(db, true)
 	if err != nil {
 		return err
 	}
