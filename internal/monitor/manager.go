@@ -186,11 +186,11 @@ type Logger interface {
 func NewManager(cfg Config, st store.Store) (*Manager, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	m := &Manager{
-		cfg:    cfg,
-		nodes:  make(map[string]*entry),
-		ctx:    ctx,
-		cancel: cancel,
-		db:     st,
+		cfg:         cfg,
+		nodes:       make(map[string]*entry),
+		ctx:         ctx,
+		cancel:      cancel,
+		db:          st,
 		egressCache: make(map[string]egressCacheEntry),
 	}
 
@@ -412,7 +412,9 @@ func (m *Manager) logDebugState() {
 
 	rng := rand.New(rand.NewSource(now.UnixNano()))
 	rng.Shuffle(len(schedulableSnaps), func(i, j int) { schedulableSnaps[i], schedulableSnaps[j] = schedulableSnaps[j], schedulableSnaps[i] })
-	rng.Shuffle(len(unschedulableSnaps), func(i, j int) { unschedulableSnaps[i], unschedulableSnaps[j] = unschedulableSnaps[j], unschedulableSnaps[i] })
+	rng.Shuffle(len(unschedulableSnaps), func(i, j int) {
+		unschedulableSnaps[i], unschedulableSnaps[j] = unschedulableSnaps[j], unschedulableSnaps[i]
+	})
 
 	nSched := 5
 	if len(schedulableSnaps) < nSched {
@@ -568,6 +570,7 @@ func (m *Manager) probeAllNodes(roundCtx context.Context, timeout time.Duration)
 	var availableCount atomic.Int32
 	var failedCount atomic.Int32
 
+scheduleLoop:
 	for _, e := range entries {
 		e.mu.RLock()
 		probeFn := e.probe
@@ -579,7 +582,15 @@ func (m *Manager) probeAllNodes(roundCtx context.Context, timeout time.Duration)
 			continue
 		}
 
-		sem <- struct{}{}
+		select {
+		case sem <- struct{}{}:
+		case <-roundCtx.Done():
+			break scheduleLoop
+		}
+		if roundCtx.Err() != nil {
+			<-sem
+			break scheduleLoop
+		}
 		wg.Add(1)
 		go func(entry *entry, probe probeFunc, tag string, info NodeInfo) {
 			defer wg.Done()

@@ -532,3 +532,14 @@
 
 涉及模块：
 - `internal/monitor/manager.go`
+
+### 30. 修复健康检查轮次取消导致大量无意义失败记录（已实现）
+
+问题：
+- 当节点数量很大且单轮健康检查未完成时，下一轮启动会取消上一轮 `roundCtx`；如果取消后仍继续调度后续节点的 probe，会导致大量节点“刚开始就因 ctx canceled 失败”，从而在短时间内累积海量 failure 记录，污染统计与可调度判断。
+
+修复后行为：
+- 一旦轮次 `roundCtx` 被取消，本轮不再继续启动未开始的节点 probe；仅允许已在执行中的少量 probe 收尾。
+
+涉及模块：
+- `internal/monitor/manager.go`
