@@ -200,8 +200,53 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		})
 
 		const maxRuntimeNodes = 5000
+		// Reserve slots for never-tested nodes so they can enter runtime and get probed.
+		// "Never-tested" is defined as HealthCheckCount == 0 (no recorded health checks).
+		const reserveNeverTested = 3000
 		if len(selected) > maxRuntimeNodes {
-			selected = selected[:maxRuntimeNodes]
+			tested := make([]store.Node, 0, len(selected))
+			neverTested := make([]store.Node, 0, len(selected))
+			for _, n := range selected {
+				if n.HealthCheckCount == 0 {
+					neverTested = append(neverTested, n)
+				} else {
+					tested = append(tested, n)
+				}
+			}
+
+			neverTake := 0
+			if len(neverTested) >= reserveNeverTested {
+				neverTake = reserveNeverTested
+			} else {
+				neverTake = len(neverTested)
+			}
+			testedCap := maxRuntimeNodes - neverTake
+			testedTake := testedCap
+			if len(tested) < testedTake {
+				testedTake = len(tested)
+			}
+			remaining := maxRuntimeNodes - (testedTake + neverTake)
+			if remaining > 0 {
+				if len(neverTested) > neverTake {
+					extra := len(neverTested) - neverTake
+					if extra > remaining {
+						extra = remaining
+					}
+					neverTake += extra
+					remaining -= extra
+				}
+			}
+			if remaining > 0 {
+				if len(tested) > testedTake {
+					extra := len(tested) - testedTake
+					if extra > remaining {
+						extra = remaining
+					}
+					testedTake += extra
+					remaining -= extra
+				}
+			}
+			selected = append(tested[:testedTake], neverTested[:neverTake]...)
 		}
 		if len(selected) == 0 {
 			// Fallback: keep at least one node so the service can start.
@@ -216,7 +261,13 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		if err := cfg.NormalizeWithPortMap(portMap); err != nil {
 			logx.Printf("⚠️  normalize nodes after store load failed: %v (continue)", err)
 		}
-		logx.Printf("✅ loaded %d active nodes from store (egress groups=%d, runtime=%d)", len(active), len(bestByGroup), len(cfg.Nodes))
+		neverTestedCount := 0
+		for i := range selected {
+			if selected[i].HealthCheckCount == 0 {
+				neverTestedCount++
+			}
+		}
+		logx.Printf("✅ loaded %d active nodes from store (egress groups=%d, runtime=%d, never_tested=%d)", len(active), len(bestByGroup), len(cfg.Nodes), neverTestedCount)
 	}
 
 	// Build monitor config
