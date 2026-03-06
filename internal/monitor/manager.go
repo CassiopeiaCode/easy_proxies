@@ -615,6 +615,13 @@ func (m *Manager) probeAllNodes(roundCtx context.Context, timeout time.Duration)
 			}
 			entry.mu.Unlock()
 
+			if err == nil && m.logger != nil {
+				latencyMs := latency.Milliseconds()
+				if latencyMs == 0 && latency > 0 {
+					latencyMs = 1
+				}
+				m.logger.Info("probe success for ", tag, ", latency: ", latencyMs, "ms")
+			}
 			if err != nil && m.logger != nil {
 				m.logger.Warn("probe failed for ", tag, ": ", err)
 			}

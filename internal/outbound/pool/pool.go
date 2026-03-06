@@ -896,7 +896,14 @@ func (p *poolOutbound) probeEgressIPFirst(ctx context.Context, tag string, membe
 		}
 		return
 	}
-	_ = p.monitor.UpdateNodeEgressIP(traceCtx, meta.URI, ip)
+	if p.logger != nil {
+		p.logger.Info("cloudflare trace success for ", tag, ", egress_ip: ", ip)
+	}
+	if err := p.monitor.UpdateNodeEgressIP(traceCtx, meta.URI, ip); err != nil {
+		if p.logger != nil {
+			p.logger.Warn("update node egress ip failed for ", tag, ": ", err)
+		}
+	}
 }
 
 func probeCloudflareTraceIP(ctx context.Context, out adapter.Outbound, insecure bool) (string, error) {
