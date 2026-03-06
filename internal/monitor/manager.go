@@ -163,11 +163,14 @@ type Manager struct {
 }
 
 type healthStatsCacheEntry struct {
-	at          time.Time
-	rows        []nodeRate
-	rateByKey   map[string]nodeRate
-	healthByKey map[string]bool
-	threshold   float64
+	at              time.Time
+	rows            []nodeRate
+	rateByKey       map[string]nodeRate
+	healthByKey     map[string]bool
+	threshold       float64
+	p95             float64
+	eligibleKeys    int
+	eligibleNonZero int
 }
 
 type egressCacheEntry struct {
@@ -250,7 +253,7 @@ func (m *Manager) StartPeriodicHealthCheck(interval, timeout time.Duration) {
 		recomputeTicker := time.NewTicker(5 * time.Minute)
 		defer recomputeTicker.Stop()
 
-		debugTicker := time.NewTicker(10 * time.Second)
+		debugTicker := time.NewTicker(120 * time.Second)
 		defer debugTicker.Stop()
 
 		cleanupTicker := time.NewTicker(12 * time.Hour)
@@ -292,12 +295,14 @@ func (m *Manager) logDebugState() {
 	cacheAt := time.Time{}
 	cacheRows := 0
 	cachedThreshold := 0.0
+	cachedP95 := 0.0
+	cachedEligibleKeys := 0
+	cachedEligibleNonZero := 0
 	threshold := 0.0
 	p95 := 0.0
 	eligibleKeys := 0
 	eligibleNonZero := 0
 	var rateByKey map[string]nodeRate
-	egressLookup := func(host string, port int) (string, bool) { return m.getEgressIPForKey(m.ctx, host, port) }
 
 	if dbEnabled {
 		m.dbMu.Lock()
@@ -311,6 +316,9 @@ func (m *Manager) logDebugState() {
 				cacheAt = stats.at
 				cacheRows = len(stats.rows)
 				cachedThreshold = stats.threshold
+				cachedP95 = stats.p95
+				cachedEligibleKeys = stats.eligibleKeys
+				cachedEligibleNonZero = stats.eligibleNonZero
 				rateByKey = stats.rateByKey
 				// egress IP is resolved via point-lookup cache (avoid full node scan).
 			}
@@ -345,13 +353,11 @@ func (m *Manager) logDebugState() {
 	}
 
 	if dbEnabled && rateByKey != nil && total > 0 {
-		uris := make([]string, 0, total)
-		for i := range snaps {
-			if snaps[i].URI != "" {
-				uris = append(uris, snaps[i].URI)
-			}
-		}
-		threshold, p95, eligibleKeys, eligibleNonZero, _ = computeDBThresholdForURIs(uris, rateByKey, egressLookup)
+		// Avoid heavy recompute in debug logger: use cached p95/threshold (derived from DB 24h stats).
+		threshold = cachedThreshold
+		p95 = cachedP95
+		eligibleKeys = cachedEligibleKeys
+		eligibleNonZero = cachedEligibleNonZero
 	}
 
 	probeRoundActiveID := func() int64 {
@@ -1598,8 +1604,17 @@ func (m *Manager) refresh24hStatsBlocking(db store.Store, force bool) (healthSta
 
 	rateByKey := make(map[string]nodeRate, len(rows))
 	rates := make([]float64, 0, len(rows))
+	eligibleKeys := 0
+	eligibleNonZero := 0
 	for _, row := range rows {
 		rateByKey[nodeRateKey(row.host, row.port)] = row
+		total := row.success + row.fail
+		if total >= dbThresholdMinTotal {
+			eligibleKeys++
+			if row.rate > 0 {
+				eligibleNonZero++
+			}
+		}
 		if row.rate > 0 {
 			rates = append(rates, row.rate)
 		}
@@ -1623,11 +1638,14 @@ func (m *Manager) refresh24hStatsBlocking(db store.Store, force bool) (healthSta
 	}
 
 	entry := healthStatsCacheEntry{
-		at:          time.Now(),
-		rows:        rows,
-		rateByKey:   rateByKey,
-		healthByKey: healthByKey,
-		threshold:   threshold,
+		at:              time.Now(),
+		rows:            rows,
+		rateByKey:       rateByKey,
+		healthByKey:     healthByKey,
+		threshold:       threshold,
+		p95:             p95,
+		eligibleKeys:    eligibleKeys,
+		eligibleNonZero: eligibleNonZero,
 	}
 
 	m.healthStatsCacheMu.Lock()
