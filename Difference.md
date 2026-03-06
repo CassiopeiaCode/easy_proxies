@@ -506,6 +506,8 @@
 - `internal/monitor/server.go`
 - `internal/app/app.go`
 
+
+- 启动阶段读取 store active 节点的超时从 5s 调整为 2 分钟，减少因超时回退到全量 config nodes 导致的 5000 cap 分支波动。
 ### 28. probe 成功日志 + Cloudflare trace 成功日志（已实现）
 
 目标：

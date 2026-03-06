@@ -76,7 +76,7 @@ func Run(ctx context.Context, cfg *config.Config) error {
 
 	portMap := cfg.BuildPortMap()
 
-	loadCtx, cancelLoad := context.WithTimeout(ctx, 5*time.Second)
+	loadCtx, cancelLoad := context.WithTimeout(ctx, 2*time.Minute)
 	active, listErr := st.ListActiveNodes(loadCtx)
 	cancelLoad()
 	if listErr != nil {
