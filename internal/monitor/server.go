@@ -210,7 +210,16 @@ func (s *Server) handleNodes(w http.ResponseWriter, r *http.Request) {
 	nodes := s.mgr.Snapshot()
 	nodes = s.mgr.Attach24hStats(nodes)
 
-	payload := map[string]any{"nodes": nodes}
+	// Only return schedulable nodes (align with runtime scheduling semantics).
+	// schedulable := InitialCheckDone && Available
+	schedulable := nodes[:0]
+	for _, n := range nodes {
+		if n.InitialCheckDone && n.Available {
+			schedulable = append(schedulable, n)
+		}
+	}
+
+	payload := map[string]any{"nodes": schedulable}
 	writeJSON(w, payload)
 }
 
