@@ -238,11 +238,15 @@ func (s *Server) handleStoreNodes(w http.ResponseWriter, r *http.Request) {
 			"protocol":                   n.Protocol,
 			"is_damaged":                 n.IsDamaged,
 			"damage_reason":              n.DamageReason,
+			"egress_ip":                  n.EgressIP,
 			"health_check_count":         n.HealthCheckCount,
 			"health_check_success_count": n.HealthCheckSuccessCount,
 			"failure_count":              n.FailureCount,
 			"created_at":                 n.CreatedAt,
 			"updated_at":                 n.UpdatedAt,
+		}
+		if n.EgressIPUpdatedAt != nil {
+			row["egress_ip_updated_at"] = *n.EgressIPUpdatedAt
 		}
 		if n.LastCheckAt != nil {
 			row["last_check_at"] = *n.LastCheckAt

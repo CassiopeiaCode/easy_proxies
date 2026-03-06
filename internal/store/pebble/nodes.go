@@ -258,6 +258,93 @@ func (d *DB) DeleteNodeByHostPort(ctx context.Context, host string, port int) er
 	return nil
 }
 
+func (d *DB) GetNodeByHostPort(ctx context.Context, host string, port int) (store.Node, bool, error) {
+	if d == nil || d.db == nil {
+		return store.Node{}, false, errors.New("pebble: db not initialized")
+	}
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return store.Node{}, false, err
+		}
+	}
+	host = strings.TrimSpace(host)
+	if host == "" || port <= 0 {
+		return store.Node{}, false, errors.New("host/port invalid")
+	}
+
+	k := keyNode(host, port)
+	val, closer, err := d.db.Get(k)
+	if err != nil {
+		if errors.Is(err, pebblepkg.ErrNotFound) {
+			return store.Node{}, false, nil
+		}
+		return store.Node{}, false, fmt.Errorf("pebble get node: %w", err)
+	}
+	defer closer.Close()
+
+	n, uerr := unmarshalNode(val)
+	if uerr != nil {
+		return store.Node{}, false, uerr
+	}
+	return n, true, nil
+}
+
+func (d *DB) UpdateNodeEgressIP(ctx context.Context, host string, port int, egressIP string, at time.Time) error {
+	if d == nil || d.db == nil {
+		return errors.New("pebble: db not initialized")
+	}
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	}
+	host = strings.TrimSpace(host)
+	egressIP = strings.TrimSpace(egressIP)
+	if host == "" || port <= 0 {
+		return errors.New("host/port invalid")
+	}
+	if egressIP == "" {
+		return errors.New("egress_ip is empty")
+	}
+
+	now := time.Now().UTC()
+	if at.IsZero() {
+		at = now
+	}
+	at = at.UTC()
+
+	k := keyNode(host, port)
+	var node store.Node
+	if val, closer, err := d.db.Get(k); err == nil {
+		n, uerr := unmarshalNode(val)
+		_ = closer.Close()
+		if uerr == nil {
+			node = n
+		}
+	}
+	if strings.TrimSpace(node.Host) == "" || node.Port <= 0 {
+		node = store.Node{
+			Host:      host,
+			Port:      port,
+			CreatedAt: now,
+			UpdatedAt: now,
+		}
+	}
+
+	node.EgressIP = egressIP
+	node.EgressIPUpdatedAt = &at
+	node.UpdatedAt = now
+
+	b, merr := marshalNode(node)
+	if merr != nil {
+		return merr
+	}
+	if err := d.db.Set(k, b, pebblepkg.Sync); err != nil {
+		return fmt.Errorf("pebble set node: %w", err)
+	}
+	return nil
+}
+
 func (d *DB) ListActiveNodes(ctx context.Context) ([]store.Node, error) {
 	if d == nil || d.db == nil {
 		return nil, errors.New("pebble: db not initialized")

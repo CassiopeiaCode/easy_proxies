@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"math/rand"
 	"net"
@@ -35,6 +36,11 @@ const (
 	modeRandom     = "random"
 	modeBalance    = "balance"
 	modeSticky     = "sticky"
+)
+
+const (
+	cloudflareTraceHost = "www.cloudflare.com"
+	cloudflareTracePath = "/cdn-cgi/trace"
 )
 
 // Options controls pool outbound behaviour.
@@ -767,6 +773,8 @@ func (p *poolOutbound) makeProbeFunc(member *memberState) func(ctx context.Conte
 		return nil
 	}
 	return func(ctx context.Context) (time.Duration, error) {
+		p.probeEgressIPFirst(ctx, member.tag, member)
+
 		start := time.Now()
 		conn, err := member.outbound.DialContext(ctx, N.NetworkTCP, destination)
 		if err != nil {
@@ -832,6 +840,8 @@ func (p *poolOutbound) makeProbeByTagFunc(tag string) func(ctx context.Context) 
 			return 0, E.New("member not found: ", tag)
 		}
 
+		p.probeEgressIPFirst(ctx, tag, member)
+
 		start := time.Now()
 		conn, err := member.outbound.DialContext(ctx, N.NetworkTCP, destination)
 		if err != nil {
@@ -858,6 +868,181 @@ func (p *poolOutbound) makeProbeByTagFunc(tag string) func(ctx context.Context) 
 		}
 		return duration, nil
 	}
+}
+
+func (p *poolOutbound) probeEgressIPFirst(ctx context.Context, tag string, member *memberState) {
+	if p == nil || p.monitor == nil || member == nil {
+		return
+	}
+	meta, ok := p.options.Metadata[tag]
+	if !ok || strings.TrimSpace(meta.URI) == "" {
+		return
+	}
+
+	// Reuse monitor-derived "insecure" flag (skip cert verify) for the trace request.
+	_, _, _, _, _, insecure, ok := p.monitor.ProbeHTTPInfo()
+	if !ok {
+		insecure = false
+	}
+
+	traceCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	ip, err := probeCloudflareTraceIP(traceCtx, member.outbound, insecure)
+	if err != nil {
+		// Requirement: trace failure counts as a failure event, but we still proceed with the main probe.
+		if member.entry != nil {
+			member.entry.RecordFailure(fmt.Errorf("cloudflare trace: %w", err))
+		}
+		return
+	}
+	_ = p.monitor.UpdateNodeEgressIP(traceCtx, meta.URI, ip)
+}
+
+func probeCloudflareTraceIP(ctx context.Context, out adapter.Outbound, insecure bool) (string, error) {
+	if out == nil {
+		return "", errors.New("outbound is nil")
+	}
+	dst := M.ParseSocksaddrHostPort(cloudflareTraceHost, 443)
+	conn, err := out.DialContext(ctx, N.NetworkTCP, dst)
+	if err != nil {
+		return "", err
+	}
+	defer conn.Close()
+	return cloudflareTraceIPOverConn(ctx, conn, cloudflareTraceHost, insecure)
+}
+
+func cloudflareTraceIPOverConn(ctx context.Context, conn net.Conn, serverName string, insecure bool) (string, error) {
+	if conn == nil {
+		return "", errors.New("conn is nil")
+	}
+	if strings.TrimSpace(serverName) == "" {
+		serverName = cloudflareTraceHost
+	}
+
+	var hasDeadline bool
+	var deadline time.Time
+	if ctx != nil {
+		if d, ok := ctx.Deadline(); ok {
+			hasDeadline = true
+			deadline = d
+			_ = conn.SetDeadline(deadline)
+		}
+	}
+
+	cfg := &tls.Config{
+		ServerName:         serverName,
+		InsecureSkipVerify: insecure,
+	}
+	tlsConn := tls.Client(conn, cfg)
+	if hasDeadline {
+		_ = tlsConn.SetDeadline(deadline)
+	} else {
+		_ = tlsConn.SetDeadline(time.Now().Add(10 * time.Second))
+	}
+	if err := tlsConn.Handshake(); err != nil {
+		return "", fmt.Errorf("tls handshake: %w", err)
+	}
+	if hasDeadline {
+		_ = tlsConn.SetDeadline(deadline)
+	} else {
+		_ = tlsConn.SetDeadline(time.Time{})
+	}
+	conn = tlsConn
+
+	req := fmt.Sprintf(
+		"GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\nUser-Agent: Mozilla/5.0\r\nAccept: */*\r\nAccept-Encoding: identity\r\n\r\n",
+		cloudflareTracePath,
+		cloudflareTraceHost,
+	)
+
+	if hasDeadline {
+		_ = conn.SetWriteDeadline(deadline)
+	} else {
+		_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	}
+	if _, err := conn.Write([]byte(req)); err != nil {
+		return "", fmt.Errorf("write request: %w", err)
+	}
+	if hasDeadline {
+		_ = conn.SetReadDeadline(deadline)
+	} else {
+		_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	}
+
+	reader := bufio.NewReader(conn)
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		return "", fmt.Errorf("read status line: %w", err)
+	}
+	status, err := parseHTTPStatusCode(line)
+	if err != nil {
+		return "", err
+	}
+	if status != 200 {
+		return "", fmt.Errorf("unexpected HTTP status %d", status)
+	}
+
+	// Skip headers.
+	for {
+		h, err := reader.ReadString('\n')
+		if err != nil {
+			return "", fmt.Errorf("read headers: %w", err)
+		}
+		if h == "\r\n" {
+			break
+		}
+	}
+
+	// Read body lines (trace is small). Limit total bytes to avoid hanging.
+	const maxBodyBytes = 8 * 1024
+	var b strings.Builder
+	b.Grow(1024)
+	readBytes := 0
+	for readBytes < maxBodyBytes {
+		l, err := reader.ReadString('\n')
+		if len(l) > 0 {
+			readBytes += len(l)
+			b.WriteString(l)
+			if ip, ok := parseCloudflareTraceIP(b.String()); ok {
+				return ip, nil
+			}
+		}
+		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				break
+			}
+			// EOF is expected; parse with what we have.
+			break
+		}
+	}
+
+	if ip, ok := parseCloudflareTraceIP(b.String()); ok {
+		return ip, nil
+	}
+	return "", errors.New("missing ip= in trace body")
+}
+
+func parseCloudflareTraceIP(body string) (string, bool) {
+	body = strings.TrimSpace(body)
+	if body == "" {
+		return "", false
+	}
+	for _, line := range strings.Split(body, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "ip=") {
+			continue
+		}
+		ipStr := strings.TrimSpace(strings.TrimPrefix(line, "ip="))
+		if ipStr == "" {
+			return "", false
+		}
+		if net.ParseIP(ipStr) == nil {
+			return "", false
+		}
+		return ipStr, true
+	}
+	return "", false
 }
 
 // makeReleaseByTagFunc creates a release function that works before member initialization

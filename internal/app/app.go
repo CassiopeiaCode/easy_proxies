@@ -7,6 +7,9 @@ import (
 	"net/http/pprof"
 	"os"
 	"os/signal"
+	"sort"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -71,18 +74,149 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	}
 	cancelImport()
 
+	portMap := cfg.BuildPortMap()
+
 	loadCtx, cancelLoad := context.WithTimeout(ctx, 5*time.Second)
 	active, listErr := st.ListActiveNodes(loadCtx)
 	cancelLoad()
 	if listErr != nil {
 		logx.Printf("⚠️  list active nodes from store failed, continue with config nodes: %v", listErr)
 	} else if len(active) > 0 {
-		nodes := make([]config.NodeConfig, 0, len(active))
+		// Prefer store-driven active nodes, but de-duplicate by egress IP and cap runtime nodes to 5000.
+		// Unknown egress_ip nodes are kept as-is (not grouped).
+		type score struct {
+			rate       float64
+			total      int64
+			latencyMs  int64
+			hasLatency bool
+			key        string // host:port for stable tie-break
+		}
+		rateByKey := make(map[string]store.NodeRate, 0)
+		rateCtx, cancelRate := context.WithTimeout(ctx, 5*time.Second)
+		rates, rerr := st.QueryNodeRatesSince(rateCtx, time.Now().UTC().Add(-24*time.Hour))
+		cancelRate()
+		if rerr == nil {
+			rateByKey = make(map[string]store.NodeRate, len(rates))
+			for _, r := range rates {
+				rateByKey[strings.TrimSpace(r.Host)+":"+strconv.Itoa(r.Port)] = r
+			}
+		}
+
+		bestByGroup := make(map[string]store.Node, len(active))
+		bestScore := make(map[string]score, len(active))
+
 		for _, n := range active {
+			host := strings.TrimSpace(n.Host)
+			if host == "" || n.Port <= 0 {
+				continue
+			}
+			hp := host + ":" + strconv.Itoa(n.Port)
+			group := hp
+			if ip := strings.TrimSpace(n.EgressIP); ip != "" {
+				group = ip
+			}
+
+			sc := score{rate: 0, total: 0, latencyMs: 1<<62 - 1, hasLatency: false, key: hp}
+			if r, ok := rateByKey[hp]; ok {
+				sc.rate = r.Rate
+				sc.total = r.SuccessCount + r.FailCount
+			}
+			if n.LastLatencyMs != nil {
+				sc.latencyMs = *n.LastLatencyMs
+				sc.hasLatency = true
+			}
+
+			cur, exists := bestByGroup[group]
+			if !exists {
+				bestByGroup[group] = n
+				bestScore[group] = sc
+				continue
+			}
+			curSc := bestScore[group]
+
+			// Pick representative within group:
+			// - higher 24h success rate
+			// - higher sample count
+			// - lower last latency (if present)
+			// - stable host:port
+			replace := false
+			if sc.rate > curSc.rate {
+				replace = true
+			} else if sc.rate == curSc.rate && sc.total > curSc.total {
+				replace = true
+			} else if sc.rate == curSc.rate && sc.total == curSc.total {
+				if sc.hasLatency && !curSc.hasLatency {
+					replace = true
+				} else if sc.hasLatency == curSc.hasLatency && sc.latencyMs < curSc.latencyMs {
+					replace = true
+				} else if sc.hasLatency == curSc.hasLatency && sc.latencyMs == curSc.latencyMs && sc.key < curSc.key {
+					replace = true
+				}
+			}
+
+			if replace {
+				_ = cur
+				bestByGroup[group] = n
+				bestScore[group] = sc
+			}
+		}
+
+		// Flatten + sort deterministically, then cap to 5000.
+		selected := make([]store.Node, 0, len(bestByGroup))
+		for group, n := range bestByGroup {
+			_ = group
+			selected = append(selected, n)
+		}
+
+		sByHP := make(map[string]score, len(selected))
+		for _, n := range selected {
+			host := strings.TrimSpace(n.Host)
+			hp := host + ":" + strconv.Itoa(n.Port)
+			group := hp
+			if ip := strings.TrimSpace(n.EgressIP); ip != "" {
+				group = ip
+			}
+			sByHP[hp] = bestScore[group]
+		}
+
+		sort.Slice(selected, func(i, j int) bool {
+			hi := strings.TrimSpace(selected[i].Host) + ":" + strconv.Itoa(selected[i].Port)
+			hj := strings.TrimSpace(selected[j].Host) + ":" + strconv.Itoa(selected[j].Port)
+			si := sByHP[hi]
+			sj := sByHP[hj]
+			if si.rate != sj.rate {
+				return si.rate > sj.rate
+			}
+			if si.total != sj.total {
+				return si.total > sj.total
+			}
+			if si.hasLatency != sj.hasLatency {
+				return si.hasLatency
+			}
+			if si.latencyMs != sj.latencyMs {
+				return si.latencyMs < sj.latencyMs
+			}
+			return si.key < sj.key
+		})
+
+		const maxRuntimeNodes = 5000
+		if len(selected) > maxRuntimeNodes {
+			selected = selected[:maxRuntimeNodes]
+		}
+		if len(selected) == 0 {
+			// Fallback: keep at least one node so the service can start.
+			selected = active[:1]
+		}
+
+		nodes := make([]config.NodeConfig, 0, len(selected))
+		for _, n := range selected {
 			nodes = append(nodes, config.NodeConfig{Name: n.Name, URI: n.URI})
 		}
 		cfg.Nodes = nodes
-		logx.Printf("✅ loaded %d active nodes from store", len(active))
+		if err := cfg.NormalizeWithPortMap(portMap); err != nil {
+			logx.Printf("⚠️  normalize nodes after store load failed: %v (continue)", err)
+		}
+		logx.Printf("✅ loaded %d active nodes from store (egress groups=%d, runtime=%d)", len(active), len(bestByGroup), len(cfg.Nodes))
 	}
 
 	// Build monitor config

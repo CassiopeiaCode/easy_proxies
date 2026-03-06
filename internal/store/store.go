@@ -27,10 +27,12 @@ type Store interface {
 	UpsertNodesByHostPortBatch(ctx context.Context, in []UpsertNodeInput) error
 	DeleteNodeByURI(ctx context.Context, uri string) error
 	DeleteNodeByHostPort(ctx context.Context, host string, port int) error
+	GetNodeByHostPort(ctx context.Context, host string, port int) (Node, bool, error)
 	ListNodes(ctx context.Context) ([]Node, error)
 	ListActiveNodes(ctx context.Context) ([]Node, error)
 	IsNodeDamaged(ctx context.Context, host string, port int) (bool, error)
 	MarkNodeDamaged(ctx context.Context, host string, port int, reason string) error
+	UpdateNodeEgressIP(ctx context.Context, host string, port int, egressIP string, at time.Time) error
 
 	// Health
 	RecordHealthCheck(ctx context.Context, u HealthCheckUpdate) error
@@ -47,6 +49,8 @@ type Node struct {
 	Protocol                string
 	IsDamaged               bool
 	DamageReason            string
+	EgressIP                string
+	EgressIPUpdatedAt       *time.Time
 	HealthCheckCount        int64
 	HealthCheckSuccessCount int64
 	LastCheckAt             *time.Time

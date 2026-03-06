@@ -71,6 +71,7 @@ type Snapshot struct {
 	DB24hTotalCount   int64           `json:"db_24h_total_count"`
 	DB24hSuccessRate  float64         `json:"db_24h_success_rate"`
 	DB24hFailureRate  float64         `json:"db_24h_failure_rate"`
+	EgressIP          string          `json:"egress_ip,omitempty"`
 	Blacklisted       bool            `json:"blacklisted"`
 	BlacklistedUntil  time.Time       `json:"blacklisted_until"`
 	ActiveConnections int32           `json:"active_connections"`
@@ -162,6 +163,7 @@ type healthStatsCacheEntry struct {
 	rows        []nodeRate
 	rateByKey   map[string]nodeRate
 	healthByKey map[string]bool
+	egressByKey map[string]string
 	threshold   float64
 }
 
@@ -286,6 +288,7 @@ func (m *Manager) logDebugState() {
 	eligibleKeys := 0
 	eligibleNonZero := 0
 	var rateByKey map[string]nodeRate
+	var egressByKey map[string]string
 
 	if dbEnabled {
 		m.dbMu.Lock()
@@ -300,6 +303,7 @@ func (m *Manager) logDebugState() {
 				cacheRows = len(stats.rows)
 				cachedThreshold = stats.threshold
 				rateByKey = stats.rateByKey
+				egressByKey = stats.egressByKey
 			}
 		}
 	}
@@ -338,7 +342,7 @@ func (m *Manager) logDebugState() {
 				uris = append(uris, snaps[i].URI)
 			}
 		}
-		threshold, p95, eligibleKeys, eligibleNonZero = computeDBThresholdForURIs(uris, rateByKey)
+		threshold, p95, eligibleKeys, eligibleNonZero, _ = computeDBThresholdForURIs(uris, rateByKey, egressByKey)
 	}
 
 	probeRoundActiveID := func() int64 {
@@ -1294,6 +1298,38 @@ func (m *Manager) recordHealthCheck(ctx context.Context, u store.HealthCheckUpda
 	return nil
 }
 
+// UpdateNodeEgressIP updates the persisted egress IP (public exit IP) for the node identified by URI.
+// It is best-effort and is safe to call even when persistence is disabled.
+func (m *Manager) UpdateNodeEgressIP(ctx context.Context, uri string, egressIP string) error {
+	if m == nil {
+		return nil
+	}
+	uri = strings.TrimSpace(uri)
+	egressIP = strings.TrimSpace(egressIP)
+	if uri == "" || egressIP == "" {
+		return errors.New("uri/egress_ip is empty")
+	}
+
+	m.dbMu.Lock()
+	db := m.db
+	m.dbMu.Unlock()
+	if db == nil {
+		return nil
+	}
+
+	host, port, _, hpErr := store.HostPortFromURI(uri)
+	if hpErr != nil || host == "" || port <= 0 {
+		return errors.New("invalid uri host:port")
+	}
+
+	if ctx == nil {
+		ctx = m.ctx
+	}
+	saveCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	return db.UpdateNodeEgressIP(saveCtx, host, port, egressIP, time.Now().UTC())
+}
+
 type nodeRate struct {
 	host    string
 	port    int
@@ -1363,7 +1399,7 @@ func (m *Manager) applyHealthThresholdFromDB() error {
 	for _, e := range entries {
 		uris = append(uris, e.info.URI)
 	}
-	threshold, _, _, _ := computeDBThresholdForURIs(uris, stats.rateByKey)
+	threshold, _, _, _, repByKey := computeDBThresholdForURIs(uris, stats.rateByKey, stats.egressByKey)
 
 	for _, e := range entries {
 		e.mu.Lock()
@@ -1388,6 +1424,15 @@ func (m *Manager) applyHealthThresholdFromDB() error {
 		total := row.success + row.fail
 		if total < dbThresholdMinTotal {
 			// Not enough samples => treat as not schedulable (equivalent to "no 24h stats").
+			e.available = false
+			e.initialCheckDone = true
+			e.mu.Unlock()
+			continue
+		}
+
+		k := nodeRateKey(host, port)
+		if repByKey != nil && !repByKey[k] {
+			// Same egress_ip group exists; only the representative node is schedulable.
 			e.available = false
 			e.initialCheckDone = true
 			e.mu.Unlock()
@@ -1510,11 +1555,27 @@ func (m *Manager) refresh24hStatsBlocking(db store.Store, force bool) (healthSta
 		healthByKey[nodeRateKey(row.host, row.port)] = row.rate >= threshold
 	}
 
+	egressByKey := make(map[string]string, len(rows))
+	{
+		cctx, cancel := context.WithTimeout(m.ctx, 5*time.Second)
+		nodes, nerr := db.ListNodes(cctx)
+		cancel()
+		if nerr == nil {
+			for _, n := range nodes {
+				if strings.TrimSpace(n.EgressIP) == "" {
+					continue
+				}
+				egressByKey[nodeRateKey(n.Host, n.Port)] = strings.TrimSpace(n.EgressIP)
+			}
+		}
+	}
+
 	entry := healthStatsCacheEntry{
 		at:          time.Now(),
 		rows:        rows,
 		rateByKey:   rateByKey,
 		healthByKey: healthByKey,
+		egressByKey: egressByKey,
 		threshold:   threshold,
 	}
 
@@ -1547,7 +1608,11 @@ func (m *Manager) Attach24hStats(snaps []Snapshot) []Snapshot {
 		if hpErr != nil || host == "" || port <= 0 {
 			continue
 		}
-		if row, ok := stats.rateByKey[nodeRateKey(host, port)]; ok {
+		k := nodeRateKey(host, port)
+		if ip := strings.TrimSpace(stats.egressByKey[k]); ip != "" {
+			snaps[i].EgressIP = ip
+		}
+		if row, ok := stats.rateByKey[k]; ok {
 			total := row.success + row.fail
 			snaps[i].DB24hSuccessCount = row.success
 			snaps[i].DB24hFailureCount = row.fail
@@ -1595,13 +1660,27 @@ func nodeRateKey(host string, port int) string {
 // computeDBThresholdForURIs computes the DB-mode scheduling threshold for the given runtime URIs.
 // It implements "p95(non-zero) - 5%" but scopes percentile computation to the current runtime set
 // and ignores low-sample keys to avoid stale/one-hit stats dominating threshold.
-func computeDBThresholdForURIs(uris []string, rateByKey map[string]nodeRate) (threshold, p95 float64, eligibleKeys, eligibleNonZero int) {
+//
+// When egressByKey is provided, nodes sharing the same egress IP are treated as a single group:
+// only the representative (highest 24h success rate; tie-break by higher sample count) contributes
+// to percentile computation and is considered schedulable.
+func computeDBThresholdForURIs(
+	uris []string,
+	rateByKey map[string]nodeRate,
+	egressByKey map[string]string,
+) (threshold, p95 float64, eligibleKeys, eligibleNonZero int, repByKey map[string]bool) {
 	if len(uris) == 0 || len(rateByKey) == 0 {
-		return 1, 0, 0, 0
+		return 1, 0, 0, 0, nil
 	}
 
-	rates := make([]float64, 0, len(uris))
-	seen := make(map[string]struct{}, len(uris))
+	type rep struct {
+		key   string
+		rate  float64
+		total int64
+	}
+
+	groupRep := make(map[string]rep, len(uris))
+	seen := make(map[string]struct{}, len(uris)) // host:port
 	for _, uri := range uris {
 		host, port, _, hpErr := store.HostPortFromURI(uri)
 		if hpErr != nil || host == "" || port <= 0 {
@@ -1624,13 +1703,40 @@ func computeDBThresholdForURIs(uris []string, rateByKey map[string]nodeRate) (th
 		eligibleKeys++
 		if row.rate > 0 {
 			eligibleNonZero++
-			rates = append(rates, row.rate)
+		}
+
+		groupKey := k
+		if egressByKey != nil {
+			if ip := strings.TrimSpace(egressByKey[k]); ip != "" {
+				groupKey = ip
+			}
+		}
+
+		cur, exists := groupRep[groupKey]
+		if !exists {
+			groupRep[groupKey] = rep{key: k, rate: row.rate, total: total}
+			continue
+		}
+
+		if row.rate > cur.rate ||
+			(row.rate == cur.rate && total > cur.total) ||
+			(row.rate == cur.rate && total == cur.total && k < cur.key) {
+			groupRep[groupKey] = rep{key: k, rate: row.rate, total: total}
 		}
 	}
 
-	// No eligible non-zero rates => schedule none.
+	rates := make([]float64, 0, len(groupRep))
+	repByKey = make(map[string]bool, len(groupRep))
+	for _, r := range groupRep {
+		repByKey[r.key] = true
+		if r.rate > 0 {
+			rates = append(rates, r.rate)
+		}
+	}
+
+	// No eligible non-zero representative rates => schedule none.
 	if len(rates) == 0 {
-		return 1, 0, eligibleKeys, 0
+		return 1, 0, eligibleKeys, 0, repByKey
 	}
 
 	p95 = percentile(rates, 0.95)
@@ -1641,7 +1747,7 @@ func computeDBThresholdForURIs(uris []string, rateByKey map[string]nodeRate) (th
 	if threshold > 1 {
 		threshold = 1
 	}
-	return threshold, p95, eligibleKeys, eligibleNonZero
+	return threshold, p95, eligibleKeys, eligibleNonZero, repByKey
 }
 
 func percentile(values []float64, q float64) float64 {
