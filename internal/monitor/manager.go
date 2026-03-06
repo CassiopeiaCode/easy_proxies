@@ -57,7 +57,7 @@ type TimelineEvent struct {
 
 const maxTimelineSize = 20
 const healthStatsCacheTTL = 30 * time.Second
-const dbThresholdMinTotal = 20
+const dbThresholdMinTotal = 2
 const egressCacheTTL = 10 * time.Minute
 
 // Snapshot is a runtime view of a proxy node.
