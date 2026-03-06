@@ -505,3 +505,16 @@
 - `internal/monitor/manager.go`
 - `internal/monitor/server.go`
 - `internal/app/app.go`
+
+### 28. probe 成功日志 + Cloudflare trace 成功日志（已实现）
+
+目标：
+- 排查 “outbound 日志很多但 probe 日志很少/只见失败” 的问题时，补齐成功路径的可观测性。
+
+当前实现行为：
+- monitor 的 periodic health check：每个节点 probe 成功会输出 `probe success for ... latency ...ms` 日志；失败仍维持 `probe failed for ...` 日志不变。
+- Cloudflare trace 获取出口 IP 成功时输出 `cloudflare trace success for ... egress_ip: ...` 日志；写入 `egress_ip` 失败则额外输出 warn（不影响后续 probe 流程）。
+
+涉及模块：
+- `internal/monitor/manager.go`
+- `internal/outbound/pool/pool.go`
