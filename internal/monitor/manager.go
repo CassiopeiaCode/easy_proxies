@@ -394,16 +394,41 @@ func (m *Manager) logDebugState() {
 		return
 	}
 
-	// Sample up to 10 nodes and log details.
-	n := 10
-	if total < n {
-		n = total
-	}
-	rng := rand.New(rand.NewSource(now.UnixNano()))
-	rng.Shuffle(total, func(i, j int) { snaps[i], snaps[j] = snaps[j], snaps[i] })
+	// Sample nodes and log details:
+	// - Pick up to 5 schedulable nodes (init && avail)
+	// - Pick up to 5 unschedulable nodes (everything else)
+	// This avoids log bias when schedulable set is tiny but total runtime nodes is large.
+	schedulableSnaps := make([]Snapshot, 0, 5)
+	unschedulableSnaps := make([]Snapshot, 0, 5)
 
-	for i := 0; i < n; i++ {
+	for i := range snaps {
 		s := snaps[i]
+		if s.InitialCheckDone && s.Available {
+			schedulableSnaps = append(schedulableSnaps, s)
+		} else {
+			unschedulableSnaps = append(unschedulableSnaps, s)
+		}
+	}
+
+	rng := rand.New(rand.NewSource(now.UnixNano()))
+	rng.Shuffle(len(schedulableSnaps), func(i, j int) { schedulableSnaps[i], schedulableSnaps[j] = schedulableSnaps[j], schedulableSnaps[i] })
+	rng.Shuffle(len(unschedulableSnaps), func(i, j int) { unschedulableSnaps[i], unschedulableSnaps[j] = unschedulableSnaps[j], unschedulableSnaps[i] })
+
+	nSched := 5
+	if len(schedulableSnaps) < nSched {
+		nSched = len(schedulableSnaps)
+	}
+	nUnsched := 5
+	if len(unschedulableSnaps) < nUnsched {
+		nUnsched = len(unschedulableSnaps)
+	}
+
+	sample := make([]Snapshot, 0, nSched+nUnsched)
+	sample = append(sample, schedulableSnaps[:nSched]...)
+	sample = append(sample, unschedulableSnaps[:nUnsched]...)
+
+	for i := range sample {
+		s := sample[i]
 		hostPort := ""
 		db24h := ""
 		if dbEnabled && rateByKey != nil && s.URI != "" {

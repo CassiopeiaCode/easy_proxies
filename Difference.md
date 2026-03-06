@@ -518,3 +518,17 @@
 涉及模块：
 - `internal/monitor/manager.go`
 - `internal/outbound/pool/pool.go`
+
+### 29. debug 节点抽样按可调度/不可调度分组（已实现）
+
+目标：
+- debug 抽样日志更贴近排障诉求：同时看到少量可调度节点与不可调度节点的代表样本，避免 5000 节点时随机抽样基本都落在不可调度集合。
+
+当前实现行为：
+- 每次 debug 输出节点明细时：
+  - 从可调度（`initial_check_done && available`）节点中随机选最多 5 个打印；
+  - 从不可调度节点中随机选最多 5 个打印；
+  - 不进行额外 DB 扫描（`db24h` 仍基于已缓存的 24h 聚合 stats 做 key 查找）。
+
+涉及模块：
+- `internal/monitor/manager.go`
