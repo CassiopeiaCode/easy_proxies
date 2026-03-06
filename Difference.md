@@ -396,30 +396,6 @@
 
 涉及模块：
 - `internal/monitor/manager.go`
-
-### 27. 出口 IP（egress_ip）持久化 + 按出口去重调度/加载（已实现）
-
-目标：
-- 解决“random pool 随机到不同节点但出口公网 IP 高度同质”的问题：把“出口 IP 多样性”引入 DB 与调度口径。
-- 在不改变用户现有接入方式（pool/random）的前提下，使运行时更倾向于“随机出口 IP”，并降低同出口节点重复占用 runtime 配额。
-
-当前实现行为：
-- DB 节点结构新增 `egress_ip` 与 `egress_ip_updated_at` 字段，持久化保存出口公网 IP。
-- periodic health check（monitor probe）会在原有 `probe_target` 探测前，先通过节点出站请求 `https://www.cloudflare.com/cdn-cgi/trace` 并解析 `ip=...`：
-  - 成功：写入 DB 的 `egress_ip`（不额外计为一次成功）
-  - 失败：额外记录一次失败（但仍继续执行原来的 `probe_target` 探测）
-- DB 模式下的阈值计算（`p95(non-zero)-5%`）会对相同 `egress_ip` 的节点进行分组去重：
-  - 每个出口组仅保留一个“代表节点”参与 p95 与阈值计算，代表选择规则：成功率最高；成功率相同则样本数更多优先；再相同则稳定排序。
-  - 非代表节点即使成功率很高，也不会被标记为 `Available=true`（确保“同出口只保留一个可调度节点”）。
-- 启动加载阶段（store → runtime nodes）同样按 `egress_ip` 去重，并对去重后的节点集合进行排序后截断到最多 5000 个，再执行端口保留的 normalize。
-
-涉及模块：
-- `internal/store/store.go`
-- `internal/store/pebble/nodes.go`
-- `internal/outbound/pool/pool.go`
-- `internal/monitor/manager.go`
-- `internal/monitor/server.go`
-- `internal/app/app.go`
 - `internal/monitor/server.go`
 - `internal/monitor/assets/index.html`
 
@@ -504,3 +480,28 @@
 
 涉及模块：
 - `internal/monitor/manager.go`
+
+### 27. 出口 IP（egress_ip）持久化 + 按出口去重调度/加载（已实现）
+
+目标：
+- 解决“random pool 随机到不同节点但出口公网 IP 高度同质”的问题：把“出口 IP 多样性”引入 DB 与调度口径。
+- 在不改变用户现有接入方式（pool/random）的前提下，使运行时更倾向于“随机出口 IP”，并降低同出口节点重复占用 runtime 配额。
+
+当前实现行为：
+- DB 节点结构新增 `egress_ip` 与 `egress_ip_updated_at` 字段，持久化保存出口公网 IP。
+- periodic health check（monitor probe）会在原有 `probe_target` 探测前，先通过节点出站请求 `https://www.cloudflare.com/cdn-cgi/trace` 并解析 `ip=...`：
+  - 成功：写入 DB 的 `egress_ip`（不额外计为一次成功）
+  - 失败：额外记录一次失败（但仍继续执行原来的 `probe_target` 探测）
+- DB 模式下的阈值计算（`p95(non-zero)-5%`）会对相同 `egress_ip` 的节点进行分组去重：
+  - 每个出口组仅保留一个“代表节点”参与 p95 与阈值计算，代表选择规则：成功率最高；成功率相同则样本数更多优先；再相同则稳定排序。
+  - 非代表节点即使成功率很高，也不会被标记为 `Available=true`（确保“同出口只保留一个可调度节点”）。
+- 启动加载阶段（store → runtime nodes）同样按 `egress_ip` 去重，并对去重后的节点集合进行排序后截断到最多 5000 个，再执行端口保留的 normalize。
+- 性能优化：阈值计算/调试日志不再为获取 `egress_ip` 全表扫描 nodes，而是采用 “按需 point-get + 内存 TTL 缓存” 的方式读取 `egress_ip`，避免 5000+ 节点时的周期性 JSON 解码抖动。
+
+涉及模块：
+- `internal/store/store.go`
+- `internal/store/pebble/nodes.go`
+- `internal/outbound/pool/pool.go`
+- `internal/monitor/manager.go`
+- `internal/monitor/server.go`
+- `internal/app/app.go`
