@@ -543,3 +543,14 @@
 
 涉及模块：
 - `internal/monitor/manager.go`
+
+### 31. boxmgr 的 5000 cap 分支也应用 egress_ip 去重（已实现）
+
+问题：
+- 当启动加载未能走 store active 节点分支（例如 store active 获取失败/为空）且 `cfg.nodes` 仍然超过 5000 时，boxmgr 会走 `selectNodesForSingBox` 做 5000 限制；若该分支不做 egress_ip 去重，可能与“按出口去重后再排序截断”的预期不一致。
+
+修复后行为：
+- `selectNodesForSingBox` 在可用 store 的情况下，优先按 store 中记录的 `egress_ip` 对候选节点分组去重（无 egress_ip 的按 host:port 处理），并以 24h success rate/样本数/最近延迟做排序后再截断到 5000；失败时回退到原有 healthySet 策略。
+
+涉及模块：
+- `internal/boxmgr/manager.go`

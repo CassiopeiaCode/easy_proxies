@@ -12,6 +12,7 @@ import (
 	"reflect"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -510,6 +511,12 @@ func (m *Manager) selectNodesForSingBox(ctx context.Context, nodes []config.Node
 		return cloneNodes(nodes)
 	}
 
+	// Best-effort: apply the same egress_ip de-dup selection strategy as the store-driven boot path.
+	// This branch is hit when cfg.Nodes is still > 5000 (e.g., store active list is unavailable).
+	if selected, ok := m.selectNodesForSingBoxEgressDedup(ctx, nodes); ok {
+		return selected
+	}
+
 	healthySet, err := m.computeHealthyNodeSet(ctx, nodes)
 	if err != nil && m.logger != nil {
 		m.logger.Warnf("compute healthy node set failed, fallback to first %d nodes: %v", maxSingBoxNodes, err)
@@ -558,6 +565,230 @@ func (m *Manager) selectNodesForSingBox(ctx context.Context, nodes []config.Node
 		selected = selected[:maxSingBoxNodes]
 	}
 	return selected
+}
+
+func (m *Manager) selectNodesForSingBoxEgressDedup(ctx context.Context, nodes []config.NodeConfig) ([]config.NodeConfig, bool) {
+	if len(nodes) == 0 {
+		return nil, false
+	}
+	if m == nil || m.store == nil {
+		return nil, false
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	type hp struct {
+		host string
+		port int
+		key  string // host:port
+	}
+
+	// Collect unique host:port keys for point-lookup of egress_ip/latency from store.
+	seen := make(map[string]hp, len(nodes))
+	for _, n := range nodes {
+		host, port, _, hpErr := store.HostPortFromURI(n.URI)
+		if hpErr != nil || strings.TrimSpace(host) == "" || port <= 0 {
+			continue
+		}
+		host = strings.TrimSpace(host)
+		k := host + ":" + strconv.Itoa(port)
+		if _, ok := seen[k]; ok {
+			continue
+		}
+		seen[k] = hp{host: host, port: port, key: k}
+	}
+
+	// Load store node metadata (egress_ip, last_latency_ms, health_check_count).
+	metaByKey := make(map[string]store.Node, len(seen))
+	{
+		lookupCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+
+		items := make([]hp, 0, len(seen))
+		for _, v := range seen {
+			items = append(items, v)
+		}
+
+		var mu sync.Mutex
+		workerLimit := 32
+		if c := len(items); c < workerLimit {
+			workerLimit = c
+		}
+		if workerLimit < 1 {
+			workerLimit = 1
+		}
+
+		ch := make(chan hp, workerLimit)
+		var wg sync.WaitGroup
+		for i := 0; i < workerLimit; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for it := range ch {
+					n, ok, err := m.store.GetNodeByHostPort(lookupCtx, it.host, it.port)
+					if err != nil || !ok {
+						continue
+					}
+					mu.Lock()
+					metaByKey[it.key] = n
+					mu.Unlock()
+				}
+			}()
+		}
+		for _, it := range items {
+			if lookupCtx.Err() != nil {
+				break
+			}
+			ch <- it
+		}
+		close(ch)
+		wg.Wait()
+	}
+
+	// Load 24h stats for scoring.
+	rateByKey := make(map[string]store.NodeRate)
+	{
+		queryCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		defer cancel()
+		cutoff := time.Now().UTC().Add(-24 * time.Hour)
+		rows, err := m.store.QueryNodeRatesSince(queryCtx, cutoff)
+		if err == nil && len(rows) > 0 {
+			rateByKey = make(map[string]store.NodeRate, len(rows))
+			for _, r := range rows {
+				k := strings.TrimSpace(r.Host) + ":" + strconv.Itoa(r.Port)
+				rateByKey[k] = r
+			}
+		}
+	}
+
+	type score struct {
+		rate       float64
+		total      int64
+		latencyMs  int64
+		hasLatency bool
+		key        string // host:port (or uri) for stable tie-break
+	}
+
+	bestByGroup := make(map[string]config.NodeConfig, len(nodes))
+	bestScore := make(map[string]score, len(nodes))
+
+	for _, n := range nodes {
+		group := strings.TrimSpace(n.URI)
+		scKey := group
+
+		host, port, _, hpErr := store.HostPortFromURI(n.URI)
+		if hpErr == nil && strings.TrimSpace(host) != "" && port > 0 {
+			host = strings.TrimSpace(host)
+			hpKey := host + ":" + strconv.Itoa(port)
+			group = hpKey
+			scKey = hpKey
+
+			if meta, ok := metaByKey[hpKey]; ok {
+				if ip := strings.TrimSpace(meta.EgressIP); ip != "" {
+					group = ip
+				}
+			}
+		}
+
+		sc := score{rate: 0, total: 0, latencyMs: 1<<62 - 1, hasLatency: false, key: scKey}
+		if r, ok := rateByKey[scKey]; ok {
+			sc.rate = r.Rate
+			sc.total = r.SuccessCount + r.FailCount
+		}
+		if meta, ok := metaByKey[scKey]; ok {
+			if meta.LastLatencyMs != nil {
+				sc.latencyMs = *meta.LastLatencyMs
+				sc.hasLatency = true
+			}
+		}
+
+		cur, exists := bestByGroup[group]
+		if !exists {
+			bestByGroup[group] = n
+			bestScore[group] = sc
+			continue
+		}
+		curSc := bestScore[group]
+
+		replace := false
+		if sc.rate > curSc.rate {
+			replace = true
+		} else if sc.rate == curSc.rate && sc.total > curSc.total {
+			replace = true
+		} else if sc.rate == curSc.rate && sc.total == curSc.total {
+			if sc.hasLatency && !curSc.hasLatency {
+				replace = true
+			} else if sc.hasLatency == curSc.hasLatency && sc.latencyMs < curSc.latencyMs {
+				replace = true
+			} else if sc.hasLatency == curSc.hasLatency && sc.latencyMs == curSc.latencyMs && sc.key < curSc.key {
+				replace = true
+			}
+		}
+
+		if replace {
+			_ = cur
+			bestByGroup[group] = n
+			bestScore[group] = sc
+		}
+	}
+
+	selected := make([]config.NodeConfig, 0, len(bestByGroup))
+	scoreByNodeKey := make(map[string]score, len(bestByGroup))
+	for _, n := range bestByGroup {
+		selected = append(selected, n)
+
+		host, port, _, hpErr := store.HostPortFromURI(n.URI)
+		nodeKey := strings.TrimSpace(n.URI)
+		if hpErr == nil && strings.TrimSpace(host) != "" && port > 0 {
+			nodeKey = strings.TrimSpace(host) + ":" + strconv.Itoa(port)
+		}
+
+		groupKey := nodeKey
+		if meta, ok := metaByKey[nodeKey]; ok {
+			if ip := strings.TrimSpace(meta.EgressIP); ip != "" {
+				groupKey = ip
+			}
+		}
+		scoreByNodeKey[nodeKey] = bestScore[groupKey]
+	}
+
+	sort.Slice(selected, func(i, j int) bool {
+		hiHost, hiPort, _, hiErr := store.HostPortFromURI(selected[i].URI)
+		hjHost, hjPort, _, hjErr := store.HostPortFromURI(selected[j].URI)
+		hi := strings.TrimSpace(selected[i].URI)
+		hj := strings.TrimSpace(selected[j].URI)
+		if hiErr == nil && strings.TrimSpace(hiHost) != "" && hiPort > 0 {
+			hi = strings.TrimSpace(hiHost) + ":" + strconv.Itoa(hiPort)
+		}
+		if hjErr == nil && strings.TrimSpace(hjHost) != "" && hjPort > 0 {
+			hj = strings.TrimSpace(hjHost) + ":" + strconv.Itoa(hjPort)
+		}
+
+		si := scoreByNodeKey[hi]
+		sj := scoreByNodeKey[hj]
+		if si.rate != sj.rate {
+			return si.rate > sj.rate
+		}
+		if si.total != sj.total {
+			return si.total > sj.total
+		}
+		if si.hasLatency != sj.hasLatency {
+			return si.hasLatency
+		}
+		if si.latencyMs != sj.latencyMs {
+			return si.latencyMs < sj.latencyMs
+		}
+		return si.key < sj.key
+	})
+
+	if len(selected) > maxSingBoxNodes {
+		selected = selected[:maxSingBoxNodes]
+	}
+	if len(selected) == 0 {
+		selected = cloneNodes(nodes[:1])
+	}
+	return selected, true
 }
 
 func (m *Manager) computeHealthyNodeSet(ctx context.Context, nodes []config.NodeConfig) (map[string]struct{}, error) {
