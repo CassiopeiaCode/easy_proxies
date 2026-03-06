@@ -475,7 +475,7 @@
 
 修复后行为：
 - DB 模式下 `InitialCheckDone` 在节点注册时即置为 `true`，避免被“初检”语义阻塞；调度实质只由 DB 推导的 `Available` 决定。
-- 计算 `p95(non-zero)-5%` 时限定作用域为“当前 runtime 节点集合的 host:port 交集”，并忽略样本量不足的 key（避免低样本 100% 主导阈值）。
+- 计算 `p95(non-zero)-5%` 时限定作用域为“当前 runtime 节点集合的 host:port 交集”，并忽略样本量不足的 key（`success+fail < dbThresholdMinTotal`，当前为 2；避免低样本 100% 主导阈值）。
 - 周期 debug 日志每 10 秒输出一次系统汇总并随机抽样 10 个节点，便于定位阈值/统计/可用性问题。
 
 涉及模块：
