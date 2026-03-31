@@ -67,6 +67,10 @@ func parseHealthHourNodeKey(key []byte) (host string, port int, ok bool) {
 	return host, p, true
 }
 
+func nodeHealthKey(host string, port int) string {
+	return host + ":" + strconv.Itoa(port)
+}
+
 func (d *DB) shouldPersistNodeState(key string, now time.Time) bool {
 	if d == nil {
 		return false
@@ -102,7 +106,7 @@ func (d *DB) RecordHealthCheck(ctx context.Context, u store.HealthCheckUpdate) e
 
 	now := time.Now().UTC()
 	hour := now.Truncate(time.Hour)
-	nodeKey := nodeRateKey(u.Host, u.Port)
+	nodeKey := nodeHealthKey(u.Host, u.Port)
 	persistNode := d.shouldPersistNodeState(nodeKey, now)
 
 	kNode := keyNode(u.Host, u.Port)
