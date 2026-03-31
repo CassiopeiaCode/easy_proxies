@@ -1,6 +1,7 @@
 package pebble
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -13,6 +14,8 @@ import (
 
 	pebblepkg "github.com/cockroachdb/pebble"
 )
+
+const nodeHealthPersistMinInterval = 10 * time.Second
 
 func parseHealthHourKey(key []byte) (hour time.Time, host string, port int, ok bool) {
 	s := string(key)
@@ -39,6 +42,48 @@ func parseHealthHourKey(key []byte) (hour time.Time, host string, port int, ok b
 	return t, host, p, true
 }
 
+func parseHealthHourNodeKey(key []byte) (host string, port int, ok bool) {
+	if !bytes.HasPrefix(key, []byte(keyHealthHourPref)) {
+		return "", 0, false
+	}
+
+	rest := key[len(keyHealthHourPref):]
+	firstSlash := bytes.IndexByte(rest, '/')
+	if firstSlash <= 0 || len(rest) < firstSlash+2 {
+		return "", 0, false
+	}
+	rest = rest[firstSlash+1:]
+
+	lastSlash := bytes.LastIndexByte(rest, '/')
+	if lastSlash <= 0 || lastSlash == len(rest)-1 {
+		return "", 0, false
+	}
+
+	host = string(rest[:lastSlash])
+	p, err := strconv.Atoi(string(rest[lastSlash+1:]))
+	if err != nil || p <= 0 || p > 65535 {
+		return "", 0, false
+	}
+	return host, p, true
+}
+
+func (d *DB) shouldPersistNodeState(key string, now time.Time) bool {
+	if d == nil {
+		return false
+	}
+	d.nodeWriteMu.Lock()
+	defer d.nodeWriteMu.Unlock()
+	if d.lastNodeWriteAt == nil {
+		d.lastNodeWriteAt = make(map[string]time.Time)
+	}
+	last, ok := d.lastNodeWriteAt[key]
+	if ok && now.Sub(last) < nodeHealthPersistMinInterval {
+		return false
+	}
+	d.lastNodeWriteAt[key] = now
+	return true
+}
+
 func (d *DB) RecordHealthCheck(ctx context.Context, u store.HealthCheckUpdate) error {
 	if d == nil || d.db == nil {
 		return errors.New("pebble: db not initialized")
@@ -57,45 +102,51 @@ func (d *DB) RecordHealthCheck(ctx context.Context, u store.HealthCheckUpdate) e
 
 	now := time.Now().UTC()
 	hour := now.Truncate(time.Hour)
+	nodeKey := nodeRateKey(u.Host, u.Port)
+	persistNode := d.shouldPersistNodeState(nodeKey, now)
 
-	// Load node record (optional; if missing, we create a minimal record)
 	kNode := keyNode(u.Host, u.Port)
-	var node store.Node
-	haveNode := false
-	if val, closer, err := d.db.Get(kNode); err == nil {
-		n, uerr := unmarshalNode(val)
-		_ = closer.Close()
-		if uerr == nil {
-			node = n
-			haveNode = true
-		}
-	}
-	if !haveNode {
-		node = store.Node{
-			Host:      u.Host,
-			Port:      u.Port,
-			CreatedAt: now,
-			UpdatedAt: now,
-		}
-	}
-
-	// Update node counters
-	node.HealthCheckCount++
-	tCheck := now
-	node.LastCheckAt = &tCheck
-	if u.Success {
-		node.HealthCheckSuccessCount++
-		tOK := now
-		node.LastSuccessAt = &tOK
-		if u.LatencyMs != nil {
-			v := *u.LatencyMs
-			if v < 0 {
-				v = 0
+	var (
+		node   store.Node
+		haveNode bool
+	)
+	if persistNode {
+		// Node display fields are best-effort metadata. Persist them at a lower cadence so
+		// high-QPS health events do not force a full node read/modify/write on every sample.
+		if val, closer, err := d.db.Get(kNode); err == nil {
+			n, uerr := unmarshalNode(val)
+			_ = closer.Close()
+			if uerr == nil {
+				node = n
+				haveNode = true
 			}
-			node.LastLatencyMs = &v
 		}
+		if !haveNode {
+			node = store.Node{
+				Host:      u.Host,
+				Port:      u.Port,
+				CreatedAt: now,
+				UpdatedAt: now,
+			}
+		}
+
+		node.HealthCheckCount++
+		tCheck := now
+		node.LastCheckAt = &tCheck
+		if u.Success {
+			node.HealthCheckSuccessCount++
+			tOK := now
+			node.LastSuccessAt = &tOK
+			if u.LatencyMs != nil {
+				v := *u.LatencyMs
+				if v < 0 {
+					v = 0
+				}
+				node.LastLatencyMs = &v
+			}
+		}
+		node.UpdatedAt = now
 	}
-	node.UpdatedAt = now
 
 	// Load hourly aggregate
 	kHour := keyHealthHour(hour, u.Host, u.Port)
@@ -118,10 +169,6 @@ func (d *DB) RecordHealthCheck(ctx context.Context, u store.HealthCheckUpdate) e
 	}
 	agg.UpdatedAtUnix = now.Unix()
 
-	bNode, err := marshalNode(node)
-	if err != nil {
-		return err
-	}
 	bAgg, err := marshalHealthHour(agg)
 	if err != nil {
 		return err
@@ -129,8 +176,14 @@ func (d *DB) RecordHealthCheck(ctx context.Context, u store.HealthCheckUpdate) e
 
 	batch := d.db.NewBatch()
 	defer batch.Close()
-	if err := batch.Set(kNode, bNode, nil); err != nil {
-		return fmt.Errorf("pebble batch set node: %w", err)
+	if persistNode {
+		bNode, err := marshalNode(node)
+		if err != nil {
+			return err
+		}
+		if err := batch.Set(kNode, bNode, nil); err != nil {
+			return fmt.Errorf("pebble batch set node: %w", err)
+		}
 	}
 	if err := batch.Set(kHour, bAgg, nil); err != nil {
 		return fmt.Errorf("pebble batch set health hour: %w", err)
@@ -161,8 +214,12 @@ func (d *DB) QueryNodeRatesSince(ctx context.Context, since time.Time) ([]store.
 	}
 	defer iter.Close()
 
+	type nodeKey struct {
+		host string
+		port int
+	}
 	type acc struct{ s, f int64 }
-	m := make(map[string]acc)
+	m := make(map[nodeKey]acc)
 
 	for iter.First(); iter.Valid(); iter.Next() {
 		if ctx != nil {
@@ -171,7 +228,7 @@ func (d *DB) QueryNodeRatesSince(ctx context.Context, since time.Time) ([]store.
 			}
 		}
 
-		_, host, port, ok := parseHealthHourKey(iter.Key())
+		host, port, ok := parseHealthHourNodeKey(iter.Key())
 		if !ok {
 			continue
 		}
@@ -179,7 +236,7 @@ func (d *DB) QueryNodeRatesSince(ctx context.Context, since time.Time) ([]store.
 		if uerr != nil {
 			continue
 		}
-		k := fmt.Sprintf("%s:%d", host, port)
+		k := nodeKey{host: host, port: port}
 		prev := m[k]
 		prev.s += agg.SuccessCount
 		prev.f += agg.FailCount
@@ -191,12 +248,7 @@ func (d *DB) QueryNodeRatesSince(ctx context.Context, since time.Time) ([]store.
 
 	out := make([]store.NodeRate, 0, len(m))
 	for k, v := range m {
-		parts := strings.Split(k, ":")
-		if len(parts) != 2 {
-			continue
-		}
-		p, _ := strconv.Atoi(parts[1])
-		r := store.NodeRate{Host: parts[0], Port: p, SuccessCount: v.s, FailCount: v.f}
+		r := store.NodeRate{Host: k.host, Port: k.port, SuccessCount: v.s, FailCount: v.f}
 		total := r.SuccessCount + r.FailCount
 		if total > 0 {
 			r.Rate = float64(r.SuccessCount) / float64(total)

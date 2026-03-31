@@ -95,6 +95,9 @@ type EntryHandle struct {
 
 type entry struct {
 	info             NodeInfo
+	host             string
+	port             int
+	hostPortValid    bool
 	failure          int
 	success          int64
 	timeline         []TimelineEvent
@@ -176,6 +179,12 @@ type healthStatsCacheEntry struct {
 type egressCacheEntry struct {
 	ip string
 	at time.Time
+}
+
+type runtimeNodeRef struct {
+	host  string
+	port  int
+	valid bool
 }
 
 // Logger interface for logging
@@ -762,6 +771,12 @@ func (m *Manager) Register(info NodeInfo) *EntryHandle {
 			timeline: make([]TimelineEvent, 0, maxTimelineSize),
 			mgr:      m,
 		}
+		host, port, _, hpErr := store.HostPortFromURI(info.URI)
+		if hpErr == nil && host != "" && port > 0 {
+			e.host = host
+			e.port = port
+			e.hostPortValid = true
+		}
 		// In DB mode, "InitialCheckDone" is not a startup probe marker; scheduling is derived from DB stats.
 		// Set it to true immediately so runtime gating effectively depends on DB-derived Available only.
 		if m.shouldPersistHealth() {
@@ -772,6 +787,16 @@ func (m *Manager) Register(info NodeInfo) *EntryHandle {
 		e.info = info
 		if e.mgr == nil {
 			e.mgr = m
+		}
+		host, port, _, hpErr := store.HostPortFromURI(info.URI)
+		if hpErr == nil && host != "" && port > 0 {
+			e.host = host
+			e.port = port
+			e.hostPortValid = true
+		} else {
+			e.host = ""
+			e.port = 0
+			e.hostPortValid = false
 		}
 	}
 	return &EntryHandle{ref: e}
@@ -1421,6 +1446,7 @@ func (m *Manager) applyHealthThresholdFromDB() error {
 	if db == nil {
 		return nil
 	}
+	m.warmEgressCache(db)
 
 	// Do not force refresh for every recompute: QueryNodeRatesSince scans Pebble hourly aggregates
 	// and is expensive. Use cache and let refresh happen at most once per TTL.
@@ -1466,18 +1492,22 @@ func (m *Manager) applyHealthThresholdFromDB() error {
 	}
 	m.mu.RUnlock()
 
-	uris := make([]string, 0, len(entries))
+	runtimeNodes := make([]runtimeNodeRef, 0, len(entries))
 	for _, e := range entries {
-		uris = append(uris, e.info.URI)
+		runtimeNodes = append(runtimeNodes, runtimeNodeRef{
+			host:  e.host,
+			port:  e.port,
+			valid: e.hostPortValid,
+		})
 	}
-	threshold, _, _, _, repByKey := computeDBThresholdForURIs(uris, stats.rateByKey, func(host string, port int) (string, bool) {
+	threshold, _, _, _, repByKey := computeDBThresholdForNodes(runtimeNodes, stats.rateByKey, func(host string, port int) (string, bool) {
 		return m.getEgressIPForKey(m.ctx, host, port)
 	})
 
 	for _, e := range entries {
 		e.mu.Lock()
-		host, port, _, hpErr := store.HostPortFromURI(e.info.URI)
-		if hpErr != nil || host == "" || port <= 0 {
+		host, port := e.host, e.port
+		if !e.hostPortValid || host == "" || port <= 0 {
 			// No host:port mapping => cannot join 24h stats => not schedulable.
 			e.available = false
 			e.initialCheckDone = true
@@ -1666,6 +1696,7 @@ func (m *Manager) Attach24hStats(snaps []Snapshot) []Snapshot {
 	if db == nil {
 		return snaps
 	}
+	m.warmEgressCache(db)
 
 	stats, err := m.load24hStatsCached(db, false)
 	if err != nil {
@@ -1756,6 +1787,16 @@ func (m *Manager) getEgressIPForKey(ctx context.Context, host string, port int) 
 	if db == nil {
 		return "", false
 	}
+	m.warmEgressCache(db)
+
+	m.egressMu.RLock()
+	if m.egressCache != nil {
+		if v, ok := m.egressCache[k]; ok && v.ip != "" && time.Since(v.at) <= egressCacheTTL {
+			m.egressMu.RUnlock()
+			return v.ip, true
+		}
+	}
+	m.egressMu.RUnlock()
 
 	if ctx == nil {
 		ctx = m.ctx
@@ -1781,19 +1822,75 @@ func (m *Manager) getEgressIPForKey(ctx context.Context, host string, port int) 
 	return ip, true
 }
 
-// computeDBThresholdForURIs computes the DB-mode scheduling threshold for the given runtime URIs.
+func (m *Manager) warmEgressCache(db store.Store) {
+	if m == nil || db == nil {
+		return
+	}
+
+	m.egressMu.RLock()
+	cacheWarm := len(m.egressCache) > 0
+	cacheFresh := false
+	if cacheWarm {
+		for _, v := range m.egressCache {
+			if v.ip != "" && time.Since(v.at) <= egressCacheTTL {
+				cacheFresh = true
+				break
+			}
+		}
+	}
+	m.egressMu.RUnlock()
+	if cacheFresh {
+		return
+	}
+
+	ctx := m.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	loadCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	nodes, err := db.ListActiveNodes(loadCtx)
+	if err != nil {
+		return
+	}
+
+	now := time.Now()
+	cache := make(map[string]egressCacheEntry, len(nodes))
+	for _, n := range nodes {
+		ip := strings.TrimSpace(n.EgressIP)
+		if ip == "" || n.Host == "" || n.Port <= 0 {
+			continue
+		}
+		cache[nodeRateKey(n.Host, n.Port)] = egressCacheEntry{ip: ip, at: now}
+	}
+	if len(cache) == 0 {
+		return
+	}
+
+	m.egressMu.Lock()
+	if m.egressCache == nil {
+		m.egressCache = make(map[string]egressCacheEntry, len(cache))
+	}
+	for k, v := range cache {
+		m.egressCache[k] = v
+	}
+	m.egressMu.Unlock()
+}
+
+// computeDBThresholdForNodes computes the DB-mode scheduling threshold for the given runtime nodes.
 // It implements "p95(non-zero) - 5%" but scopes percentile computation to the current runtime set
 // and ignores low-sample keys to avoid stale/one-hit stats dominating threshold.
 //
 // When egressLookup is provided, nodes sharing the same egress IP are treated as a single group:
 // only the representative (highest 24h success rate; tie-break by higher sample count) contributes
 // to percentile computation and is considered schedulable.
-func computeDBThresholdForURIs(
-	uris []string,
+func computeDBThresholdForNodes(
+	nodes []runtimeNodeRef,
 	rateByKey map[string]nodeRate,
 	egressLookup func(host string, port int) (string, bool),
 ) (threshold, p95 float64, eligibleKeys, eligibleNonZero int, repByKey map[string]bool) {
-	if len(uris) == 0 || len(rateByKey) == 0 {
+	if len(nodes) == 0 || len(rateByKey) == 0 {
 		return 1, 0, 0, 0, nil
 	}
 
@@ -1803,11 +1900,11 @@ func computeDBThresholdForURIs(
 		total int64
 	}
 
-	groupRep := make(map[string]rep, len(uris))
-	seen := make(map[string]struct{}, len(uris)) // host:port
-	for _, uri := range uris {
-		host, port, _, hpErr := store.HostPortFromURI(uri)
-		if hpErr != nil || host == "" || port <= 0 {
+	groupRep := make(map[string]rep, len(nodes))
+	seen := make(map[string]struct{}, len(nodes)) // host:port
+	for _, node := range nodes {
+		host, port := node.host, node.port
+		if !node.valid || host == "" || port <= 0 {
 			continue
 		}
 		k := nodeRateKey(host, port)

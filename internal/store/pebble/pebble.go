@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 
 	"easy_proxies/internal/store"
 
@@ -30,6 +32,9 @@ type Options struct {
 type DB struct {
 	db  *pebblepkg.DB
 	dir string
+
+	nodeWriteMu     sync.Mutex
+	lastNodeWriteAt map[string]time.Time
 }
 
 var _ store.Store = (*DB)(nil)
@@ -45,7 +50,11 @@ func Open(ctx context.Context, opt Options) (*DB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open pebble: %w", err)
 	}
-	return &DB{db: pdb, dir: dir}, nil
+	return &DB{
+		db:              pdb,
+		dir:             dir,
+		lastNodeWriteAt: make(map[string]time.Time),
+	}, nil
 }
 
 func (d *DB) Close() error {
